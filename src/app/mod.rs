@@ -9,8 +9,11 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::DefaultTerminal;
 use ratatui::widgets::ListState;
 
-use crate::config::Config;
-use crate::domain::{Model, OptionItem, Profile, Runtime, human_size, stubs};
+use std::path::PathBuf;
+
+use crate::config::{Config, Paths};
+use crate::discovery;
+use crate::domain::{Model, OptionItem, Profile, Runtime, format_unix_date, human_size, stubs};
 use crate::ui;
 
 /// The four navigable panes. The Info pane is always visible and never focused;
@@ -111,7 +114,7 @@ impl<T> PaneList<T> {
 }
 
 pub struct App {
-    #[allow(dead_code)] // wired up in Phase 1+ (discovery uses config paths)
+    #[allow(dead_code)] // retained for Phase 2+ (profiles, defaults)
     pub config: Config,
     pub focus: Pane,
     pub runtimes: PaneList<Runtime>,
@@ -120,19 +123,33 @@ pub struct App {
     pub options: PaneList<OptionItem>,
     pub show_help: bool,
     should_quit: bool,
+    /// Discovered GGUF models for the llama.cpp runtime.
+    scanned_models: Vec<Model>,
+    /// Expanded, absolute model search directories.
+    model_paths: Vec<PathBuf>,
+    model_cache: PathBuf,
 }
 
 impl App {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, paths: Paths) -> Self {
+        // Discover the real llama.cpp runtime; keep vLLM as a demo stub.
+        let llama = discovery::discover_llama_cpp(&config.runtime.llama_cpp, &paths.cache_dir);
+        let model_paths = expand_model_paths(&config.models.paths);
+        let model_cache = paths.cache_dir.join("models.json");
+        let scanned_models = discovery::scan_models(&model_paths, &model_cache);
+
         let mut app = Self {
             config,
             focus: Pane::Runtime,
-            runtimes: PaneList::new(stubs::runtimes()),
+            runtimes: PaneList::new(vec![llama, stubs::vllm_runtime()]),
             models: PaneList::new(Vec::new()),
             profiles: PaneList::new(Vec::new()),
             options: PaneList::new(Vec::new()),
             show_help: false,
             should_quit: false,
+            scanned_models,
+            model_paths,
+            model_cache,
         };
         // Derive the whole chain from the initially-selected runtime.
         app.rebuild_below(Pane::Runtime);
@@ -176,8 +193,18 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => self.select_first(),
             KeyCode::Char('G') | KeyCode::End => self.select_last(),
 
+            // Re-scan model directories.
+            KeyCode::F(5) => self.refresh_models(),
+
             _ => {}
         }
+    }
+
+    /// Re-scan configured model directories (the `F5` refresh).
+    fn refresh_models(&mut self) {
+        self.scanned_models = discovery::scan_models(&self.model_paths, &self.model_cache);
+        // Models or anything downstream may have changed; rebuild from runtime.
+        self.rebuild_below(Pane::Runtime);
     }
 
     /// Drill into the preview pane, but only if it actually has items.
@@ -232,7 +259,12 @@ impl App {
     fn rebuild_below(&mut self, changed: Pane) {
         let level = changed.index();
         if level < Pane::Model.index() {
-            let models = self.runtimes.selected().map(stubs::models_for).unwrap_or_default();
+            let models = match self.runtimes.selected() {
+                // vLLM is a stub; llama.cpp uses the discovered GGUF models.
+                Some(rt) if rt.name == "vLLM" => stubs::vllm_models(),
+                Some(_) => self.scanned_models.clone(),
+                None => Vec::new(),
+            };
             self.models.replace(models);
         }
         if level < Pane::Profile.index() {
@@ -245,34 +277,50 @@ impl App {
         }
     }
 
-    /// A one-line metadata summary of the hovered item in the current (middle)
-    /// column, shown in the status bar — Yazi shows hovered file info this way.
-    pub fn hovered_detail(&self) -> String {
+    /// Two-line status bar content for the hovered item: a primary locator
+    /// (line 1 — a path) and a secondary metadata summary (line 2).
+    pub fn status(&self) -> (String, String) {
         match self.focus {
             Pane::Runtime => self.runtimes.selected().map(|r| {
-                let ver = r.version.clone().unwrap_or_else(|| "version n/a".into());
-                let path = r
+                let primary = r
                     .binary_path
                     .as_ref()
                     .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "(not found)".into());
-                format!("{ver} · {path} · {}", r.formats_label())
+                    .unwrap_or_else(|| "(binary not found)".into());
+                let mut meta = Vec::new();
+                if let Some(v) = &r.version {
+                    meta.push(v.clone());
+                }
+                meta.push(r.formats_label());
+                (primary, meta.join(" · "))
             }),
             Pane::Model => self.models.selected().map(|m| {
-                format!(
-                    "{} · {} · {}",
-                    human_size(m.size_bytes),
-                    m.quantization.as_deref().unwrap_or("?"),
-                    m.architecture.as_deref().unwrap_or("?"),
-                )
+                let primary = m.path.display().to_string();
+                let mut meta = vec![human_size(m.size_bytes)];
+                if let Some(q) = &m.quantization {
+                    meta.push(q.clone());
+                }
+                if let Some(a) = &m.architecture {
+                    meta.push(a.clone());
+                }
+                if let Some(ctx) = m.context_length {
+                    meta.push(format!("ctx {ctx}"));
+                }
+                if m.has_chat_template {
+                    meta.push("chat-template".into());
+                }
+                if let Some(secs) = m.modified {
+                    meta.push(format_unix_date(secs));
+                }
+                (primary, meta.join(" · "))
             }),
             Pane::Profile => self.profiles.selected().map(|p| {
                 let kind = if p.builtin { "built-in template" } else { "custom profile" };
                 let fav = if p.favorite { " · ★" } else { "" };
-                format!("{kind}{fav}")
+                (p.name.clone(), format!("{kind}{fav}"))
             }),
             Pane::Options => self.options.selected().map(|o| {
-                format!("current {} · default {} · {}", o.value, o.default, o.cli)
+                (o.key.clone(), format!("current {} · default {} · {}", o.value, o.default, o.cli))
             }),
         }
         .unwrap_or_default()
@@ -302,4 +350,60 @@ impl App {
         }
         crumbs
     }
+}
+
+/// Resolve the directories to scan for models.
+///
+/// When `config.models.paths` is set we honor it (expanding `~`); otherwise we
+/// fall back to the well-known runtime model locations. We never scan `$HOME`
+/// itself, only specific subdirectories (per the requirements).
+fn expand_model_paths(configured: &[PathBuf]) -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut paths: Vec<PathBuf> = if configured.is_empty() {
+        default_model_dirs(home.as_deref())
+    } else {
+        configured
+            .iter()
+            .map(|p| match (p.strip_prefix("~"), &home) {
+                (Ok(rest), Some(home)) => home.join(rest),
+                _ => p.clone(),
+            })
+            .collect()
+    };
+
+    // De-duplicate (e.g. LLAMA_CACHE may equal ~/.cache/llama.cpp).
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Well-known directories where local runtimes keep models, including
+/// env-var-configured caches. Only existing dirs matter; the scanner skips the
+/// rest.
+fn default_model_dirs(home: Option<&std::path::Path>) -> Vec<PathBuf> {
+    use std::env::var_os;
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    // llama.cpp download cache (LLAMA_CACHE overrides the default location).
+    if let Some(cache) = var_os("LLAMA_CACHE") {
+        dirs.push(PathBuf::from(cache));
+    } else if let Some(home) = home {
+        dirs.push(home.join(".cache/llama.cpp"));
+    }
+
+    // HuggingFace hub cache (used by `llama-server -hf` and others).
+    if let Some(hf) = var_os("HUGGINGFACE_HUB_CACHE") {
+        dirs.push(PathBuf::from(hf));
+    } else if let Some(hf) = var_os("HF_HOME") {
+        dirs.push(PathBuf::from(hf).join("hub"));
+    } else if let Some(home) = home {
+        dirs.push(home.join(".cache/huggingface/hub"));
+    }
+
+    if let Some(home) = home {
+        dirs.push(home.join(".lmstudio/models")); // LM Studio
+        dirs.push(home.join("models")); // generic convention
+    }
+
+    dirs
 }

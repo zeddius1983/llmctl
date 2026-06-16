@@ -50,7 +50,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
-        Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .areas(frame.area());
 
@@ -202,7 +202,15 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let detail = Line::from(format!(" {}", app.hovered_detail())).style(Style::default().dim());
+    let (primary, secondary) = app.status();
+    let [top, bottom] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+
+    // Line 1: the locator/path. Left-truncate (keeping the tail) if too wide.
+    let path = truncate_left(&primary, top.width.saturating_sub(1) as usize);
+    frame.render_widget(Paragraph::new(Line::from(format!(" {path}")).dim()), top);
+
+    // Line 2: metadata on the left, key hints on the right.
     let keys = Line::from(vec![
         Span::styled("hjkl ", Style::default().fg(ACCENT)),
         Span::raw("nav  "),
@@ -212,11 +220,23 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw("quit "),
     ])
     .right_aligned();
-
     let [left, right] =
-        Layout::horizontal([Constraint::Min(0), Constraint::Length(26)]).areas(area);
-    frame.render_widget(Paragraph::new(detail), left);
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(26)]).areas(bottom);
+    frame.render_widget(Paragraph::new(Line::from(format!(" {secondary}")).dim()), left);
     frame.render_widget(Paragraph::new(keys), right);
+}
+
+/// Truncate from the left, keeping the rightmost characters with a leading `…`.
+fn truncate_left(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".repeat(max);
+    }
+    let tail: String = s.chars().skip(count - (max - 1)).collect();
+    format!("…{tail}")
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
@@ -227,6 +247,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         help_row("l / →", "drill into selection"),
         help_row("h / ←", "back up a level"),
         help_row("g / G", "first / last"),
+        help_row("F5", "rescan models"),
         Line::raw(""),
         help_row("?", "toggle this help"),
         help_row("q", "quit"),

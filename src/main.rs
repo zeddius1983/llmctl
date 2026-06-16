@@ -2,6 +2,7 @@
 
 mod app;
 mod config;
+mod discovery;
 mod domain;
 mod ui;
 
@@ -18,7 +19,7 @@ fn main() -> Result<()> {
     let config = Config::load()?;
 
     let mut terminal = ratatui::init();
-    let result = App::new(config).run(&mut terminal);
+    let result = App::new(config, paths).run(&mut terminal);
     ratatui::restore();
 
     result

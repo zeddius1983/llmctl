@@ -5,6 +5,8 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 /// An inference backend (MVP: only llama.cpp).
 #[derive(Debug, Clone)]
 pub struct Runtime {
@@ -16,15 +18,18 @@ pub struct Runtime {
     pub formats: Vec<String>,
 }
 
-/// A discovered GGUF model.
-#[derive(Debug, Clone)]
+/// A discovered GGUF model. Serializable so the scanner can cache results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
     pub name: String,
-    #[allow(dead_code)] // used to build the launch command (Phase 3)
     pub path: PathBuf,
     pub size_bytes: u64,
     pub quantization: Option<String>,
     pub architecture: Option<String>,
+    pub context_length: Option<u64>,
+    /// Last-modified time, seconds since the Unix epoch (cache invalidation).
+    pub modified: Option<u64>,
+    pub has_chat_template: bool,
 }
 
 /// A reusable launch configuration.
@@ -57,6 +62,22 @@ impl Runtime {
     }
 }
 
+/// Format a Unix timestamp (seconds) as `YYYY-MM-DD` (UTC).
+pub fn format_unix_date(secs: u64) -> String {
+    // days since epoch → civil date (Howard Hinnant's algorithm).
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as i64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 /// Format a byte count as a short human string (e.g. "12.3 GB").
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -81,32 +102,15 @@ pub fn human_size(bytes: u64) -> String {
 pub mod stubs {
     use super::*;
 
-    pub fn runtimes() -> Vec<Runtime> {
-        vec![
-            Runtime {
-                name: "llama.cpp".into(),
-                description: "GGUF inference via llama-server".into(),
-                version: None,
-                binary_path: None,
-                formats: vec!["GGUF".into()],
-            },
-            // Stub only — vLLM support is a future runtime (see requirements).
-            Runtime {
-                name: "vLLM".into(),
-                description: "High-throughput serving with PagedAttention".into(),
-                version: None,
-                binary_path: None,
-                formats: vec!["Safetensors".into(), "HF".into()],
-            },
-        ]
-    }
-
-    /// Models available for the given runtime. Different backends surface
-    /// different model formats, so the stub varies by runtime.
-    pub fn models_for(runtime: &Runtime) -> Vec<Model> {
-        match runtime.name.as_str() {
-            "vLLM" => vllm_models(),
-            _ => models(),
+    /// The vLLM runtime — a stub for now (real support is a future phase), kept
+    /// so multi-runtime navigation is exercisable alongside discovered llama.cpp.
+    pub fn vllm_runtime() -> Runtime {
+        Runtime {
+            name: "vLLM".into(),
+            description: "High-throughput serving with PagedAttention".into(),
+            version: None,
+            binary_path: None,
+            formats: vec!["Safetensors".into(), "HF".into()],
         }
     }
 
@@ -120,55 +124,40 @@ pub mod stubs {
         options()
     }
 
-    fn models() -> Vec<Model> {
+    /// Stub models for the vLLM runtime (HF/safetensors style names).
+    pub fn vllm_models() -> Vec<Model> {
+        let model = |name: &str, path: &str, size: u64, quant: &str, arch: &str| Model {
+            name: name.into(),
+            path: path.into(),
+            size_bytes: size,
+            quantization: Some(quant.into()),
+            architecture: Some(arch.into()),
+            context_length: None,
+            modified: None,
+            has_chat_template: true,
+        };
         vec![
-            Model {
-                name: "Qwen3-32B-Q6_K.gguf".into(),
-                path: "/models/Qwen3-32B-Q6_K.gguf".into(),
-                size_bytes: 27_000_000_000,
-                quantization: Some("Q6_K".into()),
-                architecture: Some("qwen3".into()),
-            },
-            Model {
-                name: "Gemma-27B-Q4_K_M.gguf".into(),
-                path: "/models/Gemma-27B-Q4_K_M.gguf".into(),
-                size_bytes: 16_000_000_000,
-                quantization: Some("Q4_K_M".into()),
-                architecture: Some("gemma2".into()),
-            },
-            Model {
-                name: "GPT-OSS-20B-Q8.gguf".into(),
-                path: "/models/GPT-OSS-20B-Q8.gguf".into(),
-                size_bytes: 21_000_000_000,
-                quantization: Some("Q8_0".into()),
-                architecture: Some("gptoss".into()),
-            },
-        ]
-    }
-
-    fn vllm_models() -> Vec<Model> {
-        vec![
-            Model {
-                name: "meta-llama/Llama-3.1-8B-Instruct".into(),
-                path: "/models/hf/Llama-3.1-8B-Instruct".into(),
-                size_bytes: 16_100_000_000,
-                quantization: Some("FP16".into()),
-                architecture: Some("llama".into()),
-            },
-            Model {
-                name: "Qwen/Qwen2.5-32B-Instruct-AWQ".into(),
-                path: "/models/hf/Qwen2.5-32B-Instruct-AWQ".into(),
-                size_bytes: 19_400_000_000,
-                quantization: Some("AWQ".into()),
-                architecture: Some("qwen2".into()),
-            },
-            Model {
-                name: "mistralai/Mistral-7B-Instruct-v0.3".into(),
-                path: "/models/hf/Mistral-7B-Instruct-v0.3".into(),
-                size_bytes: 14_500_000_000,
-                quantization: Some("FP16".into()),
-                architecture: Some("mistral".into()),
-            },
+            model(
+                "meta-llama/Llama-3.1-8B-Instruct",
+                "/models/hf/Llama-3.1-8B-Instruct",
+                16_100_000_000,
+                "FP16",
+                "llama",
+            ),
+            model(
+                "Qwen/Qwen2.5-32B-Instruct-AWQ",
+                "/models/hf/Qwen2.5-32B-Instruct-AWQ",
+                19_400_000_000,
+                "AWQ",
+                "qwen2",
+            ),
+            model(
+                "mistralai/Mistral-7B-Instruct-v0.3",
+                "/models/hf/Mistral-7B-Instruct-v0.3",
+                14_500_000_000,
+                "FP16",
+                "mistral",
+            ),
         ]
     }
 
