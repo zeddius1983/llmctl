@@ -79,9 +79,11 @@ sessions), `~/.cache/llmctl/` (models.json, llama-server.help.txt).
 - A `feature/` branch may instead name a **target version** (e.g.
   `feature/v0.0.1`) to act as an umbrella that accumulates several features
   before a release.
-- Work proceeds in phases (see roadmap); branch off the current working branch
-  and keep them stacked until merged to `main`. (The early `phase-*` and `docs`
-  branches predate this policy and are grandfathered.)
+- **Release plan:** each remaining phase is built on its own `feature/<task>`
+  branch. Once all planned phases are complete, they are merged together into
+  **`feature/v0.1.0`** (the release umbrella), which is then merged to `main`.
+  (The early `phase-*` and `docs` branches predate this policy and are
+  grandfathered.)
 - Commit only when asked. Commit messages end with:
   `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
 - Don't commit the legacy Go `llmctl` binary or `/target` (see `.gitignore`).

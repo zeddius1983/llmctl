@@ -14,8 +14,10 @@ Living status of the build. Update this when phases complete or scope shifts
 | 4 | Process control & logs | ◻ Planned |
 | 5 | Search/filter & polish | ◻ Planned |
 
-Branching: each phase lands on `phase-N-name`, stacked on the previous branch;
-not yet merged to `main`. Latest: `phase-2-profiles`.
+Branching: each remaining phase is built on its own `feature/<task>` branch.
+When all planned phases are done, they merge into the release umbrella
+**`feature/v0.1.0`**, which then merges to `main`. (Early `phase-*`/`docs`
+branches predate this policy and are grandfathered.)
 
 ## Done
 
