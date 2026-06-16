@@ -37,23 +37,35 @@ trait SessionSupervisor {
 }
 ```
 
-## Navigation model (Yazi miller-columns)
+## Navigation model (Yazi sliding three-column)
 
-The five panes are **not** all populated at once. Like Yazi's
-parent / current / preview columns, llmctl reveals one level ahead of focus:
+llmctl shows a **sliding three-column window** over a five-level hierarchy,
+exactly like Yazi's parent / current / preview columns — not five fixed panes.
 
-- A pane is rendered with content only when `pane_index <= focus_index + 1`.
-  The pane immediately right of focus is the **preview** of the hovered parent
-  item; panes beyond that are hidden until you drill in.
-- So: Models are visible once a Runtime is hovered; Profiles once a Model is
-  hovered; Options once a Profile is hovered — mirroring "you don't see a
-  directory's contents until you select it".
-- Child lists are **derived from the parent selection**. Moving the cursor in a
-  parent pane rebuilds and resets every descendant pane to the top (new parent →
-  fresh subtree), exactly like hovering a different directory in Yazi.
-- `l`/`Enter` shifts focus right (only if the preview has items); `h` shifts
-  left. The Info pane (far right) always previews the focused pane's selection.
-- A breadcrumb in the footer shows the committed path (Runtime ▸ Model ▸ …).
+```text
+root(virtual) ▸ Runtime ▸ Model ▸ Profile ▸ Options
+```
+
+- The window is **Parent | Current | Preview**. As the user drills in (`l`/`→`)
+  the columns slide left; `h`/`←` slides right.
+- Preview = the children of the hovered item in the Current column (a runtime's
+  models, a model's profiles, a profile's resolved options). At the **Options**
+  leaf the Preview column becomes the option **detail/editor** (current,
+  default, range, CLI, description) — this absorbs the spec's "Info" pane.
+
+| Current | Parent (left) | Current (middle) | Preview (right) |
+|---------|---------------|------------------|------------------|
+| Runtime | root (virtual)| runtimes         | models           |
+| Model   | runtimes      | models           | profiles         |
+| Profile | models        | profiles         | options (values) |
+| Options | profiles      | options          | option detail    |
+
+- Child lists are **derived from the parent selection**. Moving the cursor in
+  the Current column rebuilds and resets every descendant level to the top
+  (new parent → fresh subtree), like hovering a different directory.
+- The **header** shows the breadcrumb path (`/ llama.cpp / Qwen3… / Coding`);
+  the **footer** shows the hovered item's metadata (Yazi-style status bar) plus
+  key hints.
 
 ## Module layout
 

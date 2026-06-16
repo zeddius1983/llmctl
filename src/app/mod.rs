@@ -10,7 +10,7 @@ use ratatui::DefaultTerminal;
 use ratatui::widgets::ListState;
 
 use crate::config::Config;
-use crate::domain::{Model, OptionItem, Profile, Runtime, stubs};
+use crate::domain::{Model, OptionItem, Profile, Runtime, human_size, stubs};
 use crate::ui;
 
 /// The four navigable panes. The Info pane is always visible and never focused;
@@ -139,13 +139,6 @@ impl App {
         app
     }
 
-    /// Whether a pane should be rendered with content: panes up to and including
-    /// focus are the active path; focus+1 is the live preview of the hovered
-    /// item. Anything deeper is hidden until the user drills in.
-    pub fn is_revealed(&self, pane: Pane) -> bool {
-        pane.index() <= self.focus.index() + 1
-    }
-
     /// Run the draw/input loop until the user quits.
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.should_quit {
@@ -250,6 +243,39 @@ impl App {
             let options = self.profiles.selected().map(stubs::options_for).unwrap_or_default();
             self.options.replace(options);
         }
+    }
+
+    /// A one-line metadata summary of the hovered item in the current (middle)
+    /// column, shown in the status bar — Yazi shows hovered file info this way.
+    pub fn hovered_detail(&self) -> String {
+        match self.focus {
+            Pane::Runtime => self.runtimes.selected().map(|r| {
+                let ver = r.version.clone().unwrap_or_else(|| "version n/a".into());
+                let path = r
+                    .binary_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(not found)".into());
+                format!("{ver} · {path} · {}", r.formats_label())
+            }),
+            Pane::Model => self.models.selected().map(|m| {
+                format!(
+                    "{} · {} · {}",
+                    human_size(m.size_bytes),
+                    m.quantization.as_deref().unwrap_or("?"),
+                    m.architecture.as_deref().unwrap_or("?"),
+                )
+            }),
+            Pane::Profile => self.profiles.selected().map(|p| {
+                let kind = if p.builtin { "built-in template" } else { "custom profile" };
+                let fav = if p.favorite { " · ★" } else { "" };
+                format!("{kind}{fav}")
+            }),
+            Pane::Options => self.options.selected().map(|o| {
+                format!("current {} · default {} · {}", o.value, o.default, o.cli)
+            }),
+        }
+        .unwrap_or_default()
     }
 
     /// The committed path (Runtime ▸ Model ▸ …) up to and including focus,

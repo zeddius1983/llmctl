@@ -9,6 +9,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct Runtime {
     pub name: String,
+    #[allow(dead_code)] // shown in the runtime detail view (Phase 1)
     pub description: String,
     pub version: Option<String>,
     pub binary_path: Option<PathBuf>,
@@ -19,6 +20,7 @@ pub struct Runtime {
 #[derive(Debug, Clone)]
 pub struct Model {
     pub name: String,
+    #[allow(dead_code)] // used to build the launch command (Phase 3)
     pub path: PathBuf,
     pub size_bytes: u64,
     pub quantization: Option<String>,
@@ -80,18 +82,32 @@ pub mod stubs {
     use super::*;
 
     pub fn runtimes() -> Vec<Runtime> {
-        vec![Runtime {
-            name: "llama.cpp".into(),
-            description: "GGUF inference via llama-server".into(),
-            version: None,
-            binary_path: None,
-            formats: vec!["GGUF".into()],
-        }]
+        vec![
+            Runtime {
+                name: "llama.cpp".into(),
+                description: "GGUF inference via llama-server".into(),
+                version: None,
+                binary_path: None,
+                formats: vec!["GGUF".into()],
+            },
+            // Stub only — vLLM support is a future runtime (see requirements).
+            Runtime {
+                name: "vLLM".into(),
+                description: "High-throughput serving with PagedAttention".into(),
+                version: None,
+                binary_path: None,
+                formats: vec!["Safetensors".into(), "HF".into()],
+            },
+        ]
     }
 
-    /// Models available for the given runtime.
-    pub fn models_for(_runtime: &Runtime) -> Vec<Model> {
-        models()
+    /// Models available for the given runtime. Different backends surface
+    /// different model formats, so the stub varies by runtime.
+    pub fn models_for(runtime: &Runtime) -> Vec<Model> {
+        match runtime.name.as_str() {
+            "vLLM" => vllm_models(),
+            _ => models(),
+        }
     }
 
     /// Profiles available for the given model.
@@ -126,6 +142,32 @@ pub mod stubs {
                 size_bytes: 21_000_000_000,
                 quantization: Some("Q8_0".into()),
                 architecture: Some("gptoss".into()),
+            },
+        ]
+    }
+
+    fn vllm_models() -> Vec<Model> {
+        vec![
+            Model {
+                name: "meta-llama/Llama-3.1-8B-Instruct".into(),
+                path: "/models/hf/Llama-3.1-8B-Instruct".into(),
+                size_bytes: 16_100_000_000,
+                quantization: Some("FP16".into()),
+                architecture: Some("llama".into()),
+            },
+            Model {
+                name: "Qwen/Qwen2.5-32B-Instruct-AWQ".into(),
+                path: "/models/hf/Qwen2.5-32B-Instruct-AWQ".into(),
+                size_bytes: 19_400_000_000,
+                quantization: Some("AWQ".into()),
+                architecture: Some("qwen2".into()),
+            },
+            Model {
+                name: "mistralai/Mistral-7B-Instruct-v0.3".into(),
+                path: "/models/hf/Mistral-7B-Instruct-v0.3".into(),
+                size_bytes: 14_500_000_000,
+                quantization: Some("FP16".into()),
+                architecture: Some("mistral".into()),
             },
         ]
     }
