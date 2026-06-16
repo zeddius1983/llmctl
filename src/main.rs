@@ -4,6 +4,7 @@ mod app;
 mod config;
 mod discovery;
 mod domain;
+mod profiles;
 mod ui;
 
 use anyhow::Result;

@@ -51,6 +51,8 @@ pub struct OptionItem {
     pub key: String,
     pub value: String,
     pub default: String,
+    /// Human-readable allowed range, e.g. "0.0 – 2.0" (None for free-form).
+    pub range: Option<String>,
     pub cli: String,
     pub description: String,
 }
@@ -169,42 +171,20 @@ pub mod stubs {
     }
 
     fn options() -> Vec<OptionItem> {
+        let opt = |key: &str, value: &str, default: &str, cli: &str, desc: &str| OptionItem {
+            key: key.into(),
+            value: value.into(),
+            default: default.into(),
+            range: None,
+            cli: cli.into(),
+            description: desc.into(),
+        };
         vec![
-            OptionItem {
-                key: "ctx-size".into(),
-                value: "32768".into(),
-                default: "4096".into(),
-                cli: "--ctx-size".into(),
-                description: "Maximum context window size.".into(),
-            },
-            OptionItem {
-                key: "gpu-layers".into(),
-                value: "999".into(),
-                default: "0".into(),
-                cli: "-ngl".into(),
-                description: "Number of layers offloaded to the GPU.".into(),
-            },
-            OptionItem {
-                key: "temperature".into(),
-                value: "0.7".into(),
-                default: "0.8".into(),
-                cli: "--temp".into(),
-                description: "Sampling temperature.".into(),
-            },
-            OptionItem {
-                key: "top-p".into(),
-                value: "0.95".into(),
-                default: "0.95".into(),
-                cli: "--top-p".into(),
-                description: "Nucleus sampling probability.".into(),
-            },
-            OptionItem {
-                key: "flash-attn".into(),
-                value: "true".into(),
-                default: "false".into(),
-                cli: "--flash-attn".into(),
-                description: "Enable flash attention.".into(),
-            },
+            opt("ctx-size", "32768", "4096", "--ctx-size", "Maximum context window size."),
+            opt("gpu-layers", "999", "0", "-ngl", "Number of layers offloaded to the GPU."),
+            opt("temperature", "0.7", "0.8", "--temp", "Sampling temperature."),
+            opt("top-p", "0.95", "0.95", "--top-p", "Nucleus sampling probability."),
+            opt("flash-attn", "true", "false", "--flash-attn", "Enable flash attention."),
         ]
     }
 }

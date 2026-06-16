@@ -14,7 +14,25 @@ use std::path::PathBuf;
 use crate::config::{Config, Paths};
 use crate::discovery;
 use crate::domain::{Model, OptionItem, Profile, Runtime, format_unix_date, human_size, stubs};
+use crate::profiles::{self, ProfileStore, store};
 use crate::ui;
+
+/// What a modal text prompt is collecting.
+#[derive(Clone)]
+pub enum PromptKind {
+    EditOption { key: String },
+    NewProfile,
+    RenameProfile { old: String },
+    DuplicateProfile { src: String },
+}
+
+/// A modal text input (option editing or profile naming).
+pub struct Prompt {
+    pub kind: PromptKind,
+    pub title: String,
+    pub buffer: String,
+    pub error: Option<String>,
+}
 
 /// The four navigable panes. The Info pane is always visible and never focused;
 /// it previews whatever is selected in the focused pane.
@@ -122,12 +140,15 @@ pub struct App {
     pub profiles: PaneList<Profile>,
     pub options: PaneList<OptionItem>,
     pub show_help: bool,
+    pub prompt: Option<Prompt>,
     should_quit: bool,
     /// Discovered GGUF models for the llama.cpp runtime.
     scanned_models: Vec<Model>,
     /// Expanded, absolute model search directories.
     model_paths: Vec<PathBuf>,
     model_cache: PathBuf,
+    /// Persisted, model-scoped profile instances.
+    store: ProfileStore,
 }
 
 impl App {
@@ -137,6 +158,7 @@ impl App {
         let model_paths = expand_model_paths(&config.models.paths);
         let model_cache = paths.cache_dir.join("models.json");
         let scanned_models = discovery::scan_models(&model_paths, &model_cache);
+        let store = ProfileStore::load(paths.state_dir.join("profiles.json"));
 
         let mut app = Self {
             config,
@@ -146,10 +168,12 @@ impl App {
             profiles: PaneList::new(Vec::new()),
             options: PaneList::new(Vec::new()),
             show_help: false,
+            prompt: None,
             should_quit: false,
             scanned_models,
             model_paths,
             model_cache,
+            store,
         };
         // Derive the whole chain from the initially-selected runtime.
         app.rebuild_below(Pane::Runtime);
@@ -170,6 +194,12 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        // A text prompt is modal: it consumes all input until closed.
+        if self.prompt.is_some() {
+            self.prompt_key(key);
+            return;
+        }
+
         // Help overlay swallows input apart from its own dismissal keys.
         if self.show_help {
             match key.code {
@@ -190,14 +220,331 @@ impl App {
             // Move selection within the focused pane.
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-            KeyCode::Char('g') | KeyCode::Home => self.select_first(),
-            KeyCode::Char('G') | KeyCode::End => self.select_last(),
+            KeyCode::Char('g') => self.select_first(),
+            KeyCode::Char('G') => self.select_last(),
+
+            // In Options, Home/End jump an option to its min/max; elsewhere
+            // they move to the first/last list item.
+            KeyCode::Home if self.focus == Pane::Options => self.set_option_extreme(-1),
+            KeyCode::End if self.focus == Pane::Options => self.set_option_extreme(1),
+            KeyCode::Home => self.select_first(),
+            KeyCode::End => self.select_last(),
+
+            // Inline option adjustment (Options pane).
+            KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char(']') => self.adjust_option(1),
+            KeyCode::Char('-') | KeyCode::Char('[') => self.adjust_option(-1),
+
+            // Edit the selected option / toggle the selected profile favorite.
+            KeyCode::Char('e') => self.open_editor(),
+            KeyCode::Char('f') => self.toggle_favorite(),
+
+            // Profile management (Profile pane).
+            KeyCode::Char('a') => self.prompt_new_profile(),
+            KeyCode::Char('r') => self.prompt_rename_profile(),
+            KeyCode::Char('D') => self.prompt_duplicate_profile(),
+            KeyCode::Char('d') => self.delete_profile(),
 
             // Re-scan model directories.
             KeyCode::F(5) => self.refresh_models(),
 
             _ => {}
         }
+    }
+
+    /// Handle a keystroke while a modal text prompt is open.
+    fn prompt_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.prompt = None,
+            KeyCode::Enter => self.commit_prompt(),
+            KeyCode::Backspace => {
+                if let Some(p) = self.prompt.as_mut() {
+                    p.buffer.pop();
+                    p.error = None;
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(p) = self.prompt.as_mut() {
+                    p.buffer.push(c);
+                    p.error = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Open the option editor. Bool/Enum cycle in place; numeric/string open a
+    /// text prompt. Applies only to real (non-stub) runtimes.
+    fn open_editor(&mut self) {
+        if self.focus != Pane::Options || self.is_stub_runtime() {
+            return;
+        }
+        let Some(option) = self.options.selected() else { return };
+        let key = option.key.clone();
+        let current = option.value.clone();
+
+        if let Some(spec) = profiles::registry::spec(&key) {
+            use profiles::registry::OptionKind;
+            // Bool and Enum don't need a text prompt — `e` advances them.
+            if matches!(spec.kind, OptionKind::Bool | OptionKind::Enum(_)) {
+                if let Some(next) = spec.kind.adjust(&current, 1, spec.step) {
+                    self.apply_option_value(&key, next);
+                }
+                return;
+            }
+        }
+        self.prompt = Some(Prompt {
+            kind: PromptKind::EditOption { key: key.clone() },
+            title: format!("Edit {key}"),
+            buffer: current,
+            error: None,
+        });
+    }
+
+    /// Increment/decrement the selected option in place (auto-saves).
+    fn adjust_option(&mut self, dir: i32) {
+        self.transform_option(|kind, current, step| kind.adjust(current, dir, step));
+    }
+
+    /// Set the selected option to its min (`dir < 0`) or max (`dir > 0`).
+    fn set_option_extreme(&mut self, dir: i32) {
+        self.transform_option(|kind, _current, _step| kind.extreme(dir));
+    }
+
+    /// Shared helper: compute a new value for the selected option and apply it.
+    fn transform_option(
+        &mut self,
+        f: impl Fn(&profiles::registry::OptionKind, &str, f64) -> Option<String>,
+    ) {
+        if self.focus != Pane::Options || self.is_stub_runtime() {
+            return;
+        }
+        let Some(option) = self.options.selected() else { return };
+        let key = option.key.clone();
+        let current = option.value.clone();
+        let Some(spec) = profiles::registry::spec(&key) else { return };
+        // Use the model-aware kind so ctx-size respects the model's max context.
+        let kind = match self.models.selected() {
+            Some(m) => profiles::effective_kind(spec, m),
+            None => spec.kind,
+        };
+        if let Some(value) = f(&kind, &current, spec.step) {
+            self.apply_option_value(&key, value);
+        }
+    }
+
+    /// Validate and commit the open prompt; dispatch by its kind.
+    fn commit_prompt(&mut self) {
+        let Some(prompt) = self.prompt.as_ref() else { return };
+        let input = prompt.buffer.trim().to_string();
+        let kind = prompt.kind.clone(); // release the borrow before dispatching
+        let result = match kind {
+            PromptKind::EditOption { key } => self.commit_option_edit(&key, &input),
+            PromptKind::NewProfile => self.commit_new_profile(&input),
+            PromptKind::RenameProfile { old } => self.commit_rename_profile(&old, &input),
+            PromptKind::DuplicateProfile { src } => self.commit_duplicate_profile(&src, &input),
+        };
+        match result {
+            Ok(()) => self.prompt = None,
+            Err(message) => {
+                if let Some(p) = self.prompt.as_mut() {
+                    p.error = Some(message);
+                }
+            }
+        }
+    }
+
+    fn commit_option_edit(&mut self, key: &str, input: &str) -> Result<(), String> {
+        let spec = profiles::registry::spec(key).ok_or("unknown option")?;
+        let kind = match self.models.selected() {
+            Some(m) => profiles::effective_kind(spec, m),
+            None => spec.kind,
+        };
+        let value = kind.validate(input)?;
+        self.apply_option_value(key, value);
+        Ok(())
+    }
+
+    /// Persist an option value to the model-scoped instance (auto-saves) and
+    /// refresh the Options pane while preserving the cursor position.
+    fn apply_option_value(&mut self, key: &str, value: String) {
+        let (Some(rt), Some(m), Some(p)) =
+            (self.runtimes.selected(), self.models.selected(), self.profiles.selected())
+        else {
+            return;
+        };
+        let runtime = rt.name.clone();
+        let model = store::model_key(&m.path);
+        let profile = p.clone();
+        let base = profiles::resolved_values(&profile, &self.config.defaults);
+
+        let cursor = self.options.state.selected();
+        self.store.set_value(&runtime, &model, &profile.name, key, value, &base);
+        self.rebuild_below(Pane::Profile);
+        self.options.state.select(cursor);
+    }
+
+    /// Toggle the favorite flag on the selected profile (real runtimes only).
+    fn toggle_favorite(&mut self) {
+        if self.focus != Pane::Profile || self.is_stub_runtime() {
+            return;
+        }
+        let (Some(rt), Some(m), Some(p)) =
+            (self.runtimes.selected(), self.models.selected(), self.profiles.selected())
+        else {
+            return;
+        };
+        let runtime = rt.name.clone();
+        let model = store::model_key(&m.path);
+        let profile = p.clone();
+        let base = profiles::resolved_values(&profile, &self.config.defaults);
+
+        let cursor = self.profiles.state.selected();
+        self.store.toggle_favorite(&runtime, &model, &profile.name, &base);
+        self.rebuild_below(Pane::Model);
+        self.profiles.state.select(cursor);
+    }
+
+    // --- profile management (Profile pane) ---------------------------------
+
+    fn prompt_new_profile(&mut self) {
+        if self.focus != Pane::Profile || self.is_stub_runtime() {
+            return;
+        }
+        self.prompt = Some(Prompt {
+            kind: PromptKind::NewProfile,
+            title: "New profile".into(),
+            buffer: String::new(),
+            error: None,
+        });
+    }
+
+    fn prompt_rename_profile(&mut self) {
+        if self.focus != Pane::Profile || self.is_stub_runtime() {
+            return;
+        }
+        let Some(p) = self.profiles.selected() else { return };
+        if p.builtin {
+            return; // built-in templates are read-only
+        }
+        let old = p.name.clone();
+        self.prompt = Some(Prompt {
+            kind: PromptKind::RenameProfile { old: old.clone() },
+            title: format!("Rename {old}"),
+            buffer: old,
+            error: None,
+        });
+    }
+
+    fn prompt_duplicate_profile(&mut self) {
+        if self.focus != Pane::Profile || self.is_stub_runtime() {
+            return;
+        }
+        let Some(p) = self.profiles.selected() else { return };
+        let src = p.name.clone();
+        self.prompt = Some(Prompt {
+            kind: PromptKind::DuplicateProfile { src: src.clone() },
+            title: format!("Duplicate {src}"),
+            buffer: format!("{src} copy"),
+            error: None,
+        });
+    }
+
+    /// Delete a custom profile, or reset a built-in to its template defaults.
+    fn delete_profile(&mut self) {
+        if self.focus != Pane::Profile || self.is_stub_runtime() {
+            return;
+        }
+        let (Some(rt), Some(m), Some(p)) =
+            (self.runtimes.selected(), self.models.selected(), self.profiles.selected())
+        else {
+            return;
+        };
+        let runtime = rt.name.clone();
+        let model = store::model_key(&m.path);
+        let name = p.name.clone();
+
+        let cursor = self.profiles.state.selected().unwrap_or(0);
+        self.store.delete(&runtime, &model, &name);
+        self.rebuild_below(Pane::Model);
+        let len = self.profiles.items.len();
+        if len > 0 {
+            self.profiles.state.select(Some(cursor.min(len - 1)));
+            self.rebuild_below(Pane::Profile);
+        }
+    }
+
+    fn commit_new_profile(&mut self, name: &str) -> Result<(), String> {
+        self.validate_new_name(name)?;
+        let (runtime, model) = self.current_runtime_model().ok_or("no model selected")?;
+        // Seed from the Default template's resolved values.
+        let default = Profile { name: "Default".into(), builtin: true, favorite: false };
+        let values = profiles::resolved_values(&default, &self.config.defaults);
+        self.store.create(&runtime, &model, name, values, true);
+        self.refresh_profiles(Some(name));
+        Ok(())
+    }
+
+    fn commit_rename_profile(&mut self, old: &str, name: &str) -> Result<(), String> {
+        if name.eq_ignore_ascii_case(old) {
+            return Ok(()); // no change
+        }
+        self.validate_new_name(name)?;
+        let (runtime, model) = self.current_runtime_model().ok_or("no model selected")?;
+        self.store.rename(&runtime, &model, old, name);
+        self.refresh_profiles(Some(name));
+        Ok(())
+    }
+
+    fn commit_duplicate_profile(&mut self, src: &str, name: &str) -> Result<(), String> {
+        self.validate_new_name(name)?;
+        let (Some(rt), Some(m)) = (self.runtimes.selected(), self.models.selected()) else {
+            return Err("no model selected".into());
+        };
+        let runtime = rt.name.clone();
+        let model = store::model_key(&m.path);
+        let src_profile = Profile {
+            name: src.to_string(),
+            builtin: profiles::templates::is_builtin(src),
+            favorite: false,
+        };
+        // Copy the source's *current* values (including any instance edits).
+        let values = profiles::current_values(rt, m, &src_profile, &self.store, &self.config.defaults);
+        self.store.create(&runtime, &model, name, values, true);
+        self.refresh_profiles(Some(name));
+        Ok(())
+    }
+
+    fn validate_new_name(&self, name: &str) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("name cannot be empty".into());
+        }
+        if self.profiles.items.iter().any(|p| p.name.eq_ignore_ascii_case(name)) {
+            return Err(format!("'{name}' already exists"));
+        }
+        Ok(())
+    }
+
+    fn current_runtime_model(&self) -> Option<(String, String)> {
+        let rt = self.runtimes.selected()?;
+        let m = self.models.selected()?;
+        Some((rt.name.clone(), store::model_key(&m.path)))
+    }
+
+    /// Rebuild the profile list, then optionally select a profile by name and
+    /// refresh its options.
+    fn refresh_profiles(&mut self, select: Option<&str>) {
+        self.rebuild_below(Pane::Model);
+        if let Some(name) = select {
+            if let Some(i) = self.profiles.items.iter().position(|p| p.name == name) {
+                self.profiles.state.select(Some(i));
+                self.rebuild_below(Pane::Profile);
+            }
+        }
+    }
+
+    /// True when the selected runtime is the vLLM stub (no editing/persistence).
+    fn is_stub_runtime(&self) -> bool {
+        self.runtimes.selected().map(|r| r.name == "vLLM").unwrap_or(true)
     }
 
     /// Re-scan configured model directories (the `F5` refresh).
@@ -268,11 +615,22 @@ impl App {
             self.models.replace(models);
         }
         if level < Pane::Profile.index() {
-            let profiles = self.models.selected().map(stubs::profiles_for).unwrap_or_default();
+            let profiles = match (self.runtimes.selected(), self.models.selected()) {
+                (Some(rt), Some(m)) if rt.name == "vLLM" => stubs::profiles_for(m),
+                (Some(rt), Some(m)) => profiles::list_profiles(rt, m, &self.store),
+                _ => Vec::new(),
+            };
             self.profiles.replace(profiles);
         }
         if level < Pane::Options.index() {
-            let options = self.profiles.selected().map(stubs::options_for).unwrap_or_default();
+            let options =
+                match (self.runtimes.selected(), self.models.selected(), self.profiles.selected()) {
+                    (Some(rt), _, Some(p)) if rt.name == "vLLM" => stubs::options_for(p),
+                    (Some(rt), Some(m), Some(p)) => {
+                        profiles::resolve_options(rt, m, p, &self.store, &self.config.defaults)
+                    }
+                    _ => Vec::new(),
+                };
             self.options.replace(options);
         }
     }

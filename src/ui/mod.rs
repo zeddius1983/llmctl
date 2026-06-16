@@ -17,7 +17,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
-use crate::app::{App, Pane};
+use crate::app::{App, Pane, Prompt};
 
 const ACCENT: Color = Color::Yellow;
 
@@ -50,7 +50,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
-        Constraint::Length(2),
+        Constraint::Length(3),
     ])
     .areas(frame.area());
 
@@ -85,6 +85,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if app.show_help {
         render_help(frame, frame.area());
+    }
+    if let Some(prompt) = &app.prompt {
+        render_prompt(frame, frame.area(), prompt);
     }
 }
 
@@ -181,6 +184,7 @@ fn render_option_detail(frame: &mut Frame, area: Rect, app: &App) {
                 Line::raw(""),
                 kv("Current", &o.value),
                 kv("Default", &o.default),
+                kv("Range", o.range.as_deref().unwrap_or("free-form")),
                 Line::raw(""),
                 Line::from("CLI".bold()),
                 Line::from(o.cli.clone()),
@@ -194,36 +198,71 @@ fn render_option_detail(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let crumbs = app.breadcrumb().join(" / ");
-    let line = Line::from(vec![
+    let breadcrumb = Line::from(vec![
         Span::styled(" / ", Style::default().fg(Color::DarkGray)),
         Span::styled(crumbs, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
     ]);
-    frame.render_widget(Paragraph::new(line), area);
+    frame.render_widget(Paragraph::new(breadcrumb), area);
 }
 
+/// All status lives at the bottom: path, then metadata, then context hotkeys.
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let (primary, secondary) = app.status();
-    let [top, bottom] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+    let (primary, metadata) = app.status();
+    let [l1, l2, l3] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
 
     // Line 1: the locator/path. Left-truncate (keeping the tail) if too wide.
-    let path = truncate_left(&primary, top.width.saturating_sub(1) as usize);
-    frame.render_widget(Paragraph::new(Line::from(format!(" {path}")).dim()), top);
+    let path = truncate_left(&primary, l1.width.saturating_sub(1) as usize);
+    frame.render_widget(Paragraph::new(Line::from(format!(" {path}")).dim()), l1);
 
-    // Line 2: metadata on the left, key hints on the right.
-    let keys = Line::from(vec![
-        Span::styled("hjkl ", Style::default().fg(ACCENT)),
-        Span::raw("nav  "),
-        Span::styled("? ", Style::default().fg(ACCENT)),
-        Span::raw("help  "),
-        Span::styled("q ", Style::default().fg(ACCENT)),
-        Span::raw("quit "),
-    ])
-    .right_aligned();
-    let [left, right] =
-        Layout::horizontal([Constraint::Min(0), Constraint::Length(26)]).areas(bottom);
-    frame.render_widget(Paragraph::new(Line::from(format!(" {secondary}")).dim()), left);
-    frame.render_widget(Paragraph::new(keys), right);
+    // Line 2: hovered-item metadata.
+    frame.render_widget(Paragraph::new(Line::from(format!(" {metadata}")).dim()), l2);
+
+    // Line 3: context-sensitive hotkeys for the focused pane.
+    let mut spans = vec![Span::raw(" ")];
+    for (k, label) in hotkeys(app) {
+        spans.push(Span::styled(k, Style::default().fg(ACCENT)));
+        spans.push(Span::raw(format!(" {label}   ")));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), l3);
+}
+
+/// The hotkeys relevant to the current focus, shown in the footer.
+fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
+    let mut keys: Vec<(&str, &str)> = vec![("j/k", "move")];
+    match app.focus {
+        Pane::Runtime => keys.push(("l", "enter")),
+        Pane::Model => {
+            keys.push(("h/l", "back/enter"));
+            keys.push(("F5", "rescan"));
+        }
+        Pane::Profile => {
+            // Built-ins are read-only templates: no rename, and `d` resets
+            // (drops model-scoped edits) rather than deleting.
+            let builtin = app.profiles.selected().map(|p| p.builtin).unwrap_or(false);
+            keys.push(("h/l", "back/enter"));
+            keys.push(("a", "new"));
+            if !builtin {
+                keys.push(("r", "rename"));
+            }
+            keys.push(("D", "dup"));
+            keys.push(("d", if builtin { "reset" } else { "del" }));
+            keys.push(("f", "fav"));
+        }
+        Pane::Options => {
+            keys.push(("h", "back"));
+            keys.push(("e", "edit"));
+            keys.push(("-/+", "adjust"));
+            keys.push(("Home/End", "min/max"));
+        }
+    }
+    keys.push(("?", "help"));
+    keys.push(("q", "quit"));
+    keys
 }
 
 /// Truncate from the left, keeping the rightmost characters with a leading `…`.
@@ -243,16 +282,28 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from("llmctl — keybindings".bold().fg(ACCENT)),
         Line::raw(""),
+        Line::from("Navigation".bold()),
         help_row("j / k", "move down / up"),
         help_row("l / →", "drill into selection"),
         help_row("h / ←", "back up a level"),
-        help_row("g / G", "first / last"),
+        help_row("g / G", "first / last item"),
+        Line::raw(""),
+        Line::from("Profiles".bold()),
+        help_row("a", "create profile"),
+        help_row("r", "rename (custom only)"),
+        help_row("D", "duplicate profile"),
+        help_row("d", "delete / reset profile"),
+        help_row("f", "toggle favorite"),
+        Line::raw(""),
+        Line::from("Options".bold()),
+        help_row("e", "edit / cycle value"),
+        help_row("- / +", "decrement / increment"),
+        help_row("[ / ]", "decrement / increment"),
+        help_row("Home/End", "set min / max"),
+        Line::raw(""),
+        Line::from("General".bold()),
         help_row("F5", "rescan models"),
-        Line::raw(""),
-        help_row("?", "toggle this help"),
-        help_row("q", "quit"),
-        Line::raw(""),
-        Line::from("(more shortcuts arrive in later phases)".dim()),
+        help_row("? / q", "help / quit"),
         Line::raw(""),
         Line::from("press ? or Esc to close".dim().italic()),
     ];
@@ -264,6 +315,34 @@ fn render_help(frame: &mut Frame, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ACCENT))
         .title(" Help ");
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// Modal text input for editing an option value or naming a profile.
+fn render_prompt(frame: &mut Frame, area: Rect, prompt: &Prompt) {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("❯ ", Style::default().fg(ACCENT)),
+            Span::raw(prompt.buffer.clone()),
+            Span::styled("▏", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+        ]),
+    ];
+    if let Some(err) = &prompt.error {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(err.clone(), Style::default().fg(Color::Red))));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from("Enter save · Esc cancel".dim().italic()));
+
+    let height = lines.len() as u16 + 2;
+    let popup = center(area, Constraint::Length(54), Constraint::Length(height));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(format!(" {} ", prompt.title));
 
     frame.render_widget(Clear, popup);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
