@@ -72,9 +72,16 @@ sessions), `~/.cache/llmctl/` (models.json, llama-server.help.txt).
 
 ## Dev & branching guidelines
 
-- Work proceeds in phases (see roadmap). Each phase lands on its own branch
-  `phase-N-name`, branched from the previous phase's branch (stacked); not yet
-  merged to `main`. Docs/meta work goes on a `docs`/topic branch.
+- **Branch naming:** every branch is prefixed with `feature/` or `bugfix/`,
+  followed by a short task name of **1–3 words** (kebab-case) that reflects the
+  work. Examples: `feature/launch-sessions`, `feature/model-discovery`,
+  `bugfix/shard-size`.
+- A `feature/` branch may instead name a **target version** (e.g.
+  `feature/v0.0.1`) to act as an umbrella that accumulates several features
+  before a release.
+- Work proceeds in phases (see roadmap); branch off the current working branch
+  and keep them stacked until merged to `main`. (The early `phase-*` and `docs`
+  branches predate this policy and are grandfathered.)
 - Commit only when asked. Commit messages end with:
   `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
 - Don't commit the legacy Go `llmctl` binary or `/target` (see `.gitignore`).
