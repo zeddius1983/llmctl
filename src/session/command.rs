@@ -21,6 +21,8 @@ impl Command {
     /// `--flash-attn on|off|auto`). The model is passed via `-m`. An option left
     /// at its [`registry::omit_token`] (e.g. `flash-attn=auto`, or a numeric at
     /// the `default` sentinel) is skipped so llama.cpp applies its own default.
+    /// Valueless boolean flags ([`registry::is_flag`], e.g. `--no-mmap`) emit the
+    /// bare flag with no following value.
     pub fn build(binary: &str, model_path: &str, options: &[OptionItem]) -> Self {
         let mut argv = vec![binary.to_string(), "-m".to_string(), model_path.to_string()];
 
@@ -29,7 +31,9 @@ impl Command {
                 continue;
             }
             argv.push(opt.cli.clone());
-            argv.push(opt.value.clone());
+            if !registry::is_flag(&opt.key) {
+                argv.push(opt.value.clone());
+            }
         }
         Self { argv }
     }
@@ -147,6 +151,22 @@ mod tests {
         assert!(!cmd.argv.iter().any(|a| a == "--flash-attn"));
         assert!(!cmd.argv.iter().any(|a| a == "--batch-size"));
         assert!(cmd.argv.iter().all(|a| a != registry::DEFAULT && a != "auto"));
+    }
+
+    #[test]
+    fn mmap_off_emits_bare_no_mmap_flag_and_on_is_omitted() {
+        let mut opts = sample_options();
+        opts.push(opt("mmap", "off", "--no-mmap"));
+        let cmd = Command::build("llama-server", "/m/x.gguf", &opts);
+        let i = cmd.argv.iter().position(|a| a == "--no-mmap").unwrap();
+        // The bare flag is last (or followed by another flag) — no value token,
+        // so its "off" value never reaches the command line.
+        assert!(cmd.argv.get(i + 1).map(|a| a.starts_with("--")).unwrap_or(true));
+
+        opts.pop();
+        opts.push(opt("mmap", "on", "--no-mmap")); // omit token: mmap on is llama default
+        let cmd = Command::build("llama-server", "/m/x.gguf", &opts);
+        assert!(!cmd.argv.iter().any(|a| a == "--no-mmap"));
     }
 
     #[test]

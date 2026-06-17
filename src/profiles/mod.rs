@@ -306,6 +306,21 @@ mod tests {
     }
 
     #[test]
+    fn speculative_options_default_to_their_omit_tokens() {
+        // Available for every model, defaulting to "off" (omitted from the command).
+        let opts = resolve_options(
+            &runtime(),
+            &model(),
+            &profile("Default"),
+            &empty_store(),
+            &Defaults::default(),
+        );
+        assert_eq!(value_of(&opts, "spec-type"), "none");
+        assert_eq!(value_of(&opts, "spec-draft-n-max"), registry::DEFAULT);
+        assert_eq!(value_of(&opts, "spec-draft-n-min"), registry::DEFAULT);
+    }
+
+    #[test]
     fn host_port_come_from_config_defaults() {
         let defaults = Defaults { host: "0.0.0.0".into(), port: 9000 };
         let opts =

@@ -121,21 +121,36 @@ pub const DEFAULT: &str = "default";
 
 /// The value at which an option is dropped from the launch command, because it
 /// equals what llama.cpp would do anyway. For on/off/auto enums that's `"auto"`
-/// (llama's own default); for numeric options with no in-band "auto" it's the
-/// [`DEFAULT`] sentinel. `None` means the option is always emitted.
+/// (llama's own default); enums that carry an explicit `"default"` variant
+/// (e.g. the cache types) omit at that variant; for numeric options with no
+/// in-band sentinel it's the [`DEFAULT`] sentinel. `None` means always emitted.
 pub fn omit_token(key: &str) -> Option<&'static str> {
     match key {
         "flash-attn" | "reasoning" => Some("auto"),
-        "batch-size" | "gpu-layers" | "threads" => Some(DEFAULT),
+        // `mmap=on` is llama.cpp's default (omitted); `off` adds the bare
+        // `--no-mmap` flag (see [`is_flag`]).
+        "mmap" => Some("on"),
+        // Speculative decoding is off by default.
+        "spec-type" => Some("none"),
+        "batch-size" | "gpu-layers" | "threads" | "cache-type-k" | "cache-type-v"
+        | "spec-draft-n-max" | "spec-draft-n-min" => Some(DEFAULT),
         _ => None,
     }
 }
 
+/// Whether the option is a valueless boolean flag (e.g. `mmap` → `--no-mmap`):
+/// when not at its [`omit_token`] it emits the bare flag with no value token.
+pub fn is_flag(key: &str) -> bool {
+    matches!(key, "mmap")
+}
+
 /// Whether the option's omitted state is the [`DEFAULT`] sentinel (vs an in-band
-/// enum variant like `"auto"`). Only these get the sentinel editing affordances
-/// (the `default` text entry and the `Home`-resets-to-default jump).
+/// enum variant like `"auto"` or an enum's own `"default"` choice). Only these
+/// get the sentinel editing affordances (the `default` text entry and the
+/// `Home`-resets-to-default jump); enums cycle through their variants instead.
 pub fn uses_sentinel(key: &str) -> bool {
     omit_token(key) == Some(DEFAULT)
+        && !matches!(spec(key).map(|s| s.kind), Some(OptionKind::Enum(_)))
 }
 
 impl OptionSpec {
@@ -292,12 +307,67 @@ pub static REGISTRY: &[OptionSpec] = &[
         description: "Reasoning/thinking in chat (auto = llama.cpp default; omitted from command).",
     },
     OptionSpec {
+        key: "mmap",
+        cli: "--no-mmap",
+        kind: Enum(&["on", "off"]),
+        default: "on",
+        step: 1.0,
+        description: "Memory-map the model (on = llama.cpp default; turn off to add \
+                      --no-mmap for ROCm/AMD GPU compatibility).",
+    },
+    OptionSpec {
         key: "cache-type-k",
         cli: "--cache-type-k",
-        kind: Enum(&["f16", "q8_0", "q4_0"]),
-        default: "f16",
+        kind: Enum(&["default", "f16", "q8_0", "q4_0"]),
+        default: "default",
         step: 1.0,
-        description: "KV cache data type for keys (lower = less memory).",
+        description: "KV cache data type for keys (default = llama.cpp default; \
+                      lower precision = less memory).",
+    },
+    OptionSpec {
+        key: "cache-type-v",
+        cli: "--cache-type-v",
+        kind: Enum(&["default", "f16", "q8_0", "q4_0"]),
+        default: "default",
+        step: 1.0,
+        description: "KV cache data type for values (default = llama.cpp default; \
+                      lower precision = less memory).",
+    },
+    OptionSpec {
+        key: "spec-type",
+        cli: "--spec-type",
+        kind: Enum(&[
+            "none",
+            "draft-simple",
+            "draft-eagle3",
+            "draft-mtp",
+            "ngram-simple",
+            "ngram-map-k",
+            "ngram-map-k4v",
+            "ngram-mod",
+            "ngram-cache",
+        ]),
+        default: "none",
+        step: 1.0,
+        description: "Speculative decoding type (none = disabled; draft-mtp uses the model's \
+                      built-in MTP head).",
+    },
+    OptionSpec {
+        key: "spec-draft-n-max",
+        cli: "--spec-draft-n-max",
+        kind: Int { min: Some(0), max: None },
+        default: "3",
+        step: 1.0,
+        description: "Max tokens to draft per step for speculative decoding \
+                      ('default' = llama.cpp's 3).",
+    },
+    OptionSpec {
+        key: "spec-draft-n-min",
+        cli: "--spec-draft-n-min",
+        kind: Int { min: Some(0), max: None },
+        default: "0",
+        step: 1.0,
+        description: "Min draft tokens for speculative decoding ('default' = llama.cpp's 0).",
     },
     OptionSpec {
         key: "host",
@@ -375,7 +445,45 @@ mod tests {
 
         let cache = spec("cache-type-k").unwrap().kind;
         assert_eq!(cache.adjust("f16", 1, 1.0), Some("q8_0".into()));
-        assert_eq!(cache.adjust("f16", -1, 1.0), Some("q4_0".into())); // wraps
+        assert_eq!(cache.adjust("f16", -1, 1.0), Some("default".into())); // back toward "default"
+    }
+
+    #[test]
+    fn cache_types_omit_at_their_default_variant_without_sentinel_affordances() {
+        for key in ["cache-type-k", "cache-type-v"] {
+            // "default" is the omitted state, but it's an in-band enum variant —
+            // not the numeric sentinel — so it cycles like any other choice.
+            assert_eq!(omit_token(key), Some(DEFAULT));
+            assert!(!uses_sentinel(key));
+            let s = spec(key).unwrap();
+            assert_eq!(s.bump(&s.kind, "default", 1), Some("f16".into()));
+            assert_eq!(s.jump(&s.kind, -1), Some("default".into())); // Home → default
+            assert_eq!(s.jump(&s.kind, 1), Some("q4_0".into())); // End → last
+        }
+    }
+
+    #[test]
+    fn speculative_options_have_proper_omit_tokens() {
+        // spec-type omits at its in-band "none" variant (cycles like an enum).
+        assert_eq!(omit_token("spec-type"), Some("none"));
+        assert!(!uses_sentinel("spec-type"));
+        let st = spec("spec-type").unwrap();
+        assert_eq!(st.bump(&st.kind, "none", 1), Some("draft-simple".into()));
+
+        // The draft-count ints fold the numeric "default" sentinel.
+        let n_max = spec("spec-draft-n-max").unwrap();
+        assert_eq!(omit_token("spec-draft-n-max"), Some(DEFAULT));
+        assert!(uses_sentinel("spec-draft-n-max"));
+        assert_eq!(n_max.bump(&n_max.kind, DEFAULT, 1), Some("3".into())); // step up enters base
+        assert_eq!(spec("spec-draft-n-min").unwrap().default, "0");
+    }
+
+    #[test]
+    fn mmap_is_a_flag_omitted_when_on() {
+        assert!(is_flag("mmap"));
+        assert_eq!(omit_token("mmap"), Some("on")); // on = llama default, omitted
+        let s = spec("mmap").unwrap();
+        assert_eq!(s.bump(&s.kind, "on", 1), Some("off".into())); // `e` toggles
     }
 
     #[test]
