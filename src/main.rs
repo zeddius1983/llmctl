@@ -5,6 +5,7 @@ mod config;
 mod discovery;
 mod domain;
 mod profiles;
+mod session;
 mod ui;
 
 use anyhow::Result;
@@ -33,8 +34,7 @@ fn init_tracing(paths: &Paths) {
 
     let log_file = paths.log_dir.join("llmctl.log");
     if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&log_file) {
-        let filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
         let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(file)

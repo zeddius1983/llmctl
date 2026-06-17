@@ -20,7 +20,9 @@ command again. The MVP targets **llama.cpp + GGUF on Linux**; other runtimes
 - **directories** — XDG base directories.
 - **walkdir** + **regex** — model discovery.
 - **anyhow** / **thiserror** — errors. **tracing** — file-based logging.
-- Planned (Phase 3): **tokio** (async process mgmt), **nix** (`setsid`, signals).
+- **libc** — `setsid`/signals for detached sessions, `/proc` sampling, `sysconf`.
+  No async runtime: a poll-based tick (`crossterm::event::poll`) drives live
+  session refresh instead of tokio (ADR-007).
 
 ## Architecture (summary)
 
@@ -39,7 +41,9 @@ src/
   domain/        pure types (Runtime, Model, Profile, OptionItem), helpers, vLLM stubs
   discovery/     gguf.rs (header parser), models.rs (scan+cache), runtimes.rs (llama.cpp)
   profiles/      registry.rs (option specs), templates.rs, store.rs (persistence), mod.rs (resolution)
-  ui/            ratatui rendering (columns, 3-line footer, prompts, help)
+  session/       command.rs (builder), supervisor.rs (DetachedSupervisor: setsid/signals),
+                 record.rs (session-<id>.json), proc.rs (/proc), health.rs (/health), mod.rs (SessionManager)
+  ui/            ratatui rendering (browser columns, Session Manager, log view, footer, prompts, help)
 docs/            requirements, architecture, decisions (ADRs), roadmap
 ```
 
@@ -54,8 +58,10 @@ sessions), `~/.cache/llmctl/` (models.json, llama-server.help.txt).
   templates that fork into instances on edit — ADR-002.
 - GGUF / llama.cpp only in the MVP — ADR-003.
 - Yazi sliding 3-column navigation, not fixed panes — ADR-004.
-- Sessions: detached processes + rediscover, behind a `SessionSupervisor`
-  trait (Phase 3) — ADR-005.
+- Sessions: detached processes (`setsid`) + rediscover, behind a
+  `SessionSupervisor` trait — ADR-005 (implemented in Phase 3).
+- Synchronous poll-tick refresh + `libc` for process control, not tokio/nix —
+  ADR-007.
 
 ## Coding standards
 
@@ -68,7 +74,7 @@ sessions), `~/.cache/llmctl/` (models.json, llama-server.help.txt).
   for those.
 - Logs go to a **file** under the state dir, never stderr (it corrupts the TUI).
 - Keep `domain/` IO-free. Discovery/process/IO lives in `discovery/`, `profiles/`,
-  (and future `session/`).
+  and `session/`.
 
 ## Dev & branching guidelines
 

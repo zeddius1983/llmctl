@@ -91,10 +91,7 @@ impl Paths {
     pub fn resolve() -> Result<Self> {
         let dirs = ProjectDirs::from("", "", "llmctl")
             .context("could not determine XDG base directories")?;
-        let state_dir = dirs
-            .state_dir()
-            .unwrap_or_else(|| dirs.data_dir())
-            .to_path_buf();
+        let state_dir = dirs.state_dir().unwrap_or_else(|| dirs.data_dir()).to_path_buf();
         Ok(Self {
             config_file: dirs.config_dir().join("config.toml"),
             log_dir: state_dir.join("logs"),
@@ -107,8 +104,7 @@ impl Paths {
     /// Create the state/cache directory tree if it does not exist yet.
     pub fn ensure_dirs(&self) -> Result<()> {
         for dir in [&self.state_dir, &self.cache_dir, &self.log_dir, &self.sessions_dir] {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("creating {}", dir.display()))?;
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         Ok(())
     }

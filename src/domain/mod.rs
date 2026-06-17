@@ -89,11 +89,7 @@ pub fn human_size(bytes: u64) -> String {
         size /= 1024.0;
         unit += 1;
     }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{size:.1} {}", UNITS[unit])
-    }
+    if unit == 0 { format!("{bytes} B") } else { format!("{size:.1} {}", UNITS[unit]) }
 }
 
 /// Static stub data for Phase 0 so the UI has something to render.
@@ -184,7 +180,7 @@ pub mod stubs {
             opt("gpu-layers", "999", "0", "-ngl", "Number of layers offloaded to the GPU."),
             opt("temperature", "0.7", "0.8", "--temp", "Sampling temperature."),
             opt("top-p", "0.95", "0.95", "--top-p", "Nucleus sampling probability."),
-            opt("flash-attn", "true", "false", "--flash-attn", "Enable flash attention."),
+            opt("flash-attn", "on", "off", "--flash-attn", "Flash attention on/off/auto."),
         ]
     }
 }

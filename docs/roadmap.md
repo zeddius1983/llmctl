@@ -10,8 +10,8 @@ Living status of the build. Update this when phases complete or scope shifts
 | 0 | TUI skeleton + Yazi navigation | ✅ Done |
 | 1 | Runtime & GGUF model discovery | ✅ Done |
 | 2 | Profiles & options | ✅ Done |
-| 3 | Launch & sessions (MVP milestone) | ⏳ Next |
-| 4 | Process control & logs | ◻ Planned |
+| 3 | Launch & sessions (MVP milestone) | ✅ Done |
+| 4 | Log search & startup-failure classification | ⏳ Next |
 | 5 | Search/filter & polish | ◻ Planned |
 
 Branching: each remaining phase is built on its own `feature/<task>` branch.
@@ -43,27 +43,26 @@ model-aware `ctx-size` (max = model context length); profile CRUD (`a` create,
 `r` rename custom, `D` duplicate, `d` delete custom / reset built-in, `f`
 favorite); context-aware footer hotkeys; 10 unit tests.
 
+### Phase 3 — Launch & sessions (MVP success milestone)
+Command builder from resolved options (`session/command.rs`, bool flags emitted
+only when on); `y` yank with a launch-command preview modal + OSC 52 clipboard
+copy; `SessionSupervisor` trait + `DetachedSupervisor` (`setsid`, stdio→log file,
+`SIGCHLD` auto-reap, group signalling) per ADR-005/007; `s` launch with auto
+port-conflict resolution; Session Manager screen (`t`) with status glyphs,
+PID/port/uptime and `/proc` CPU+memory; `/health` TCP probe promoting
+Starting→Running; rediscover + prune `session-<id>.json` on startup; `x`/`K`/`R`
+stop/kill/restart; `c` copy endpoint; tailing `L` log view; periodic poll-tick
+refresh. 21 tests (incl. ignored real-process integration tests).
+
 ## Next
 
-### Phase 3 — Launch & sessions (MVP success milestone)
-- [ ] Command builder from resolved options → `llama-server -m … --ctx-size … --port …`
-- [ ] `y` yank / dry-run command preview; optional `--print-command` subcommand
-- [ ] `SessionSupervisor` trait + `DetachedSupervisor` (`setsid`, process group,
-      log file, `session-<id>.json`) — see ADR-005
-- [ ] Session Manager screen (`t`): status indicators, PID/port/uptime,
-      `/proc` CPU+memory
-- [ ] Rediscover + prune sessions on startup; `/health` poll for Starting→Running
-- [ ] Auto port-conflict resolution (next free port)
-
-## Planned
-
-### Phase 4 — Process control & logs
-- [ ] `s` start, `x` stop (SIGTERM + timeout), `R` restart (stored config),
-      `K` kill (SIGKILL)
-- [ ] Session detail view (resolved options, generated command, env, resources)
-- [ ] Log view (`L`): tail, search, copy
+### Phase 4 — Log search & startup-failure classification
+- [ ] Log view search / filtering (`L` already tails + scrolls)
 - [ ] Startup-failure classification (port in use, model missing, OOM, GPU/Vulkan/
-      CUDA init, unsupported arg) via a regex rule table
+      CUDA init, unsupported arg) via a regex rule table → drives the `Crashed`/
+      `Unknown` distinction and a failure banner
+- [ ] Configurable stop timeout (SIGTERM → escalate to SIGKILL)
+- [ ] Optional `--print-command` subcommand (headless dry-run)
 
 ### Phase 5 — Search/filter & polish
 - [ ] Incremental `/` search + `n`/`N` in every pane

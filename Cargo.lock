@@ -293,6 +293,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "directories",
+ "libc",
  "ratatui",
  "regex",
  "serde",

@@ -58,7 +58,11 @@ impl ProfileStore {
                         .map(|r| {
                             (
                                 (r.runtime, r.model, r.profile),
-                                Instance { values: r.values, favorite: r.favorite, custom: r.custom },
+                                Instance {
+                                    values: r.values,
+                                    favorite: r.favorite,
+                                    custom: r.custom,
+                                },
                             )
                         })
                         .collect()

@@ -84,8 +84,8 @@ fn build_model(path: &Path, size: u64, modified: Option<u64>) -> Model {
 
     // Prefer the filename label — it captures exact variants (e.g. Unsloth
     // `Q4_K_XL`, `MXFP4`) that the header's coarse `file_type` enum misses.
-    let quantization =
-        quant_from_filename(&name).or_else(|| info.as_ref().and_then(|i| i.file_type_label.clone()));
+    let quantization = quant_from_filename(&name)
+        .or_else(|| info.as_ref().and_then(|i| i.file_type_label.clone()));
 
     Model {
         name,
@@ -106,7 +106,9 @@ fn aggregate_size(path: &Path, first_size: u64) -> u64 {
     let re = RE.get_or_init(|| Regex::new(r"(?i)-(\d{5})-of-(\d{5})\.gguf$").unwrap());
 
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let Some(caps) = re.captures(&name) else { return first_size };
+    let Some(caps) = re.captures(&name) else {
+        return first_size;
+    };
     let total: u32 = caps[2].parse().unwrap_or(1);
     let idx = caps.get(1).unwrap();
     let (head, tail) = (&name[..idx.start()], &name[idx.end()..]);

@@ -7,9 +7,10 @@ Component structure and application design for `llmctl`. See
 ## Overview
 
 `llmctl` is a single-binary Rust TUI built on ratatui + crossterm. It runs a
-synchronous draw/input loop (Phase 0–2; async via tokio arrives with process
-management in Phase 3). State lives in one `App` struct; rendering is a pure
-function of that state.
+synchronous draw/input loop; since Phase 3 a short `event::poll` timeout adds a
+periodic tick that refreshes live session status without an async runtime
+(ADR-007). State lives in one `App` struct; rendering is a pure function of that
+state.
 
 ```
             ┌──────────────┐   draw(&App)   ┌──────────────┐
@@ -55,8 +56,20 @@ function of that state.
     `profiles.json`; create/rename/delete/favorite/set-value, auto-saved.
   - `mod.rs` — resolution: `list_profiles`, `resolve_options`,
     `current_values`, `effective_kind` (model-aware ctx-size bound).
-- **`ui/`** — all rendering: the three columns, header breadcrumb, three-line
-  footer (path / metadata / context hotkeys), the modal prompt, and help overlay.
+- **`session/`**
+  - `command.rs` — pure launch-command builder (argv + shell-quoted display;
+    bool flags emitted only when on, model via `-m`).
+  - `supervisor.rs` — `SessionSupervisor` trait + `DetachedSupervisor` (`setsid`
+    pre-exec, stdio→log file, `SIGCHLD` auto-reap, `kill(-pgid, …)`); plus the
+    OSC 52 base64 helper used for clipboard yank.
+  - `record.rs` — `SessionRecord` persisted as `session-<id>.json`; load/prune.
+  - `proc.rs` — `/proc` liveness, cmdline match (PID-reuse guard), RSS, CPU%.
+  - `health.rs` — minimal `/health` TCP probe; bindable-port check.
+  - `mod.rs` — `SessionManager`: launch, rediscover + prune, refresh
+    (status/resources), stop/kill/restart, port-conflict resolution.
+- **`ui/`** — all rendering: the browser's three columns + footer, the Session
+  Manager (list + detail), the log-tail view, the modal prompt/message overlays,
+  and the help overlay.
 
 ## Navigation model (Yazi sliding three-column)
 
@@ -98,19 +111,34 @@ a default never exceeds what the model supports.
 - `~/.local/state/llmctl/logs/` — app log + (Phase 3) per-session server logs.
 - `~/.local/state/llmctl/sessions/` — (Phase 3) session metadata for rediscovery.
 
-## Process management (Phase 3, planned)
+## Process management (Phase 3, implemented)
 
-Lifecycle hidden behind a `SessionSupervisor` trait. The MVP `DetachedSupervisor`
-spawns `llama-server` via `setsid()` in its own process group (survives TUI
-exit), writes `session-<id>.json` (pid, pgid, port, cmd, model, profile, log,
-start_token), and on startup rediscovers live sessions by validating the PID and
-`/proc/<pid>/cmdline`, pruning stale records. A future `DaemonSupervisor` or
-`systemd-run` backend can implement the same trait. See ADR-005.
+Lifecycle is hidden behind a `SessionSupervisor` trait. The MVP
+`DetachedSupervisor` spawns `llama-server` via `setsid()` in its own session/
+process group (survives TUI exit, ignores tty signals), redirects stdio to a
+per-session log file, and ignores `SIGCHLD` so detached children are auto-reaped.
+Each launch writes `session-<id>.json` (id, name, pid, host, port, full argv,
+model/profile, log path, start time). On startup `SessionManager::rediscover`
+keeps sessions whose PID is alive *and* whose `/proc/<pid>/cmdline` still
+contains the model path (PID-reuse guard), deleting the JSON for the rest.
+
+`SessionManager::refresh` (called on the ≈1 s tick) derives status — `Starting`
+until a `GET /health` returns 200, then `Running`; `Stopped` if the user asked it
+to stop and the process is gone, else `Crashed` — and samples `/proc` for RSS and
+CPU%. Launch resolves a bindable port (skipping ports held by other live
+sessions) before spawning. A future `DaemonSupervisor` or `systemd-run` backend
+can implement the same trait. See ADR-005 and ADR-007.
 
 ## Testing strategy
 
 - **Unit tests** for pure logic: option resolution, validation, adjust/clamp/
-  cycle, extremes, model-aware ctx-size.
-- **PTY smoke tests** for the TUI via a Python driver (per-key delays); note
-  multi-byte escape sequences (Home/End/arrows) are split by the driver, so
+  cycle, extremes, model-aware ctx-size, command building, session
+  naming/uptime, port resolution, OSC 52 base64.
+- **`#[ignore]` integration tests** in `session/` that spawn real processes
+  (a `sleep`, and a fake `/health` server) to exercise the actual spawn →
+  liveness → signal path and the full launch → Running → rediscover → stop
+  lifecycle. Run with `cargo test -- --ignored`.
+- **PTY smoke tests** for the TUI via a Python driver (per-key delays; the pty
+  must be given a window size via `TIOCSWINSZ` or crossterm renders blank).
+  Multi-byte escape sequences (Home/End/arrows) are split by the driver, so
   those bindings are verified by unit tests instead.

@@ -60,13 +60,17 @@ pub fn resolve_options(
     registry::REGISTRY
         .iter()
         .map(|spec| {
-            let default = config_default(spec, defaults);
+            let default = match registry::omit_token(spec.key) {
+                Some(token) => token.to_string(),
+                None => model_default(spec, model, defaults),
+            };
 
             let value = instance
                 .and_then(|i| i.values.get(spec.key).cloned())
                 .or_else(|| template.and_then(|t| override_value(t, spec.key)))
                 .unwrap_or_else(|| default.clone());
             let value = clamp_ctx_to_model(spec.key, value, model);
+            let value = normalize_legacy(spec.key, value);
 
             OptionItem {
                 key: spec.key.to_string(),
@@ -96,17 +100,17 @@ pub fn current_values(
 }
 
 /// The resolved template values for a profile (used to seed a new instance).
-pub fn resolved_values(
-    profile: &Profile,
-    defaults: &Defaults,
-) -> BTreeMap<String, String> {
+pub fn resolved_values(profile: &Profile, defaults: &Defaults) -> BTreeMap<String, String> {
     let template = templates::find(&profile.name);
     registry::REGISTRY
         .iter()
         .map(|spec| {
-            let value = template
-                .and_then(|t| override_value(t, spec.key))
-                .unwrap_or_else(|| config_default(spec, defaults));
+            let value = template.and_then(|t| override_value(t, spec.key)).unwrap_or_else(|| {
+                match registry::omit_token(spec.key) {
+                    Some(token) => token.to_string(),
+                    None => config_default(spec, defaults),
+                }
+            });
             (spec.key.to_string(), value)
         })
         .collect()
@@ -118,6 +122,35 @@ fn config_default(spec: &registry::OptionSpec, defaults: &Defaults) -> String {
         "host" => defaults.host.clone(),
         "port" => defaults.port.to_string(),
         _ => spec.default.to_string(),
+    }
+}
+
+/// Default specialized for the model: `ctx-size` defaults to one eighth of the
+/// model's trained context (a memory-friendly starting point that the user can
+/// raise toward the model max); everything else uses the config/registry default.
+fn model_default(spec: &registry::OptionSpec, model: &Model, defaults: &Defaults) -> String {
+    if spec.key == "ctx-size" {
+        if let Some(ctx) = model.context_length {
+            if ctx >= 8 {
+                return (ctx / 8).to_string();
+            }
+        }
+    }
+    config_default(spec, defaults)
+}
+
+/// Map legacy stored values for the on/off/auto enums onto the current vocabulary
+/// so old profiles still launch: booleans (`true`/`false`, from when flash-attn
+/// was a switch) and the old `default` sentinel (now spelled `auto`).
+fn normalize_legacy(key: &str, value: String) -> String {
+    if key != "flash-attn" && key != "reasoning" {
+        return value;
+    }
+    match value.as_str() {
+        "true" => "on".into(),
+        "false" => "off".into(),
+        "default" => "auto".into(),
+        _ => value,
     }
 }
 
@@ -178,16 +211,26 @@ mod tests {
 
     #[test]
     fn default_profile_uses_registry_defaults() {
-        let opts =
-            resolve_options(&runtime(), &model(), &profile("Default"), &empty_store(), &Defaults::default());
+        let opts = resolve_options(
+            &runtime(),
+            &model(),
+            &profile("Default"),
+            &empty_store(),
+            &Defaults::default(),
+        );
         assert_eq!(value_of(&opts, "ctx-size"), "4096");
         assert_eq!(value_of(&opts, "temperature"), "0.8");
     }
 
     #[test]
     fn template_overrides_apply() {
-        let opts =
-            resolve_options(&runtime(), &model(), &profile("Coding"), &empty_store(), &Defaults::default());
+        let opts = resolve_options(
+            &runtime(),
+            &model(),
+            &profile("Coding"),
+            &empty_store(),
+            &Defaults::default(),
+        );
         assert_eq!(value_of(&opts, "ctx-size"), "16384");
         assert_eq!(value_of(&opts, "temperature"), "0.2");
     }
@@ -206,17 +249,67 @@ mod tests {
     }
 
     #[test]
-    fn ctx_size_default_clamped_to_small_model() {
-        // Registry default is 4096; a 2048-ctx model should resolve to 2048.
+    fn ctx_size_default_is_model_context_over_eight() {
+        // A model with a known context defaults ctx-size to ctx / 8.
+        let m = model_with_ctx(Some(32768));
+        let opts = resolve_options(
+            &runtime(),
+            &m,
+            &profile("Default"),
+            &empty_store(),
+            &Defaults::default(),
+        );
+        assert_eq!(value_of(&opts, "ctx-size"), "4096");
+    }
+
+    #[test]
+    fn ctx_size_template_override_clamped_to_small_model() {
+        // Long Context overrides ctx-size to 131072; a 2048-ctx model clamps it.
         let m = model_with_ctx(Some(2048));
-        let opts = resolve_options(&runtime(), &m, &profile("Default"), &empty_store(), &Defaults::default());
+        let opts = resolve_options(
+            &runtime(),
+            &m,
+            &profile("Long Context"),
+            &empty_store(),
+            &Defaults::default(),
+        );
         assert_eq!(value_of(&opts, "ctx-size"), "2048");
+    }
+
+    #[test]
+    fn omittable_options_default_to_their_omit_token() {
+        let opts = resolve_options(
+            &runtime(),
+            &model(),
+            &profile("Default"),
+            &empty_store(),
+            &Defaults::default(),
+        );
+        // Enums default to "auto" (their in-band omit token)...
+        for key in ["flash-attn", "reasoning"] {
+            assert_eq!(value_of(&opts, key), "auto", "{key} should start at auto");
+        }
+        // ...numerics default to the sentinel.
+        for key in ["batch-size", "gpu-layers", "threads"] {
+            assert_eq!(value_of(&opts, key), registry::DEFAULT, "{key} should start at default");
+        }
+        // A profile that explicitly sets one still carries a concrete value.
+        let server = resolve_options(
+            &runtime(),
+            &model(),
+            &profile("Server"),
+            &empty_store(),
+            &Defaults::default(),
+        );
+        assert_eq!(value_of(&server, "flash-attn"), "on");
+        assert_eq!(value_of(&server, "gpu-layers"), "999");
     }
 
     #[test]
     fn host_port_come_from_config_defaults() {
         let defaults = Defaults { host: "0.0.0.0".into(), port: 9000 };
-        let opts = resolve_options(&runtime(), &model(), &profile("Default"), &empty_store(), &defaults);
+        let opts =
+            resolve_options(&runtime(), &model(), &profile("Default"), &empty_store(), &defaults);
         assert_eq!(value_of(&opts, "host"), "0.0.0.0");
         assert_eq!(value_of(&opts, "port"), "9000");
     }

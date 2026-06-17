@@ -28,13 +28,10 @@ pub static TEMPLATES: &[Template] = &[
             ("ctx-size", "16384"),
         ],
     },
-    Template {
-        name: "Long Context",
-        overrides: &[("ctx-size", "131072"), ("flash-attn", "true")],
-    },
+    Template { name: "Long Context", overrides: &[("ctx-size", "131072"), ("flash-attn", "on")] },
     Template {
         name: "Server",
-        overrides: &[("host", "0.0.0.0"), ("flash-attn", "true"), ("gpu-layers", "999")],
+        overrides: &[("host", "0.0.0.0"), ("flash-attn", "on"), ("gpu-layers", "999")],
     },
 ];
 

@@ -85,7 +85,7 @@ one level ahead. Child lists are derived from and reset by parent selection.
 
 ## ADR-005: Detached processes + rediscovery (not a daemon)
 
-**Status:** Accepted (planned for Phase 3)
+**Status:** Accepted (implemented in Phase 3)
 
 **Context:** Sessions must survive TUI restarts ("never lose visibility of a
 running server"). Options: a long-lived supervisor daemon, or detached child
@@ -120,3 +120,53 @@ back to the header's `file_type`.
 **Consequences:** Predictable option metadata and validation independent of
 llama.cpp version. Quant labels match what users downloaded. New options are a
 one-line registry addition.
+
+---
+
+## ADR-007: Synchronous poll-tick + `libc` for sessions (not tokio/nix)
+
+**Status:** Accepted (supersedes the Phase 3 plan to add tokio + nix)
+
+**Context:** Phase 3 (launch & sessions) needs to spawn detached servers, signal
+them, sample `/proc`, poll `/health`, and refresh the UI periodically. The
+original plan listed **tokio** (async) and **nix** (`setsid`/signals). The user
+asked to keep things as simple as possible.
+
+**Decision:** Keep the existing **synchronous** draw/input loop and add a
+periodic tick driven by `crossterm::event::poll` with a short timeout (no async
+runtime). Use **`libc`** directly for the few OS primitives needed:
+`setsid()` (in a `pre_exec` hook), `kill(-pgid, …)`, `sysconf` (page size / CPU
+count), and `signal(SIGCHLD, SIG_IGN)` so detached children are auto-reaped.
+`/proc` and `/health` are read with std file/TCP I/O — no HTTP-client crate
+(a tiny `GET /health` over `TcpStream`), and clipboard yank uses the OSC 52
+terminal escape (with a hand-rolled base64) rather than a clipboard dependency.
+
+**Consequences:** One small dependency (`libc`) instead of two large subsystems,
+and no async rewrite of the event loop. The tick cadence (≈1 s) bounds how
+quickly status/resource readings update — fine for a manager view. A future
+runtime with genuinely concurrent needs could still adopt tokio behind the
+`SessionSupervisor` trait without disturbing the UI.
+
+---
+
+## ADR-008: Process control folded into Phase 3 (not deferred to Phase 4)
+
+**Status:** Accepted (adjusts the roadmap split)
+
+**Context:** The roadmap originally put the `SessionSupervisor`/launch machinery
+in Phase 3 but the `s`/`x`/`R`/`K` keybindings and the log view in Phase 4. In
+practice a supervisor with no way to start, stop, or inspect a session is not
+demonstrable, and the MVP success criteria require launching, monitoring logs,
+and stopping/restarting in one flow.
+
+**Decision:** Ship the full launch→manage→stop lifecycle in Phase 3: command
+builder + `y` yank, `s` launch, the Session Manager screen (status/PID/port/
+uptime/CPU/memory), rediscovery + prune, `/health` promotion, port-conflict
+resolution, `x`/`K`/`R` stop/kill/restart, `c` copy endpoint, and a tailing
+`L` log view. Phase 4 is narrowed to richer log search and startup-failure
+classification.
+
+**Consequences:** Phase 3 is the working MVP milestone. Startup-failure
+classification (port-in-use, OOM, GPU/Vulkan/CUDA init, …) and log search remain
+for Phase 4; the `Unknown` session state is reserved for that richer
+classification.

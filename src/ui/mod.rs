@@ -17,7 +17,9 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
-use crate::app::{App, Pane, Prompt};
+use crate::app::{App, Message, Pane, Prompt, Screen};
+use crate::domain::human_size;
+use crate::session::{Session, SessionStatus, format_uptime};
 
 const ACCENT: Color = Color::Yellow;
 
@@ -28,6 +30,8 @@ const ICON_MODEL: &str = "\u{f1b2}"; // cube
 const ICON_PROFILE: &str = "\u{f02e}"; // bookmark
 const ICON_OPTION: &str = "\u{f1de}"; // sliders
 const ICON_ROOT: &str = "\u{f015}"; // home
+const ICON_SESSION: &str = "\u{f233}"; // server
+const ICON_LOG: &str = "\u{f15c}"; // file-text
 
 fn level_icon(level: Pane) -> &'static str {
     match level {
@@ -47,12 +51,28 @@ enum Role {
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let [header, body, footer] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(0),
-        Constraint::Length(3),
-    ])
-    .areas(frame.area());
+    match app.screen {
+        Screen::Browser => draw_browser(frame, app),
+        Screen::Sessions => draw_sessions(frame, app),
+        Screen::Logs => draw_logs(frame, app),
+    }
+
+    if app.show_help {
+        render_help(frame, frame.area());
+    }
+    if let Some(prompt) = &app.prompt {
+        render_prompt(frame, frame.area(), prompt);
+    }
+    if let Some(message) = &app.message {
+        render_message(frame, frame.area(), message);
+    }
+}
+
+/// The Yazi-style three-column browser.
+fn draw_browser(frame: &mut Frame, app: &mut App) {
+    let [header, body, footer] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(3)])
+            .areas(frame.area());
 
     // Parent | Current | Preview.
     let [parent, current, preview] = Layout::horizontal([
@@ -82,13 +102,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     render_footer(frame, footer, app);
-
-    if app.show_help {
-        render_help(frame, frame.area());
-    }
-    if let Some(prompt) = &app.prompt {
-        render_prompt(frame, frame.area(), prompt);
-    }
 }
 
 /// Render one level's list into a column, styled for its role.
@@ -106,12 +119,9 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
             .iter()
             .map(|r| ListItem::new(format!("{icon}  {}", r.name)))
             .collect(),
-        Pane::Model => app
-            .models
-            .items
-            .iter()
-            .map(|m| ListItem::new(format!("{icon}  {}", m.name)))
-            .collect(),
+        Pane::Model => {
+            app.models.items.iter().map(|m| ListItem::new(format!("{icon}  {}", m.name))).collect()
+        }
         Pane::Profile => app
             .profiles
             .items
@@ -141,7 +151,8 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
 
     // Preview columns are read-only: render plainly, no cursor.
     if role == Role::Preview {
-        let list = List::new(items).block(block).style(Style::default().add_modifier(Modifier::DIM));
+        let list =
+            List::new(items).block(block).style(Style::default().add_modifier(Modifier::DIM));
         frame.render_widget(list, area);
         return;
     }
@@ -208,12 +219,9 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 /// All status lives at the bottom: path, then metadata, then context hotkeys.
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let (primary, metadata) = app.status();
-    let [l1, l2, l3] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(area);
+    let [l1, l2, l3] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
+            .areas(area);
 
     // Line 1: the locator/path. Left-truncate (keeping the tail) if too wide.
     let path = truncate_left(&primary, l1.width.saturating_sub(1) as usize);
@@ -252,14 +260,20 @@ fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
             keys.push(("D", "dup"));
             keys.push(("d", if builtin { "reset" } else { "del" }));
             keys.push(("f", "fav"));
+            keys.push(("s", "start"));
+            keys.push(("C", "chat"));
+            keys.push(("y", "yank"));
         }
         Pane::Options => {
             keys.push(("h", "back"));
             keys.push(("e", "edit"));
             keys.push(("-/+", "adjust"));
-            keys.push(("Home/End", "min/max"));
+            keys.push(("s", "start"));
+            keys.push(("C", "chat"));
+            keys.push(("y", "yank"));
         }
     }
+    keys.push(("t", "sessions"));
     keys.push(("?", "help"));
     keys.push(("q", "quit"));
     keys
@@ -276,6 +290,207 @@ fn truncate_left(s: &str, max: usize) -> String {
     }
     let tail: String = s.chars().skip(count - (max - 1)).collect();
     format!("…{tail}")
+}
+
+// --- Session Manager screen ------------------------------------------------
+
+/// Colour for a session status indicator.
+fn status_color(status: SessionStatus) -> Color {
+    match status {
+        SessionStatus::Running => Color::Green,
+        SessionStatus::Starting => ACCENT,
+        SessionStatus::Crashed => Color::Red,
+        SessionStatus::Stopped => Color::DarkGray,
+        SessionStatus::Unknown => Color::DarkGray,
+    }
+}
+
+/// The Session Manager: list of servers on the left, detail on the right.
+fn draw_sessions(frame: &mut Frame, app: &mut App) {
+    let [header, body, footer] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+            .areas(frame.area());
+
+    let title = Line::from(vec![
+        Span::styled(format!(" {ICON_SESSION}  Sessions "), Style::default().fg(ACCENT).bold()),
+        Span::styled(
+            format!("({} running)", app.sessions.sessions.len()),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(title), header);
+
+    if app.sessions.sessions.is_empty() {
+        let hint = Paragraph::new(Text::from(vec![
+            Line::raw(""),
+            Line::from("No sessions yet.".dim()),
+            Line::from("Pick a model + profile in the browser and press 's' to launch one.".dim()),
+        ]))
+        .block(pane_block("Sessions", true));
+        frame.render_widget(hint, body);
+    } else {
+        let [list, detail] =
+            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .areas(body);
+        render_session_list(frame, list, app);
+        render_session_detail(frame, detail, app);
+    }
+
+    let keys = [
+        ("x", "stop"),
+        ("K", "kill"),
+        ("R", "restart"),
+        ("L", "logs"),
+        ("c", "copy url"),
+        ("y", "yank cmd"),
+        ("d", "remove"),
+        ("Esc", "back"),
+        ("q", "quit"),
+    ];
+    render_keyline(frame, footer, &keys);
+}
+
+fn render_session_list(frame: &mut Frame, area: Rect, app: &mut App) {
+    let items: Vec<ListItem> = app
+        .sessions
+        .sessions
+        .iter()
+        .map(|s| {
+            let color = status_color(s.status);
+            let uptime = s.uptime_secs().map(format_uptime).unwrap_or_else(|| "—".into());
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{} ", s.status.glyph()), Style::default().fg(color)),
+                Span::raw(s.record.name.clone()),
+                Span::styled(
+                    format!("   port:{}  {}", s.record.port, uptime),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(pane_block("Sessions", true))
+        .highlight_style(Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▌ ");
+    frame.render_stateful_widget(list, area, &mut app.session_sel);
+}
+
+fn render_session_detail(frame: &mut Frame, area: Rect, app: &App) {
+    let block = pane_block("Detail", false);
+    let Some(session) = app.session_sel.selected().and_then(|i| app.sessions.sessions.get(i))
+    else {
+        frame.render_widget(block, area);
+        return;
+    };
+    frame.render_widget(
+        Paragraph::new(session_detail_lines(session)).block(block).wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn session_detail_lines(session: &Session) -> Text<'static> {
+    let r = &session.record;
+    let color = status_color(session.status);
+    let uptime = session.uptime_secs().map(format_uptime).unwrap_or_else(|| "—".into());
+    let mem = session.rss_bytes.map(human_size).unwrap_or_else(|| "—".into());
+    let cpu = session.cpu_percent.map(|c| format!("{c:.0}%")).unwrap_or_else(|| "—".into());
+
+    Text::from(vec![
+        Line::from(r.name.clone().bold().fg(ACCENT)),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} {}", session.status.glyph(), session.status.label()),
+                Style::default().fg(color),
+            ),
+        ]),
+        kv("Runtime", &r.runtime),
+        kv("Model", &r.model),
+        kv("Profile", &r.profile),
+        Line::raw(""),
+        kv("PID", &r.pid.to_string()),
+        kv("Port", &r.port.to_string()),
+        kv("Uptime", &uptime),
+        kv("Memory", &mem),
+        kv("CPU", &cpu),
+        Line::raw(""),
+        kv("Endpoint", &r.endpoint()),
+        kv("Log", &r.log_file.display().to_string()),
+        Line::raw(""),
+        Line::from("Command".bold()),
+        Line::from(crate::session::command::Command { argv: r.command.clone() }.display()),
+    ])
+}
+
+/// The log-tail screen for a session.
+fn draw_logs(frame: &mut Frame, app: &mut App) {
+    let [header, body, footer] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+            .areas(frame.area());
+
+    let name = app
+        .session_sel
+        .selected()
+        .and_then(|i| app.sessions.sessions.get(i))
+        .map(|s| s.record.name.clone())
+        .unwrap_or_default();
+    let follow = if app.log_follow { "  [tailing]" } else { "" };
+    let title = Line::from(vec![
+        Span::styled(format!(" {ICON_LOG}  Logs — {name}"), Style::default().fg(ACCENT).bold()),
+        Span::styled(follow.to_string(), Style::default().fg(Color::Green)),
+    ]);
+    frame.render_widget(Paragraph::new(title), header);
+
+    let block = pane_block("Output", true);
+    let inner_height = body.height.saturating_sub(2); // borders
+    let total = app.log_lines.len() as u16;
+    let max_scroll = total.saturating_sub(inner_height);
+    let scroll = if app.log_follow { max_scroll } else { app.log_scroll.min(max_scroll) };
+    app.log_scroll = scroll; // keep state clamped/in-sync
+
+    let text = if app.log_lines.is_empty() {
+        Text::from(Line::from("(log is empty)".dim()))
+    } else {
+        Text::from(app.log_lines.iter().map(|l| Line::raw(l.clone())).collect::<Vec<_>>())
+    };
+    frame.render_widget(Paragraph::new(text).block(block).scroll((scroll, 0)), body);
+
+    let keys =
+        [("j/k", "scroll"), ("g/G", "top/tail"), ("F5", "reload"), ("Esc", "back"), ("q", "quit")];
+    render_keyline(frame, footer, &keys);
+}
+
+/// Render a single-line key hint row (used by the Session/Logs screens).
+fn render_keyline(frame: &mut Frame, area: Rect, keys: &[(&str, &str)]) {
+    let mut spans = vec![Span::raw(" ")];
+    for (k, label) in keys {
+        spans.push(Span::styled(k.to_string(), Style::default().fg(ACCENT)));
+        spans.push(Span::raw(format!(" {label}   ")));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// A read-only message modal (launch preview, copy confirmation, errors).
+fn render_message(frame: &mut Frame, area: Rect, message: &Message) {
+    let mut lines: Vec<Line> = message.lines.iter().map(|l| Line::raw(l.clone())).collect();
+    lines.push(Line::raw(""));
+    lines.push(Line::from("press any key to dismiss".dim().italic()));
+
+    let width = message.lines.iter().map(|l| l.chars().count()).max().unwrap_or(20).clamp(24, 88)
+        as u16
+        + 4;
+    let height = lines.len() as u16 + 2;
+    let popup = center(area, Constraint::Length(width), Constraint::Length(height));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(format!(" {} ", message.title));
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), popup);
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
@@ -299,10 +514,20 @@ fn render_help(frame: &mut Frame, area: Rect) {
         help_row("e", "edit / cycle value"),
         help_row("- / +", "decrement / increment"),
         help_row("[ / ]", "decrement / increment"),
-        help_row("Home/End", "set min / max"),
+        help_row("Home/End", "default·min / max"),
+        Line::raw(""),
+        Line::from("Launch & sessions".bold()),
+        help_row("s", "start server"),
+        help_row("C", "chat in terminal (llama-cli)"),
+        help_row("y", "yank command"),
+        help_row("t", "session manager"),
+        help_row("x / K", "stop / kill"),
+        help_row("R", "restart"),
+        help_row("L", "view logs"),
+        help_row("c", "copy endpoint"),
         Line::raw(""),
         Line::from("General".bold()),
-        help_row("F5", "rescan models"),
+        help_row("F5", "rescan / reload"),
         help_row("? / q", "help / quit"),
         Line::raw(""),
         Line::from("press ? or Esc to close".dim().italic()),
@@ -322,13 +547,11 @@ fn render_help(frame: &mut Frame, area: Rect) {
 
 /// Modal text input for editing an option value or naming a profile.
 fn render_prompt(frame: &mut Frame, area: Rect, prompt: &Prompt) {
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("❯ ", Style::default().fg(ACCENT)),
-            Span::raw(prompt.buffer.clone()),
-            Span::styled("▏", Style::default().add_modifier(Modifier::SLOW_BLINK)),
-        ]),
-    ];
+    let mut lines = vec![Line::from(vec![
+        Span::styled("❯ ", Style::default().fg(ACCENT)),
+        Span::raw(prompt.buffer.clone()),
+        Span::styled("▏", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+    ])];
     if let Some(err) = &prompt.error {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(err.clone(), Style::default().fg(Color::Red))));
@@ -351,16 +574,10 @@ fn render_prompt(frame: &mut Frame, area: Rect, prompt: &Prompt) {
 // --- helpers ---------------------------------------------------------------
 
 fn pane_block(title: &str, focused: bool) -> Block<'static> {
-    let border_style = if focused {
-        Style::default().fg(ACCENT)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
+    let border_style =
+        if focused { Style::default().fg(ACCENT) } else { Style::default().fg(Color::DarkGray) };
     let title = if focused {
-        Span::styled(
-            format!(" {title} "),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )
+        Span::styled(format!(" {title} "), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
     } else {
         Span::styled(format!(" {title} "), Style::default().fg(Color::DarkGray))
     };

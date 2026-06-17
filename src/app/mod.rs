@@ -10,11 +10,13 @@ use ratatui::DefaultTerminal;
 use ratatui::widgets::ListState;
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crate::config::{Config, Paths};
 use crate::discovery;
 use crate::domain::{Model, OptionItem, Profile, Runtime, format_unix_date, human_size, stubs};
 use crate::profiles::{self, ProfileStore, store};
+use crate::session::{self, LaunchRequest, SessionManager};
 use crate::ui;
 
 /// What a modal text prompt is collecting.
@@ -32,6 +34,24 @@ pub struct Prompt {
     pub title: String,
     pub buffer: String,
     pub error: Option<String>,
+}
+
+/// A read-only modal message (launch-command preview, copy confirmation,
+/// errors). Dismissed by any key.
+pub struct Message {
+    pub title: String,
+    pub lines: Vec<String>,
+}
+
+/// The top-level screen the UI is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    /// The Yazi-style runtime/model/profile/options browser.
+    Browser,
+    /// The Session Manager (running servers).
+    Sessions,
+    /// A session's log tail.
+    Logs,
 }
 
 /// The four navigable panes. The Info pane is always visible and never focused;
@@ -141,6 +161,20 @@ pub struct App {
     pub options: PaneList<OptionItem>,
     pub show_help: bool,
     pub prompt: Option<Prompt>,
+    /// A read-only modal message overlay, if any.
+    pub message: Option<Message>,
+    /// Which top-level screen is active.
+    pub screen: Screen,
+    /// Running/known inference sessions.
+    pub sessions: SessionManager,
+    /// Selection cursor in the Session Manager list.
+    pub session_sel: ListState,
+    /// Loaded log lines for the Logs screen.
+    pub log_lines: Vec<String>,
+    /// Whether the log view tails the bottom of the file.
+    pub log_follow: bool,
+    /// Scroll offset (lines from the top) for the log view when not following.
+    pub log_scroll: u16,
     should_quit: bool,
     /// Discovered GGUF models for the llama.cpp runtime.
     scanned_models: Vec<Model>,
@@ -149,6 +183,11 @@ pub struct App {
     model_cache: PathBuf,
     /// Persisted, model-scoped profile instances.
     store: ProfileStore,
+    /// Last time live session status was refreshed.
+    last_tick: Instant,
+    /// A foreground interactive chat (`llama-cli`) to run on the next loop turn,
+    /// suspending the TUI while it owns the terminal.
+    pending_chat: Option<Vec<String>>,
 }
 
 impl App {
@@ -159,6 +198,9 @@ impl App {
         let model_cache = paths.cache_dir.join("models.json");
         let scanned_models = discovery::scan_models(&model_paths, &model_cache);
         let store = ProfileStore::load(paths.state_dir.join("profiles.json"));
+        // Built after discovery's one-shot `Command`s: the supervisor ignores
+        // SIGCHLD, which would otherwise prevent reaping those probe processes.
+        let sessions = SessionManager::new(paths.sessions_dir.clone(), paths.log_dir.clone());
 
         let mut app = Self {
             config,
@@ -169,37 +211,73 @@ impl App {
             options: PaneList::new(Vec::new()),
             show_help: false,
             prompt: None,
+            message: None,
+            screen: Screen::Browser,
+            sessions,
+            session_sel: ListState::default(),
+            log_lines: Vec::new(),
+            log_follow: true,
+            log_scroll: 0,
             should_quit: false,
             scanned_models,
             model_paths,
             model_cache,
             store,
+            last_tick: Instant::now(),
+            pending_chat: None,
         };
+        app.sync_session_selection();
         // Derive the whole chain from the initially-selected runtime.
         app.rebuild_below(Pane::Runtime);
         app
     }
 
-    /// Run the draw/input loop until the user quits.
+    /// Run the draw/input loop until the user quits. A short poll timeout drives
+    /// a periodic tick so live session status/resources stay current without
+    /// blocking on input (no async runtime needed — see ADR-007).
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.should_quit {
+            if self.last_tick.elapsed() >= Duration::from_secs(1) {
+                self.tick();
+            }
             terminal.draw(|frame| ui::draw(frame, self))?;
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    self.on_key(key);
+            if event::poll(Duration::from_millis(250))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press {
+                        self.on_key(key);
+                    }
                 }
+            }
+            // A chat request hands the terminal to llama-cli, then we re-enter.
+            if let Some(argv) = self.pending_chat.take() {
+                run_chat(terminal, &argv)?;
             }
         }
         Ok(())
     }
 
+    /// Periodic refresh: update live session status/resources, and reload the
+    /// log tail when the Logs screen is open.
+    fn tick(&mut self) {
+        self.sessions.refresh();
+        self.sync_session_selection();
+        if self.screen == Screen::Logs {
+            self.reload_logs();
+        }
+        self.last_tick = Instant::now();
+    }
+
     fn on_key(&mut self, key: KeyEvent) {
+        // A read-only message overlay is dismissed by any key.
+        if self.message.is_some() {
+            self.message = None;
+            return;
+        }
         // A text prompt is modal: it consumes all input until closed.
         if self.prompt.is_some() {
             self.prompt_key(key);
             return;
         }
-
         // Help overlay swallows input apart from its own dismissal keys.
         if self.show_help {
             match key.code {
@@ -209,9 +287,22 @@ impl App {
             return;
         }
 
+        match self.screen {
+            Screen::Browser => self.on_key_browser(key),
+            Screen::Sessions => self.on_key_sessions(key),
+            Screen::Logs => self.on_key_logs(key),
+        }
+    }
+
+    /// Key handling for the Yazi-style browser screen.
+    fn on_key_browser(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('t') => self.open_sessions(),
+            KeyCode::Char('y') => self.yank_command(),
+            KeyCode::Char('s') => self.start_session(),
+            KeyCode::Char('C') => self.start_chat(),
 
             // Move focus across panes.
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => self.enter(),
@@ -251,6 +342,289 @@ impl App {
         }
     }
 
+    /// Key handling for the Session Manager screen.
+    fn on_key_sessions(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Esc | KeyCode::Char('t') => self.screen = Screen::Browser,
+            KeyCode::Char('j') | KeyCode::Down => self.move_session(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_session(-1),
+            KeyCode::Char('g') | KeyCode::Home => {
+                let any = !self.sessions.sessions.is_empty();
+                self.session_sel.select(any.then_some(0));
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                let len = self.sessions.sessions.len();
+                self.session_sel.select((len > 0).then_some(len - 1));
+            }
+            KeyCode::Char('x') => self.session_action(|m, i| m.stop(i), "stop"),
+            KeyCode::Char('K') => self.session_action(|m, i| m.kill(i), "kill"),
+            KeyCode::Char('R') => self.session_action(|m, i| m.restart(i), "restart"),
+            KeyCode::Char('d') => self.remove_session(),
+            KeyCode::Char('c') => self.copy_endpoint(),
+            KeyCode::Char('y') => self.yank_session_command(),
+            KeyCode::Char('L') | KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
+                self.open_logs()
+            }
+            KeyCode::F(5) => {
+                self.sessions.rediscover();
+                self.sync_session_selection();
+            }
+            _ => {}
+        }
+    }
+
+    /// Key handling for the log-tail screen.
+    fn on_key_logs(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc | KeyCode::Char('L') | KeyCode::Char('h') | KeyCode::Left => {
+                self.screen = Screen::Sessions
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.log_follow = false;
+                self.log_scroll = self.log_scroll.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.log_follow = false;
+                self.log_scroll = self.log_scroll.saturating_sub(1);
+            }
+            KeyCode::PageDown => {
+                self.log_follow = false;
+                self.log_scroll = self.log_scroll.saturating_add(10);
+            }
+            KeyCode::PageUp => {
+                self.log_follow = false;
+                self.log_scroll = self.log_scroll.saturating_sub(10);
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                self.log_follow = false;
+                self.log_scroll = 0;
+            }
+            KeyCode::Char('G') | KeyCode::End => self.log_follow = true,
+            KeyCode::F(5) => self.reload_logs(),
+            _ => {}
+        }
+    }
+
+    // --- Session manager / launch ------------------------------------------
+
+    /// Switch to the Session Manager screen, refreshing live status first.
+    fn open_sessions(&mut self) {
+        self.screen = Screen::Sessions;
+        self.sessions.refresh();
+        self.sync_session_selection();
+    }
+
+    /// Keep the session selection cursor within the bounds of the session list.
+    fn sync_session_selection(&mut self) {
+        let len = self.sessions.sessions.len();
+        if len == 0 {
+            self.session_sel.select(None);
+        } else {
+            let i = self.session_sel.selected().unwrap_or(0).min(len - 1);
+            self.session_sel.select(Some(i));
+        }
+    }
+
+    fn move_session(&mut self, delta: isize) {
+        let len = self.sessions.sessions.len();
+        if len == 0 {
+            return;
+        }
+        let cur = self.session_sel.selected().unwrap_or(0) as isize;
+        let next = (cur + delta).clamp(0, len as isize - 1);
+        self.session_sel.select(Some(next as usize));
+    }
+
+    /// Build a launch request from the current selection and resolved options.
+    fn build_launch_request(&self) -> Result<LaunchRequest, String> {
+        if self.is_stub_runtime() {
+            return Err("vLLM is a navigation-only stub (not launchable)".into());
+        }
+        let rt = self.runtimes.selected().ok_or("no runtime selected")?;
+        let model = self.models.selected().ok_or("no model selected")?;
+        let profile = self.profiles.selected().ok_or("no profile selected")?;
+        let binary = rt
+            .binary_path
+            .as_ref()
+            .ok_or("llama-server binary not found on PATH")?
+            .display()
+            .to_string();
+        let options = self.options.items.clone();
+        let host = option_value(&options, "host").unwrap_or_else(|| "127.0.0.1".into());
+        let port = option_value(&options, "port").and_then(|v| v.parse().ok()).unwrap_or(8000);
+        Ok(LaunchRequest {
+            runtime: rt.name.clone(),
+            binary,
+            model: model.name.clone(),
+            model_path: model.path.display().to_string(),
+            profile: profile.name.clone(),
+            host,
+            port,
+            options,
+        })
+    }
+
+    /// Preview the generated command and copy it to the clipboard (`y`).
+    fn yank_command(&mut self) {
+        if self.focus != Pane::Profile && self.focus != Pane::Options {
+            return;
+        }
+        match self.build_launch_request() {
+            Ok(req) => {
+                let cmd =
+                    session::command::Command::build(&req.binary, &req.model_path, &req.options);
+                copy_to_clipboard(&cmd.display());
+                self.message = Some(Message {
+                    title: "Launch command".into(),
+                    lines: command_message_lines(&cmd),
+                });
+            }
+            Err(e) => {
+                self.message =
+                    Some(Message { title: "Cannot build command".into(), lines: vec![e] })
+            }
+        }
+    }
+
+    /// Launch a server for the current selection and jump to the manager (`s`).
+    fn start_session(&mut self) {
+        if self.focus != Pane::Profile && self.focus != Pane::Options {
+            return;
+        }
+        let req = match self.build_launch_request() {
+            Ok(req) => req,
+            Err(e) => {
+                self.message = Some(Message { title: "Cannot launch".into(), lines: vec![e] });
+                return;
+            }
+        };
+        match self.sessions.launch(req) {
+            Ok(idx) => {
+                let endpoint = self.sessions.sessions[idx].record.endpoint();
+                let name = self.sessions.sessions[idx].record.name.clone();
+                self.screen = Screen::Sessions;
+                self.session_sel.select(Some(idx));
+                self.message = Some(Message {
+                    title: "Launched".into(),
+                    lines: vec![name, format!("Starting — {endpoint}")],
+                });
+            }
+            Err(e) => {
+                self.message =
+                    Some(Message { title: "Launch failed".into(), lines: vec![e.to_string()] })
+            }
+        }
+    }
+
+    /// Launch an interactive `llama-cli` chat for the current selection in the
+    /// foreground (`C`). Server-only flags (host/port) are dropped and
+    /// conversation mode is forced; the TUI is suspended while it runs.
+    fn start_chat(&mut self) {
+        if self.focus != Pane::Profile && self.focus != Pane::Options {
+            return;
+        }
+        let req = match self.build_launch_request() {
+            Ok(req) => req,
+            Err(e) => {
+                self.message = Some(Message { title: "Cannot start chat".into(), lines: vec![e] });
+                return;
+            }
+        };
+        let Some(cli) = cli_binary(&req.binary) else {
+            self.message = Some(Message {
+                title: "llama-cli not found".into(),
+                lines: vec![
+                    "Expected a 'llama-cli' binary next to llama-server.".into(),
+                    "Chat mode needs the interactive llama.cpp client.".into(),
+                ],
+            });
+            return;
+        };
+        // Drop server-only flags; keep the model plus sampling/runtime options.
+        let opts: Vec<OptionItem> =
+            req.options.into_iter().filter(|o| o.key != "host" && o.key != "port").collect();
+        let cmd =
+            session::command::Command::build(&cli.display().to_string(), &req.model_path, &opts);
+        let mut argv = cmd.argv;
+        argv.push("-cnv".into()); // conversation/chat mode
+        self.pending_chat = Some(argv);
+    }
+
+    /// Apply a fallible supervisor action to the selected session.
+    fn session_action(&mut self, f: impl Fn(&mut SessionManager, usize) -> Result<()>, verb: &str) {
+        let Some(i) = self.session_sel.selected() else {
+            return;
+        };
+        if let Err(e) = f(&mut self.sessions, i) {
+            self.message =
+                Some(Message { title: format!("Failed to {verb}"), lines: vec![e.to_string()] });
+        }
+    }
+
+    /// Remove a terminated session record (`d`).
+    fn remove_session(&mut self) {
+        let Some(i) = self.session_sel.selected() else {
+            return;
+        };
+        if self.sessions.remove(i) {
+            self.sync_session_selection();
+        } else {
+            self.message = Some(Message {
+                title: "Cannot remove".into(),
+                lines: vec![
+                    "Only Stopped or Crashed sessions can be removed; stop it first.".into(),
+                ],
+            });
+        }
+    }
+
+    /// Copy the selected session's endpoint URL to the clipboard (`c`).
+    fn copy_endpoint(&mut self) {
+        let Some(i) = self.session_sel.selected() else {
+            return;
+        };
+        let endpoint = self.sessions.sessions[i].record.endpoint();
+        copy_to_clipboard(&endpoint);
+        self.message = Some(Message { title: "Endpoint copied".into(), lines: vec![endpoint] });
+    }
+
+    /// Show + copy the selected session's stored launch command (`y`).
+    fn yank_session_command(&mut self) {
+        let Some(i) = self.session_sel.selected() else {
+            return;
+        };
+        let argv = self.sessions.sessions[i].record.command.clone();
+        let cmd = session::command::Command { argv };
+        copy_to_clipboard(&cmd.display());
+        self.message =
+            Some(Message { title: "Session command".into(), lines: command_message_lines(&cmd) });
+    }
+
+    /// Open the log-tail screen for the selected session (`L`).
+    fn open_logs(&mut self) {
+        if self.session_sel.selected().is_none() {
+            return;
+        }
+        self.screen = Screen::Logs;
+        self.log_follow = true;
+        self.log_scroll = 0;
+        self.reload_logs();
+    }
+
+    /// Reload the tail of the selected session's log file.
+    fn reload_logs(&mut self) {
+        let lines = self
+            .session_sel
+            .selected()
+            .and_then(|i| self.sessions.sessions.get(i))
+            .map(|s| read_log_tail(&s.record.log_file, 1000))
+            .unwrap_or_default();
+        self.log_lines = lines;
+    }
+
     /// Handle a keystroke while a modal text prompt is open.
     fn prompt_key(&mut self, key: KeyEvent) {
         match key.code {
@@ -272,29 +646,37 @@ impl App {
         }
     }
 
-    /// Open the option editor. Bool/Enum cycle in place; numeric/string open a
+    /// Open the option editor. Enums cycle in place; numeric/string open a
     /// text prompt. Applies only to real (non-stub) runtimes.
     fn open_editor(&mut self) {
         if self.focus != Pane::Options || self.is_stub_runtime() {
             return;
         }
-        let Some(option) = self.options.selected() else { return };
+        let Some(option) = self.options.selected() else {
+            return;
+        };
         let key = option.key.clone();
         let current = option.value.clone();
 
         if let Some(spec) = profiles::registry::spec(&key) {
             use profiles::registry::OptionKind;
-            // Bool and Enum don't need a text prompt — `e` advances them.
-            if matches!(spec.kind, OptionKind::Bool | OptionKind::Enum(_)) {
-                if let Some(next) = spec.kind.adjust(&current, 1, spec.step) {
+            // Enums don't need a text prompt — `e` advances to the next state
+            // (which, for omittable options, cycles through "default" too).
+            if matches!(spec.kind, OptionKind::Enum(_)) {
+                if let Some(next) = spec.bump(&spec.kind, &current, 1) {
                     self.apply_option_value(&key, next);
                 }
                 return;
             }
         }
+        let title = if profiles::registry::uses_sentinel(&key) {
+            format!("Edit {key} (number or 'default')")
+        } else {
+            format!("Edit {key}")
+        };
         self.prompt = Some(Prompt {
             kind: PromptKind::EditOption { key: key.clone() },
-            title: format!("Edit {key}"),
+            title,
             buffer: current,
             error: None,
         });
@@ -302,39 +684,49 @@ impl App {
 
     /// Increment/decrement the selected option in place (auto-saves).
     fn adjust_option(&mut self, dir: i32) {
-        self.transform_option(|kind, current, step| kind.adjust(current, dir, step));
+        self.transform_option(|spec, kind, current| spec.bump(kind, current, dir));
     }
 
-    /// Set the selected option to its min (`dir < 0`) or max (`dir > 0`).
+    /// Set the selected option to its min/`default` (`dir < 0`) or max (`dir > 0`).
     fn set_option_extreme(&mut self, dir: i32) {
-        self.transform_option(|kind, _current, _step| kind.extreme(dir));
+        self.transform_option(|spec, kind, _current| spec.jump(kind, dir));
     }
 
     /// Shared helper: compute a new value for the selected option and apply it.
     fn transform_option(
         &mut self,
-        f: impl Fn(&profiles::registry::OptionKind, &str, f64) -> Option<String>,
+        f: impl Fn(
+            &profiles::registry::OptionSpec,
+            &profiles::registry::OptionKind,
+            &str,
+        ) -> Option<String>,
     ) {
         if self.focus != Pane::Options || self.is_stub_runtime() {
             return;
         }
-        let Some(option) = self.options.selected() else { return };
+        let Some(option) = self.options.selected() else {
+            return;
+        };
         let key = option.key.clone();
         let current = option.value.clone();
-        let Some(spec) = profiles::registry::spec(&key) else { return };
+        let Some(spec) = profiles::registry::spec(&key) else {
+            return;
+        };
         // Use the model-aware kind so ctx-size respects the model's max context.
         let kind = match self.models.selected() {
             Some(m) => profiles::effective_kind(spec, m),
             None => spec.kind,
         };
-        if let Some(value) = f(&kind, &current, spec.step) {
+        if let Some(value) = f(spec, &kind, &current) {
             self.apply_option_value(&key, value);
         }
     }
 
     /// Validate and commit the open prompt; dispatch by its kind.
     fn commit_prompt(&mut self) {
-        let Some(prompt) = self.prompt.as_ref() else { return };
+        let Some(prompt) = self.prompt.as_ref() else {
+            return;
+        };
         let input = prompt.buffer.trim().to_string();
         let kind = prompt.kind.clone(); // release the borrow before dispatching
         let result = match kind {
@@ -355,6 +747,13 @@ impl App {
 
     fn commit_option_edit(&mut self, key: &str, input: &str) -> Result<(), String> {
         let spec = profiles::registry::spec(key).ok_or("unknown option")?;
+        // Sentinel options accept "default" (or an empty entry) to drop the flag.
+        if profiles::registry::uses_sentinel(key)
+            && (input.is_empty() || input.eq_ignore_ascii_case(profiles::registry::DEFAULT))
+        {
+            self.apply_option_value(key, profiles::registry::DEFAULT.to_string());
+            return Ok(());
+        }
         let kind = match self.models.selected() {
             Some(m) => profiles::effective_kind(spec, m),
             None => spec.kind,
@@ -422,7 +821,9 @@ impl App {
         if self.focus != Pane::Profile || self.is_stub_runtime() {
             return;
         }
-        let Some(p) = self.profiles.selected() else { return };
+        let Some(p) = self.profiles.selected() else {
+            return;
+        };
         if p.builtin {
             return; // built-in templates are read-only
         }
@@ -439,7 +840,9 @@ impl App {
         if self.focus != Pane::Profile || self.is_stub_runtime() {
             return;
         }
-        let Some(p) = self.profiles.selected() else { return };
+        let Some(p) = self.profiles.selected() else {
+            return;
+        };
         let src = p.name.clone();
         self.prompt = Some(Prompt {
             kind: PromptKind::DuplicateProfile { src: src.clone() },
@@ -508,7 +911,8 @@ impl App {
             favorite: false,
         };
         // Copy the source's *current* values (including any instance edits).
-        let values = profiles::current_values(rt, m, &src_profile, &self.store, &self.config.defaults);
+        let values =
+            profiles::current_values(rt, m, &src_profile, &self.store, &self.config.defaults);
         self.store.create(&runtime, &model, name, values, true);
         self.refresh_profiles(Some(name));
         Ok(())
@@ -623,14 +1027,17 @@ impl App {
             self.profiles.replace(profiles);
         }
         if level < Pane::Options.index() {
-            let options =
-                match (self.runtimes.selected(), self.models.selected(), self.profiles.selected()) {
-                    (Some(rt), _, Some(p)) if rt.name == "vLLM" => stubs::options_for(p),
-                    (Some(rt), Some(m), Some(p)) => {
-                        profiles::resolve_options(rt, m, p, &self.store, &self.config.defaults)
-                    }
-                    _ => Vec::new(),
-                };
+            let options = match (
+                self.runtimes.selected(),
+                self.models.selected(),
+                self.profiles.selected(),
+            ) {
+                (Some(rt), _, Some(p)) if rt.name == "vLLM" => stubs::options_for(p),
+                (Some(rt), Some(m), Some(p)) => {
+                    profiles::resolve_options(rt, m, p, &self.store, &self.config.defaults)
+                }
+                _ => Vec::new(),
+            };
             self.options.replace(options);
         }
     }
@@ -764,4 +1171,77 @@ fn default_model_dirs(home: Option<&std::path::Path>) -> Vec<PathBuf> {
     }
 
     dirs
+}
+
+/// Look up a resolved option's value by key.
+fn option_value(options: &[OptionItem], key: &str) -> Option<String> {
+    options.iter().find(|o| o.key == key).map(|o| o.value.clone())
+}
+
+/// Resolve the interactive `llama-cli` binary sitting next to `llama-server`.
+fn cli_binary(server_binary: &str) -> Option<PathBuf> {
+    let p = std::path::Path::new(server_binary);
+    let file = p.file_name()?.to_string_lossy().into_owned();
+    let cli_name = file.replace("llama-server", "llama-cli");
+    if cli_name == file {
+        return None; // not a llama-server-style binary name
+    }
+    let cli = p.with_file_name(cli_name);
+    cli.exists().then_some(cli)
+}
+
+/// Hand the terminal to a foreground process (interactive chat), then re-enter
+/// the TUI. The detached-session supervisor sets `SIGCHLD` to `SIG_IGN`, which
+/// would make `wait()` fail, so default disposition is restored while it runs.
+fn run_chat(terminal: &mut DefaultTerminal, argv: &[String]) -> Result<()> {
+    use std::process::Command as StdCommand;
+    let Some((prog, args)) = argv.split_first() else {
+        return Ok(());
+    };
+
+    ratatui::restore(); // leave the alternate screen + raw mode
+    // SAFETY: setting a signal disposition is async-signal-safe and unconditional.
+    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
+    let status = StdCommand::new(prog).args(args).status();
+    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+
+    if let Err(e) = &status {
+        eprintln!("\n[llmctl] failed to start chat: {e}");
+    }
+    eprintln!("\n[llmctl] chat ended — press Enter to return to llmctl.");
+    let _ = std::io::stdin().read_line(&mut String::new());
+
+    *terminal = ratatui::init();
+    terminal.clear()?;
+    Ok(())
+}
+
+/// The body lines for a command-preview message: the pretty command plus a copy
+/// confirmation.
+fn command_message_lines(cmd: &session::command::Command) -> Vec<String> {
+    let mut lines: Vec<String> = cmd.pretty().lines().map(String::from).collect();
+    lines.push(String::new());
+    lines.push("(copied to clipboard)".into());
+    lines
+}
+
+/// Copy text to the system clipboard via the OSC 52 terminal escape. Works over
+/// SSH and needs no external tool; terminals without support silently ignore it.
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    let payload = session::supervisor::base64(text.as_bytes());
+    let seq = format!("\x1b]52;c;{payload}\x07");
+    let mut out = std::io::stdout();
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
+}
+
+/// Read up to the last `max_lines` lines of a (possibly large) log file.
+fn read_log_tail(path: &std::path::Path, max_lines: usize) -> Vec<String> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let mut lines: Vec<String> = content.lines().map(String::from).collect();
+    if lines.len() > max_lines {
+        lines = lines.split_off(lines.len() - max_lines);
+    }
+    lines
 }

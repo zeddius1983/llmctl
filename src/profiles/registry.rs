@@ -7,7 +7,6 @@
 pub enum OptionKind {
     Int { min: Option<i64>, max: Option<i64> },
     Float { min: Option<f64>, max: Option<f64> },
-    Bool,
     Enum(&'static [&'static str]),
     Str,
 }
@@ -30,7 +29,6 @@ impl OptionKind {
         match self {
             OptionKind::Int { min, max } => Some(int_range(*min, *max)),
             OptionKind::Float { min, max } => Some(float_range(*min, *max)),
-            OptionKind::Bool => Some("true | false".into()),
             OptionKind::Enum(variants) => Some(variants.join(" | ")),
             OptionKind::Str => None,
         }
@@ -50,11 +48,6 @@ impl OptionKind {
                 check_bound(v, *min, *max)?;
                 Ok(input.to_string())
             }
-            OptionKind::Bool => match input.to_ascii_lowercase().as_str() {
-                "true" | "on" | "1" | "yes" => Ok("true".into()),
-                "false" | "off" | "0" | "no" => Ok("false".into()),
-                _ => Err("expected true or false".into()),
-            },
             OptionKind::Enum(variants) => variants
                 .iter()
                 .find(|v| v.eq_ignore_ascii_case(input))
@@ -96,7 +89,6 @@ impl OptionKind {
                 }
                 Some(fmt_float(v))
             }
-            OptionKind::Bool => Some(if current == "true" { "false" } else { "true" }.into()),
             OptionKind::Enum(variants) => {
                 let idx = variants.iter().position(|v| *v == current).unwrap_or(0) as i32;
                 let n = variants.len() as i32;
@@ -108,20 +100,63 @@ impl OptionKind {
     }
 
     /// Jump to the minimum (`dir = -1`) or maximum (`dir = +1`) — Home/End.
+    /// Sentinel-aware stepping/jumping lives on [`OptionSpec`].
     pub fn extreme(&self, dir: i32) -> Option<String> {
         match self {
             OptionKind::Int { min, max } => {
                 if dir < 0 { *min } else { *max }.map(|v| v.to_string())
             }
-            OptionKind::Float { min, max } => {
-                if dir < 0 { *min } else { *max }.map(fmt_float)
-            }
-            OptionKind::Bool => Some(if dir < 0 { "false" } else { "true" }.into()),
+            OptionKind::Float { min, max } => if dir < 0 { *min } else { *max }.map(fmt_float),
             OptionKind::Enum(variants) => {
                 if dir < 0 { variants.first() } else { variants.last() }.map(|v| (*v).to_string())
             }
             OptionKind::Str => None,
         }
+    }
+}
+
+/// Sentinel value (for options with no in-band "auto") meaning "leave this flag
+/// off the command line and rely on llama.cpp's own built-in default".
+pub const DEFAULT: &str = "default";
+
+/// The value at which an option is dropped from the launch command, because it
+/// equals what llama.cpp would do anyway. For on/off/auto enums that's `"auto"`
+/// (llama's own default); for numeric options with no in-band "auto" it's the
+/// [`DEFAULT`] sentinel. `None` means the option is always emitted.
+pub fn omit_token(key: &str) -> Option<&'static str> {
+    match key {
+        "flash-attn" | "reasoning" => Some("auto"),
+        "batch-size" | "gpu-layers" | "threads" => Some(DEFAULT),
+        _ => None,
+    }
+}
+
+/// Whether the option's omitted state is the [`DEFAULT`] sentinel (vs an in-band
+/// enum variant like `"auto"`). Only these get the sentinel editing affordances
+/// (the `default` text entry and the `Home`-resets-to-default jump).
+pub fn uses_sentinel(key: &str) -> bool {
+    omit_token(key) == Some(DEFAULT)
+}
+
+impl OptionSpec {
+    /// Step the value by one increment (`dir = ±1`) for `+`/`-` and the `e`
+    /// cycle. For sentinel options [`DEFAULT`] sits just below the numeric range:
+    /// stepping up from it enters the concrete default; enums (whose omitted
+    /// state is an ordinary `"auto"` variant) just cycle normally.
+    pub fn bump(&self, kind: &OptionKind, current: &str, dir: i32) -> Option<String> {
+        if uses_sentinel(self.key) && current == DEFAULT {
+            return Some(if dir > 0 { self.default.to_string() } else { DEFAULT.to_string() });
+        }
+        kind.adjust(current, dir, self.step)
+    }
+
+    /// Home/End jump: for sentinel options `Home` resets to [`DEFAULT`];
+    /// otherwise this is [`OptionKind::extreme`].
+    pub fn jump(&self, kind: &OptionKind, dir: i32) -> Option<String> {
+        if uses_sentinel(self.key) && dir < 0 {
+            return Some(DEFAULT.to_string());
+        }
+        kind.extreme(dir)
     }
 }
 
@@ -164,7 +199,7 @@ fn fmt_float(v: f64) -> String {
     trimmed.to_string()
 }
 
-use OptionKind::{Bool, Enum, Float, Int, Str};
+use OptionKind::{Enum, Float, Int, Str};
 
 /// The MVP option set for llama-server.
 pub static REGISTRY: &[OptionSpec] = &[
@@ -180,9 +215,9 @@ pub static REGISTRY: &[OptionSpec] = &[
         key: "gpu-layers",
         cli: "-ngl",
         kind: Int { min: Some(0), max: Some(999) },
-        default: "0",
+        default: "999",
         step: 1.0,
-        description: "Number of model layers to offload to the GPU.",
+        description: "Layers to offload to the GPU (999 = all; 'default' lets llama.cpp decide).",
     },
     OptionSpec {
         key: "temperature",
@@ -230,7 +265,7 @@ pub static REGISTRY: &[OptionSpec] = &[
         kind: Int { min: Some(0), max: None },
         default: "0",
         step: 1.0,
-        description: "CPU threads for generation (0 = auto-detect).",
+        description: "CPU threads for generation ('default' lets llama.cpp auto-detect, i.e. -1).",
     },
     OptionSpec {
         key: "batch-size",
@@ -238,15 +273,23 @@ pub static REGISTRY: &[OptionSpec] = &[
         kind: Int { min: Some(1), max: None },
         default: "2048",
         step: 256.0,
-        description: "Logical batch size for prompt processing.",
+        description: "Logical batch size for prompt processing ('default' = llama.cpp's 2048).",
     },
     OptionSpec {
         key: "flash-attn",
         cli: "--flash-attn",
-        kind: Bool,
-        default: "false",
+        kind: Enum(&["auto", "on", "off"]),
+        default: "auto",
         step: 1.0,
-        description: "Enable flash attention (faster, lower memory where supported).",
+        description: "Flash attention (auto = llama.cpp default; omitted from command).",
+    },
+    OptionSpec {
+        key: "reasoning",
+        cli: "--reasoning",
+        kind: Enum(&["auto", "on", "off"]),
+        default: "auto",
+        step: 1.0,
+        description: "Reasoning/thinking in chat (auto = llama.cpp default; omitted from command).",
     },
     OptionSpec {
         key: "cache-type-k",
@@ -300,11 +343,28 @@ mod tests {
     }
 
     #[test]
-    fn bool_normalizes_synonyms() {
-        let kind = spec("flash-attn").unwrap().kind;
-        assert_eq!(kind.validate("on").unwrap(), "true");
-        assert_eq!(kind.validate("0").unwrap(), "false");
-        assert!(kind.validate("maybe").is_err());
+    fn flash_attn_is_an_enum_dropped_when_auto() {
+        let spec = spec("flash-attn").unwrap();
+        assert_eq!(spec.kind.validate("OFF").unwrap(), "off");
+        assert!(spec.kind.validate("true").is_err()); // legacy bool is not a variant
+        // "auto" is the omitted state; it cycles like any variant (no sentinel).
+        assert_eq!(omit_token("flash-attn"), Some("auto"));
+        assert_eq!(spec.bump(&spec.kind, "auto", 1), Some("on".into()));
+        assert_eq!(spec.jump(&spec.kind, -1), Some("auto".into())); // Home → auto (default)
+    }
+
+    #[test]
+    fn numeric_omittables_fold_the_default_sentinel() {
+        assert_eq!(omit_token("batch-size"), Some(DEFAULT));
+        assert_eq!(omit_token("threads"), Some(DEFAULT));
+        assert_eq!(omit_token("ctx-size"), None); // always emitted
+
+        // Stepping up from DEFAULT enters the concrete base; Home resets.
+        let ngl = spec("gpu-layers").unwrap();
+        assert_eq!(ngl.bump(&ngl.kind, DEFAULT, 1), Some("999".into()));
+        assert_eq!(ngl.bump(&ngl.kind, DEFAULT, -1), Some(DEFAULT.into()));
+        assert_eq!(ngl.jump(&ngl.kind, -1), Some(DEFAULT.into())); // Home → default
+        assert_eq!(ngl.jump(&ngl.kind, 1), Some("999".into())); // End → max
     }
 
     #[test]
