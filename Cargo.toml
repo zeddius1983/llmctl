@@ -1,0 +1,21 @@
+[package]
+name = "llmctl"
+version = "0.1.0"
+edition = "2024"
+description = "Keyboard-driven TUI for managing local llama.cpp servers"
+license = "MIT"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+directories = "5"
+walkdir = "2"
+regex = "1"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"
