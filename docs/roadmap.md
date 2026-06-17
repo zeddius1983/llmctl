@@ -11,13 +11,18 @@ Living status of the build. Update this when phases complete or scope shifts
 | 1 | Runtime & GGUF model discovery | ✅ Done |
 | 2 | Profiles & options | ✅ Done |
 | 3 | Launch & sessions (MVP milestone) | ✅ Done |
-| 4 | Log search & startup-failure classification | ⏳ Next |
-| 5 | Search/filter & polish | ◻ Planned |
+| 4 | Log search & startup-failure classification | ◻ Post-v0.1.0 |
+| 5 | Search/filter & polish | ◻ Post-v0.1.0 |
+
+**v0.1.0 released** — Phases 0–3 (the MVP), plus extra launch options
+(`--no-mmap`, `--cache-type-k`/`-v`, speculative decoding) and a README, were
+merged via the `feature/v0.1.0` umbrella and tagged `v0.1.0` on `main`. Phases 4
+and 5 are deferred to a future release; the roadmap will be revisited then.
 
 Branching: each remaining phase is built on its own `feature/<task>` branch.
-When all planned phases are done, they merge into the release umbrella
-**`feature/v0.1.0`**, which then merges to `main`. (Early `phase-*`/`docs`
-branches predate this policy and are grandfathered.)
+When a batch is ready to ship, the feature branches merge into a release umbrella
+(e.g. **`feature/v0.1.0`**), which then merges to `main` and is tagged. (Early
+`phase-*`/`docs` branches predate this policy and are grandfathered.)
 
 ## Done
 
@@ -54,7 +59,14 @@ Starting→Running; rediscover + prune `session-<id>.json` on startup; `x`/`K`/`
 stop/kill/restart; `c` copy endpoint; tailing `L` log view; periodic poll-tick
 refresh. 21 tests (incl. ignored real-process integration tests).
 
-## Next
+### v0.1.0 release polish
+Extra `llama-server` launch options: `mmap` (emits the bare `--no-mmap` flag when
+off, for ROCm/AMD), KV `--cache-type-k`/`--cache-type-v` (enum with an in-band
+`default` that omits the flag), and speculative decoding (`--spec-type`,
+`--spec-draft-n-max`, `--spec-draft-n-min`, available for all models). Added a
+top-level `README.md`.
+
+## Next (post-v0.1.0)
 
 ### Phase 4 — Log search & startup-failure classification
 - [ ] Log view search / filtering (`L` already tails + scrolls)
