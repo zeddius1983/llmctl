@@ -16,8 +16,9 @@ and watch them from a built-in session manager.
 - **Yazi-style navigation** — a sliding three-column view over the hierarchy
   `Runtime ▸ Model ▸ Profile ▸ Options`, driven entirely from the keyboard
   (`hjkl`, `g`/`G`, drill in / back out).
-- **Model discovery** — recursively scans your configured directories plus
-  well-known locations (llama.cpp cache, HuggingFace hub, LM Studio, `~/models`).
+- **Model discovery** — recursively scans your configured directories, or (when
+  none are configured) well-known locations (llama.cpp cache, HuggingFace hub,
+  LM Studio, `~/models`).
   Reads GGUF headers for architecture, context length, quantization, and embedded
   chat template; dedupes multi-shard models and sums their sizes. `F5` to rescan.
 - **Profiles & options** — built-in, read-only templates (Default, Chat, Coding,
@@ -126,8 +127,8 @@ a config file is optional. To customize, create
 `~/.config/llmctl/config.toml`:
 
 ```toml
-# Extra directories to scan recursively for GGUF models.
-# (well-known locations are always scanned in addition to these)
+# Directories scanned recursively for GGUF models. When set, ONLY these are
+# scanned; leave unset to fall back to the well-known locations listed below.
 [models]
 paths = ["/data/models", "~/work/ggufs"]
 
@@ -148,10 +149,12 @@ port = 8000
 | `~/.local/state/llmctl/` | Profile instances, session records, logs |
 | `~/.cache/llmctl/` | Model & runtime scan cache |
 
-Model directories scanned by default (in addition to `[models].paths`):
-`$LLAMA_CACHE` or `~/.cache/llama.cpp`, the HuggingFace hub cache
+When `[models].paths` is unset, llmctl falls back to scanning the well-known
+locations: `$LLAMA_CACHE` or `~/.cache/llama.cpp`, the HuggingFace hub cache
 (`$HUGGINGFACE_HUB_CACHE` / `$HF_HOME/hub` / `~/.cache/huggingface/hub`),
-`~/.lmstudio/models`, and `~/models`. Your `$HOME` is never scanned wholesale.
+`~/.lmstudio/models`, and `~/models`. Setting `paths` replaces this fallback —
+only the directories you list are scanned. Your `$HOME` is never scanned
+wholesale.
 
 ## Roadmap
 

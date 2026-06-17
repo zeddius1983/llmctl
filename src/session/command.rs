@@ -50,8 +50,8 @@ impl Command {
             return String::new();
         }
         let mut lines: Vec<String> = vec![shell_quote(&self.argv[0])];
-        let mut i = 1;
         let args = &self.argv[1..];
+        let mut i = 0;
         while i < args.len() {
             // Group a flag with its value (a token starting with '-' that is
             // followed by a non-flag token takes that token as its value).
@@ -182,6 +182,7 @@ mod tests {
     fn pretty_groups_flag_and_value_per_line() {
         let cmd = Command::build("llama-server", "/m/x.gguf", &sample_options());
         let pretty = cmd.pretty();
+        assert!(pretty.contains("-m /m/x.gguf")); // model flag + path grouped, not orphaned
         assert!(pretty.contains("--ctx-size 32768"));
         assert!(pretty.contains("--flash-attn on")); // flag + value grouped
         assert!(pretty.contains(" \\\n")); // line continuations
