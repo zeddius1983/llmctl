@@ -4,6 +4,18 @@ version = "0.1.0"
 edition = "2024"
 description = "Keyboard-driven TUI for managing local llama.cpp servers"
 license = "MIT"
+repository = "https://github.com/zeddius1983/llmctl"
+
+# Lets `cargo binstall llmctl` fetch the prebuilt binaries from the GitHub
+# Release instead of compiling. URL matches the archive name produced by the
+# release workflow (.github/workflows/release.yml).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.{ archive-format }"
+pkg-fmt = "tgz"
+
+# Slim down the binaries we distribute.
+[profile.release]
+strip = true
 
 [dependencies]
 ratatui = "0.29"

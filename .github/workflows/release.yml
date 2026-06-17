@@ -1,0 +1,38 @@
+name: Release
+
+# Build prebuilt Linux binaries and attach them to the GitHub Release.
+# Fires when a `v*` tag is pushed; can also be run manually from the Actions tab
+# against an existing tag (use the ref selector) to (re)produce its artifacts.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write # required to upload assets to the release
+
+jobs:
+  upload-assets:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          # Dynamically linked against the host glibc.
+          - x86_64-unknown-linux-gnu
+          # Fully static, no glibc version dependency — runs on any Linux.
+          - x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and upload ${{ matrix.target }}
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: llmctl
+          target: ${{ matrix.target }}
+          # Archive name, e.g. llmctl-v0.1.0-x86_64-unknown-linux-musl.tar.gz
+          archive: $bin-$tag-$target
+          tar: unix
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}
