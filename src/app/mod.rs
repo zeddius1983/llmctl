@@ -881,7 +881,7 @@ impl App {
         let runtime = rt.name.clone();
         let model = store::model_key(&m.path);
         let profile = p.clone();
-        let base = profiles::resolved_values(&profile, &self.config.defaults);
+        let base = profiles::resolved_values(&profile, m, &self.config.defaults);
 
         let cursor = self.options.state.selected();
         self.store.set_value(&runtime, &model, &profile.name, key, value, &base);
@@ -902,7 +902,7 @@ impl App {
         let runtime = rt.name.clone();
         let model = store::model_key(&m.path);
         let profile = p.clone();
-        let base = profiles::resolved_values(&profile, &self.config.defaults);
+        let base = profiles::resolved_values(&profile, m, &self.config.defaults);
 
         let cursor = self.profiles.state.selected();
         self.store.toggle_favorite(&runtime, &model, &profile.name, &base);
@@ -986,9 +986,10 @@ impl App {
     fn commit_new_profile(&mut self, name: &str) -> Result<(), String> {
         self.validate_new_name(name)?;
         let (runtime, model) = self.current_runtime_model().ok_or("no model selected")?;
-        // Seed from the Default template's resolved values.
+        let m = self.models.selected().ok_or("no model selected")?;
+        // Seed from the Default template's resolved values for this model.
         let default = Profile { name: "Default".into(), builtin: true, favorite: false };
-        let values = profiles::resolved_values(&default, &self.config.defaults);
+        let values = profiles::resolved_values(&default, m, &self.config.defaults);
         self.store.create(&runtime, &model, name, values, true);
         self.refresh_profiles(Some(name));
         Ok(())

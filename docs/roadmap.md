@@ -77,7 +77,10 @@ needs the concrete endpoint). New options: `reasoning-effort` (delivered as
 54 built-in template names), `jinja` (bare `--no-jinja` when off). Editing: `d`
 resets an option to its resolved default; `Home`/`End` are pure min/max; `Enter`
 edits in Options; enums with >8 variants open a filterable selector popup
-instead of cycling.
+instead of cycling. Bugfix: the base snapshot that seeds a profile instance on
+first edit/favorite/create is now model-aware, so materializing no longer reset
+unedited options (ctx-size silently fell from the ctx/8 default back to the
+global 4096).
 
 ## Next (post-v0.1.0)
 

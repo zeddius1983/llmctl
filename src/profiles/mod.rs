@@ -60,13 +60,7 @@ pub fn resolve_options(
     registry::REGISTRY
         .iter()
         .map(|spec| {
-            let default = match registry::omit_token(spec.key) {
-                // ctx-size is omittable but must not *start* omitted: 'default'
-                // means the model's full trained context, which can exhaust
-                // memory. It starts at the ctx/8 heuristic instead.
-                Some(token) if spec.key != "ctx-size" => token.to_string(),
-                _ => model_default(spec, model, defaults),
-            };
+            let default = spec_default(spec, model, defaults);
 
             let value = instance
                 .and_then(|i| i.values.get(spec.key).cloned())
@@ -102,22 +96,38 @@ pub fn current_values(
         .collect()
 }
 
-/// The resolved template values for a profile (used to seed a new instance).
-pub fn resolved_values(profile: &Profile, defaults: &Defaults) -> BTreeMap<String, String> {
+/// The resolved template values for a (profile, model) — the no-instance layer
+/// of [`resolve_options`]. Used as the base snapshot when materializing an
+/// instance on first edit/favorite; it must match what the Options pane was
+/// showing, or the first edit would silently shift unedited options (e.g.
+/// ctx-size from the model-aware ctx/8 back to the global 4096).
+pub fn resolved_values(
+    profile: &Profile,
+    model: &Model,
+    defaults: &Defaults,
+) -> BTreeMap<String, String> {
     let template = templates::find(&profile.name);
     registry::REGISTRY
         .iter()
         .map(|spec| {
-            let value = template.and_then(|t| override_value(t, spec.key)).unwrap_or_else(|| {
-                match registry::omit_token(spec.key) {
-                    // Same ctx-size carve-out as in [`resolve_options`].
-                    Some(token) if spec.key != "ctx-size" => token.to_string(),
-                    _ => config_default(spec, defaults),
-                }
-            });
-            (spec.key.to_string(), value)
+            let value = template
+                .and_then(|t| override_value(t, spec.key))
+                .unwrap_or_else(|| spec_default(spec, model, defaults));
+            let value = clamp_ctx_to_model(spec.key, value, model);
+            (spec.key.to_string(), normalize_legacy(spec.key, value))
         })
         .collect()
+}
+
+/// The model-aware default for an option: the omit token for omittable options,
+/// except ctx-size, which must not *start* omitted — its 'default' means the
+/// model's full trained context, which can exhaust memory — and begins at the
+/// ctx/8 heuristic instead.
+fn spec_default(spec: &registry::OptionSpec, model: &Model, defaults: &Defaults) -> String {
+    match registry::omit_token(spec.key) {
+        Some(token) if spec.key != "ctx-size" => token.to_string(),
+        _ => model_default(spec, model, defaults),
+    }
 }
 
 /// Registry default, overridden by config for host/port.
@@ -332,6 +342,30 @@ mod tests {
         assert_eq!(value_of(&opts, "spec-type"), "none");
         assert_eq!(value_of(&opts, "spec-draft-n-max"), registry::DEFAULT);
         assert_eq!(value_of(&opts, "spec-draft-n-min"), registry::DEFAULT);
+    }
+
+    #[test]
+    fn materializing_an_instance_keeps_model_aware_defaults() {
+        // Regression: editing one option materializes the instance from the
+        // resolved base; that base must be model-aware, or unedited options
+        // silently shift (ctx-size from ctx/8 = 32768 back to the global 4096).
+        let m = model_with_ctx(Some(262144));
+        let mut store = empty_store();
+        let base = resolved_values(&profile("Default"), &m, &Defaults::default());
+        store.set_value("llama.cpp", "/tmp/x.gguf", "Default", "temperature", "0.5".into(), &base);
+        let opts =
+            resolve_options(&runtime(), &m, &profile("Default"), &store, &Defaults::default());
+        assert_eq!(value_of(&opts, "temperature"), "0.5");
+        assert_eq!(value_of(&opts, "ctx-size"), "32768"); // still the ctx/8 default
+    }
+
+    #[test]
+    fn resolved_values_clamp_template_ctx_to_the_model() {
+        // The base snapshot applies the same ctx clamp as the display path:
+        // Long Context's 131072 override folds to a 2048-ctx model's max.
+        let m = model_with_ctx(Some(2048));
+        let base = resolved_values(&profile("Long Context"), &m, &Defaults::default());
+        assert_eq!(base.get("ctx-size").unwrap(), "2048");
     }
 
     #[test]
