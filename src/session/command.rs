@@ -22,7 +22,9 @@ impl Command {
     /// at its [`registry::omit_token`] (e.g. `flash-attn=auto`, or a numeric at
     /// the `default` sentinel) is skipped so llama.cpp applies its own default.
     /// Valueless boolean flags ([`registry::is_flag`], e.g. `--no-mmap`) emit the
-    /// bare flag with no following value.
+    /// bare flag with no following value. Values pass through
+    /// [`registry::cli_value`], which rewrites the ones whose on-disk form isn't
+    /// the literal argv token (e.g. `reasoning-effort` → a JSON kwarg).
     pub fn build(binary: &str, model_path: &str, options: &[OptionItem]) -> Self {
         let mut argv = vec![binary.to_string(), "-m".to_string(), model_path.to_string()];
 
@@ -32,7 +34,7 @@ impl Command {
             }
             argv.push(opt.cli.clone());
             if !registry::is_flag(&opt.key) {
-                argv.push(opt.value.clone());
+                argv.push(registry::cli_value(&opt.key, &opt.value));
             }
         }
         Self { argv }
@@ -151,6 +153,51 @@ mod tests {
         assert!(!cmd.argv.iter().any(|a| a == "--flash-attn"));
         assert!(!cmd.argv.iter().any(|a| a == "--batch-size"));
         assert!(cmd.argv.iter().all(|a| a != registry::DEFAULT && a != "auto"));
+    }
+
+    #[test]
+    fn sampling_params_at_default_are_omitted() {
+        let mut opts = sample_options();
+        opts[2] = opt("temperature", registry::DEFAULT, "--temp");
+        opts.push(opt("top-k", registry::DEFAULT, "--top-k"));
+        let cmd = Command::build("llama-server", "/m/x.gguf", &opts);
+        assert!(!cmd.argv.iter().any(|a| a == "--temp" || a == "--top-k"));
+    }
+
+    #[test]
+    fn reasoning_effort_emits_chat_template_kwargs_json() {
+        let mut opts = sample_options();
+        opts.push(opt("reasoning-effort", "high", "--chat-template-kwargs"));
+        let cmd = Command::build("llama-server", "/m/x.gguf", &opts);
+        let i = cmd.argv.iter().position(|a| a == "--chat-template-kwargs").unwrap();
+        assert_eq!(cmd.argv[i + 1], r#"{"reasoning_effort":"high"}"#);
+        // The JSON is shell-quoted in the copy/paste form.
+        assert!(cmd.display().contains(r#"'{"reasoning_effort":"high"}'"#));
+
+        // At "default" the kwarg is dropped entirely.
+        opts.pop();
+        opts.push(opt("reasoning-effort", "default", "--chat-template-kwargs"));
+        let cmd = Command::build("llama-server", "/m/x.gguf", &opts);
+        assert!(!cmd.argv.iter().any(|a| a == "--chat-template-kwargs"));
+    }
+
+    #[test]
+    fn jinja_off_emits_bare_no_jinja_flag_and_chat_template_its_name() {
+        let mut opts = sample_options();
+        opts.push(opt("jinja", "off", "--no-jinja"));
+        opts.push(opt("chat-template", "llama3", "--chat-template"));
+        let cmd = Command::build("llama-server", "/m/x.gguf", &opts);
+        assert!(cmd.argv.iter().any(|a| a == "--no-jinja"));
+        let i = cmd.argv.iter().position(|a| a == "--chat-template").unwrap();
+        assert_eq!(cmd.argv[i + 1], "llama3");
+
+        // At their omit tokens both disappear.
+        let opts = vec![
+            opt("jinja", "on", "--no-jinja"),
+            opt("chat-template", "default", "--chat-template"),
+        ];
+        let cmd = Command::build("llama-server", "/m/x.gguf", &opts);
+        assert_eq!(cmd.argv, vec!["llama-server", "-m", "/m/x.gguf"]);
     }
 
     #[test]

@@ -43,6 +43,37 @@ pub struct Message {
     pub lines: Vec<String>,
 }
 
+/// Enums with more variants than this open a [`Selector`] popup on `e`/Enter
+/// instead of cycling in place.
+const SELECTOR_THRESHOLD: usize = 8;
+
+/// A modal single-select list (combo box) for large enums like chat-template:
+/// type to filter, arrows to move, Enter to pick — instead of blind cycling.
+pub struct Selector {
+    /// Option key the picked value applies to.
+    pub key: String,
+    pub title: String,
+    /// All enum variants, in registry order.
+    pub variants: Vec<&'static str>,
+    /// Case-insensitive substring filter typed so far.
+    pub filter: String,
+    /// Cursor index into [`Self::filtered`].
+    pub cursor: usize,
+}
+
+impl Selector {
+    /// Variants matching the current filter (case-insensitive substring).
+    pub fn filtered(&self) -> Vec<&'static str> {
+        let needle = self.filter.to_lowercase();
+        self.variants.iter().filter(|v| v.to_lowercase().contains(&needle)).copied().collect()
+    }
+
+    /// The variant under the cursor, if any survives the filter.
+    pub fn selected(&self) -> Option<&'static str> {
+        self.filtered().get(self.cursor).copied()
+    }
+}
+
 /// The top-level screen the UI is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -161,6 +192,8 @@ pub struct App {
     pub options: PaneList<OptionItem>,
     pub show_help: bool,
     pub prompt: Option<Prompt>,
+    /// A modal enum-variant selector (combo box), if open.
+    pub selector: Option<Selector>,
     /// A read-only modal message overlay, if any.
     pub message: Option<Message>,
     /// Which top-level screen is active.
@@ -211,6 +244,7 @@ impl App {
             options: PaneList::new(Vec::new()),
             show_help: false,
             prompt: None,
+            selector: None,
             message: None,
             screen: Screen::Browser,
             sessions,
@@ -278,6 +312,11 @@ impl App {
             self.prompt_key(key);
             return;
         }
+        // So is the enum-variant selector.
+        if self.selector.is_some() {
+            self.selector_key(key);
+            return;
+        }
         // Help overlay swallows input apart from its own dismissal keys.
         if self.show_help {
             match key.code {
@@ -304,7 +343,9 @@ impl App {
             KeyCode::Char('s') => self.start_session(),
             KeyCode::Char('C') => self.start_chat(),
 
-            // Move focus across panes.
+            // Move focus across panes. In Options (the leaf) Enter edits the
+            // selected value instead; `l`/Right stay pure navigation.
+            KeyCode::Enter if self.focus == Pane::Options => self.open_editor(),
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => self.enter(),
             KeyCode::Char('h') | KeyCode::Left => self.focus = self.focus.prev(),
 
@@ -329,10 +370,12 @@ impl App {
             KeyCode::Char('e') => self.open_editor(),
             KeyCode::Char('f') => self.toggle_favorite(),
 
-            // Profile management (Profile pane).
+            // Profile management (Profile pane); in Options, `d` resets the
+            // selected option to its resolved default instead.
             KeyCode::Char('a') => self.prompt_new_profile(),
             KeyCode::Char('r') => self.prompt_rename_profile(),
             KeyCode::Char('D') => self.prompt_duplicate_profile(),
+            KeyCode::Char('d') if self.focus == Pane::Options => self.reset_option_default(),
             KeyCode::Char('d') => self.delete_profile(),
 
             // Re-scan model directories.
@@ -646,8 +689,46 @@ impl App {
         }
     }
 
-    /// Open the option editor. Enums cycle in place; numeric/string open a
-    /// text prompt. Applies only to real (non-stub) runtimes.
+    /// Handle a keystroke while the enum-variant selector is open: printable
+    /// keys narrow the filter, arrows/Home/End move, Enter picks, Esc cancels.
+    fn selector_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.selector = None,
+            KeyCode::Enter => {
+                if let Some(sel) = self.selector.take() {
+                    if let Some(value) = sel.selected() {
+                        self.apply_option_value(&sel.key, value.to_string());
+                    }
+                }
+            }
+            _ => {
+                let Some(sel) = self.selector.as_mut() else {
+                    return;
+                };
+                match key.code {
+                    KeyCode::Up => sel.cursor = sel.cursor.saturating_sub(1),
+                    KeyCode::Down => {
+                        sel.cursor = (sel.cursor + 1).min(sel.filtered().len().saturating_sub(1))
+                    }
+                    KeyCode::Home => sel.cursor = 0,
+                    KeyCode::End => sel.cursor = sel.filtered().len().saturating_sub(1),
+                    KeyCode::Backspace => {
+                        sel.filter.pop();
+                        sel.cursor = 0;
+                    }
+                    KeyCode::Char(c) => {
+                        sel.filter.push(c);
+                        sel.cursor = 0;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Open the option editor. Small enums cycle in place, large ones
+    /// ([`SELECTOR_THRESHOLD`]) open the filterable selector popup; numeric/
+    /// string open a text prompt. Applies only to real (non-stub) runtimes.
     fn open_editor(&mut self) {
         if self.focus != Pane::Options || self.is_stub_runtime() {
             return;
@@ -660,9 +741,20 @@ impl App {
 
         if let Some(spec) = profiles::registry::spec(&key) {
             use profiles::registry::OptionKind;
-            // Enums don't need a text prompt — `e` advances to the next state
-            // (which, for omittable options, cycles through "default" too).
-            if matches!(spec.kind, OptionKind::Enum(_)) {
+            if let OptionKind::Enum(variants) = spec.kind {
+                if variants.len() > SELECTOR_THRESHOLD {
+                    self.selector = Some(Selector {
+                        title: format!("Select {key}"),
+                        key,
+                        variants: variants.to_vec(),
+                        filter: String::new(),
+                        // Start on the current value.
+                        cursor: variants.iter().position(|v| *v == current).unwrap_or(0),
+                    });
+                    return;
+                }
+                // Small enums don't need a popup — `e` advances to the next
+                // state (which, for omittable options, cycles "default" too).
                 if let Some(next) = spec.bump(&spec.kind, &current, 1) {
                     self.apply_option_value(&key, next);
                 }
@@ -682,14 +774,29 @@ impl App {
         });
     }
 
+    /// Reset the selected option to its resolved default (`d` in Options).
+    /// Unlike `Home`, this restores the *resolved* default — the omit token for
+    /// omittable options, but e.g. ctx/8 for ctx-size or the config host/port.
+    fn reset_option_default(&mut self) {
+        if self.focus != Pane::Options || self.is_stub_runtime() {
+            return;
+        }
+        let Some(option) = self.options.selected() else {
+            return;
+        };
+        let key = option.key.clone();
+        let default = option.default.clone();
+        self.apply_option_value(&key, default);
+    }
+
     /// Increment/decrement the selected option in place (auto-saves).
     fn adjust_option(&mut self, dir: i32) {
         self.transform_option(|spec, kind, current| spec.bump(kind, current, dir));
     }
 
-    /// Set the selected option to its min/`default` (`dir < 0`) or max (`dir > 0`).
+    /// Set the selected option to its min (`dir < 0`) or max (`dir > 0`).
     fn set_option_extreme(&mut self, dir: i32) {
-        self.transform_option(|spec, kind, _current| spec.jump(kind, dir));
+        self.transform_option(|_spec, kind, _current| kind.extreme(dir));
     }
 
     /// Shared helper: compute a new value for the selected option and apply it.
@@ -1244,4 +1351,58 @@ fn read_log_tail(path: &std::path::Path, max_lines: usize) -> Vec<String> {
         lines = lines.split_off(lines.len() - max_lines);
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn selector() -> Selector {
+        Selector {
+            key: "chat-template".into(),
+            title: "Select chat-template".into(),
+            variants: vec!["default", "chatml", "llama2", "llama3", "mistral-v1", "zephyr"],
+            filter: String::new(),
+            cursor: 0,
+        }
+    }
+
+    #[test]
+    fn selector_filters_case_insensitive_substring() {
+        let mut sel = selector();
+        sel.filter = "LLaMA".into();
+        assert_eq!(sel.filtered(), vec!["llama2", "llama3"]);
+        sel.filter = "tral".into(); // substring, not just prefix
+        assert_eq!(sel.filtered(), vec!["mistral-v1"]);
+        sel.filter = "nope".into();
+        assert!(sel.filtered().is_empty());
+        assert_eq!(sel.selected(), None);
+    }
+
+    #[test]
+    fn selector_selection_tracks_the_filtered_list() {
+        let mut sel = selector();
+        assert_eq!(sel.selected(), Some("default")); // cursor 0, no filter
+        sel.filter = "llama".into();
+        sel.cursor = 1;
+        assert_eq!(sel.selected(), Some("llama3"));
+        sel.cursor = 5; // beyond the filtered list
+        assert_eq!(sel.selected(), None);
+    }
+
+    #[test]
+    fn chat_template_enum_exceeds_the_selector_threshold() {
+        use crate::profiles::registry::{self, OptionKind};
+        let spec = registry::spec("chat-template").unwrap();
+        let OptionKind::Enum(variants) = spec.kind else {
+            panic!("chat-template should be an enum");
+        };
+        assert!(variants.len() > SELECTOR_THRESHOLD);
+        // The small on/off/auto enums keep cycling in place.
+        let flash = registry::spec("flash-attn").unwrap();
+        let OptionKind::Enum(variants) = flash.kind else {
+            panic!("flash-attn should be an enum");
+        };
+        assert!(variants.len() <= SELECTOR_THRESHOLD);
+    }
 }

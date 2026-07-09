@@ -100,7 +100,8 @@ impl OptionKind {
     }
 
     /// Jump to the minimum (`dir = -1`) or maximum (`dir = +1`) — Home/End.
-    /// Sentinel-aware stepping/jumping lives on [`OptionSpec`].
+    /// Sentinel-aware stepping lives on [`OptionSpec::bump`]; resetting to the
+    /// default is the `d` key (app-level), not a jump.
     pub fn extreme(&self, dir: i32) -> Option<String> {
         match self {
             OptionKind::Int { min, max } => {
@@ -132,8 +133,16 @@ pub fn omit_token(key: &str) -> Option<&'static str> {
         "mmap" => Some("on"),
         // Speculative decoding is off by default.
         "spec-type" => Some("none"),
+        // `jinja=on` is llama.cpp's default (omitted); `off` adds the bare
+        // `--no-jinja` flag (see [`is_flag`]).
+        "jinja" => Some("on"),
         "batch-size" | "gpu-layers" | "threads" | "cache-type-k" | "cache-type-v"
-        | "spec-draft-n-max" | "spec-draft-n-min" => Some(DEFAULT),
+        | "spec-draft-n-max" | "spec-draft-n-min" | "reasoning-effort" | "chat-template"
+        | "ctx-size" | "temperature" | "top-p" | "top-k" | "min-p" | "repeat-penalty" => {
+            Some(DEFAULT)
+        }
+        // host/port are never omitted: llmctl itself needs the concrete
+        // endpoint for health checks and the Session Manager display.
         _ => None,
     }
 }
@@ -141,13 +150,24 @@ pub fn omit_token(key: &str) -> Option<&'static str> {
 /// Whether the option is a valueless boolean flag (e.g. `mmap` → `--no-mmap`):
 /// when not at its [`omit_token`] it emits the bare flag with no value token.
 pub fn is_flag(key: &str) -> bool {
-    matches!(key, "mmap")
+    matches!(key, "mmap" | "jinja")
+}
+
+/// The value token actually emitted on the command line. Most options pass
+/// their value through verbatim; `reasoning-effort` has no native llama-server
+/// flag and is delivered to the chat template as a JSON kwarg via
+/// `--chat-template-kwargs` (how GPT-OSS-style templates receive it).
+pub fn cli_value(key: &str, value: &str) -> String {
+    match key {
+        "reasoning-effort" => format!(r#"{{"reasoning_effort":"{value}"}}"#),
+        _ => value.to_string(),
+    }
 }
 
 /// Whether the option's omitted state is the [`DEFAULT`] sentinel (vs an in-band
 /// enum variant like `"auto"` or an enum's own `"default"` choice). Only these
-/// get the sentinel editing affordances (the `default` text entry and the
-/// `Home`-resets-to-default jump); enums cycle through their variants instead.
+/// get the sentinel editing affordances (the `default` text entry); enums cycle
+/// through their variants instead.
 pub fn uses_sentinel(key: &str) -> bool {
     omit_token(key) == Some(DEFAULT)
         && !matches!(spec(key).map(|s| s.kind), Some(OptionKind::Enum(_)))
@@ -163,15 +183,6 @@ impl OptionSpec {
             return Some(if dir > 0 { self.default.to_string() } else { DEFAULT.to_string() });
         }
         kind.adjust(current, dir, self.step)
-    }
-
-    /// Home/End jump: for sentinel options `Home` resets to [`DEFAULT`];
-    /// otherwise this is [`OptionKind::extreme`].
-    pub fn jump(&self, kind: &OptionKind, dir: i32) -> Option<String> {
-        if uses_sentinel(self.key) && dir < 0 {
-            return Some(DEFAULT.to_string());
-        }
-        kind.extreme(dir)
     }
 }
 
@@ -216,6 +227,67 @@ fn fmt_float(v: f64) -> String {
 
 use OptionKind::{Enum, Float, Int, Str};
 
+/// Built-in chat template names accepted by `--chat-template` (from
+/// `llama-server --help`), with a leading `"default"` omit variant meaning
+/// "use the template from the model's GGUF metadata".
+static CHAT_TEMPLATES: &[&str] = &[
+    "default",
+    "bailing",
+    "bailing-think",
+    "bailing2",
+    "chatglm3",
+    "chatglm4",
+    "chatml",
+    "command-r",
+    "deepseek",
+    "deepseek-ocr",
+    "deepseek2",
+    "deepseek3",
+    "exaone-moe",
+    "exaone3",
+    "exaone4",
+    "falcon3",
+    "gemma",
+    "gigachat",
+    "glmedge",
+    "gpt-oss",
+    "granite",
+    "granite-4.0",
+    "granite-4.1",
+    "grok-2",
+    "hunyuan-dense",
+    "hunyuan-moe",
+    "hunyuan-vl",
+    "kimi-k2",
+    "llama2",
+    "llama2-sys",
+    "llama2-sys-bos",
+    "llama2-sys-strip",
+    "llama3",
+    "llama4",
+    "megrez",
+    "minicpm",
+    "mistral-v1",
+    "mistral-v3",
+    "mistral-v3-tekken",
+    "mistral-v7",
+    "mistral-v7-tekken",
+    "monarch",
+    "openchat",
+    "orion",
+    "pangu-embedded",
+    "phi3",
+    "phi4",
+    "rwkv-world",
+    "seed_oss",
+    "smolvlm",
+    "solar-open",
+    "vicuna",
+    "vicuna-orca",
+    "yandex",
+    "zephyr",
+];
+
 /// The MVP option set for llama-server.
 pub static REGISTRY: &[OptionSpec] = &[
     OptionSpec {
@@ -224,7 +296,8 @@ pub static REGISTRY: &[OptionSpec] = &[
         kind: Int { min: Some(0), max: None },
         default: "4096",
         step: 1024.0,
-        description: "Maximum context window size in tokens (0 = use model default).",
+        description: "Maximum context window size in tokens (0 or 'default' = the model's \
+                      full trained context — watch your memory).",
     },
     OptionSpec {
         key: "gpu-layers",
@@ -240,7 +313,8 @@ pub static REGISTRY: &[OptionSpec] = &[
         kind: Float { min: Some(0.0), max: Some(2.0) },
         default: "0.8",
         step: 0.05,
-        description: "Sampling temperature; lower is more deterministic.",
+        description: "Sampling temperature; lower is more deterministic \
+                      ('default' = llama.cpp's 0.8).",
     },
     OptionSpec {
         key: "top-p",
@@ -248,7 +322,8 @@ pub static REGISTRY: &[OptionSpec] = &[
         kind: Float { min: Some(0.0), max: Some(1.0) },
         default: "0.95",
         step: 0.05,
-        description: "Nucleus sampling: keep tokens within this cumulative probability.",
+        description: "Nucleus sampling: keep tokens within this cumulative probability \
+                      ('default' = llama.cpp's 0.95).",
     },
     OptionSpec {
         key: "top-k",
@@ -256,7 +331,8 @@ pub static REGISTRY: &[OptionSpec] = &[
         kind: Int { min: Some(0), max: None },
         default: "40",
         step: 1.0,
-        description: "Keep only the top-K most likely tokens (0 = disabled).",
+        description: "Keep only the top-K most likely tokens \
+                      (0 = disabled; 'default' = llama.cpp's 40).",
     },
     OptionSpec {
         key: "min-p",
@@ -264,7 +340,8 @@ pub static REGISTRY: &[OptionSpec] = &[
         kind: Float { min: Some(0.0), max: Some(1.0) },
         default: "0.05",
         step: 0.01,
-        description: "Minimum token probability relative to the most likely token.",
+        description: "Minimum token probability relative to the most likely token \
+                      ('default' = llama.cpp's 0.05).",
     },
     OptionSpec {
         key: "repeat-penalty",
@@ -272,7 +349,8 @@ pub static REGISTRY: &[OptionSpec] = &[
         kind: Float { min: Some(0.0), max: Some(2.0) },
         default: "1.0",
         step: 0.05,
-        description: "Penalty applied to repeated tokens (1.0 = disabled).",
+        description: "Penalty applied to repeated tokens \
+                      (1.0 = disabled; 'default' = llama.cpp's 1.0).",
     },
     OptionSpec {
         key: "threads",
@@ -305,6 +383,35 @@ pub static REGISTRY: &[OptionSpec] = &[
         default: "auto",
         step: 1.0,
         description: "Reasoning/thinking in chat (auto = llama.cpp default; omitted from command).",
+    },
+    OptionSpec {
+        key: "reasoning-effort",
+        cli: "--chat-template-kwargs",
+        kind: Enum(&["default", "low", "medium", "high"]),
+        default: "default",
+        step: 1.0,
+        description: "Reasoning effort passed to the chat template as \
+                      {\"reasoning_effort\": …} (GPT-OSS-style models; \
+                      default = omitted).",
+    },
+    OptionSpec {
+        key: "chat-template",
+        cli: "--chat-template",
+        kind: Enum(CHAT_TEMPLATES),
+        default: "default",
+        step: 1.0,
+        description: "Override the chat template with a llama.cpp built-in \
+                      (default = use the template from the model's GGUF metadata).",
+    },
+    OptionSpec {
+        key: "jinja",
+        cli: "--no-jinja",
+        kind: Enum(&["on", "off"]),
+        default: "on",
+        step: 1.0,
+        description: "Jinja chat template engine (on = llama.cpp default; turn off to \
+                      add --no-jinja for legacy formatting — disables tool calls and \
+                      reasoning-effort).",
     },
     OptionSpec {
         key: "mmap",
@@ -420,21 +527,29 @@ mod tests {
         // "auto" is the omitted state; it cycles like any variant (no sentinel).
         assert_eq!(omit_token("flash-attn"), Some("auto"));
         assert_eq!(spec.bump(&spec.kind, "auto", 1), Some("on".into()));
-        assert_eq!(spec.jump(&spec.kind, -1), Some("auto".into())); // Home → auto (default)
+        assert_eq!(spec.kind.extreme(-1), Some("auto".into())); // Home → first variant
     }
 
     #[test]
     fn numeric_omittables_fold_the_default_sentinel() {
         assert_eq!(omit_token("batch-size"), Some(DEFAULT));
         assert_eq!(omit_token("threads"), Some(DEFAULT));
-        assert_eq!(omit_token("ctx-size"), None); // always emitted
+        // The sampling params and ctx-size are omittable too.
+        for key in ["ctx-size", "temperature", "top-p", "top-k", "min-p", "repeat-penalty"] {
+            assert_eq!(omit_token(key), Some(DEFAULT), "{key} should fold the sentinel");
+            assert!(uses_sentinel(key), "{key} should get sentinel affordances");
+        }
+        // host/port stay on the command line: llmctl needs the endpoint.
+        assert_eq!(omit_token("host"), None);
+        assert_eq!(omit_token("port"), None);
 
-        // Stepping up from DEFAULT enters the concrete base; Home resets.
+        // Stepping up from DEFAULT enters the concrete base; stepping down stays.
         let ngl = spec("gpu-layers").unwrap();
         assert_eq!(ngl.bump(&ngl.kind, DEFAULT, 1), Some("999".into()));
         assert_eq!(ngl.bump(&ngl.kind, DEFAULT, -1), Some(DEFAULT.into()));
-        assert_eq!(ngl.jump(&ngl.kind, -1), Some(DEFAULT.into())); // Home → default
-        assert_eq!(ngl.jump(&ngl.kind, 1), Some("999".into())); // End → max
+        // Home/End are pure min/max jumps; resetting to DEFAULT is `d` (app-level).
+        assert_eq!(ngl.kind.extreme(-1), Some("0".into())); // Home → min
+        assert_eq!(ngl.kind.extreme(1), Some("999".into())); // End → max
     }
 
     #[test]
@@ -457,8 +572,8 @@ mod tests {
             assert!(!uses_sentinel(key));
             let s = spec(key).unwrap();
             assert_eq!(s.bump(&s.kind, "default", 1), Some("f16".into()));
-            assert_eq!(s.jump(&s.kind, -1), Some("default".into())); // Home → default
-            assert_eq!(s.jump(&s.kind, 1), Some("q4_0".into())); // End → last
+            assert_eq!(s.kind.extreme(-1), Some("default".into())); // Home → first variant
+            assert_eq!(s.kind.extreme(1), Some("q4_0".into())); // End → last
         }
     }
 
@@ -479,11 +594,48 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_is_a_json_kwarg_enum_omitted_at_default() {
+        // "default" is the omitted state, an in-band enum variant (no sentinel
+        // affordances) — it cycles like the cache types.
+        assert_eq!(omit_token("reasoning-effort"), Some(DEFAULT));
+        assert!(!uses_sentinel("reasoning-effort"));
+        let s = spec("reasoning-effort").unwrap();
+        assert_eq!(s.bump(&s.kind, "default", 1), Some("low".into()));
+        assert_eq!(s.kind.extreme(1), Some("high".into())); // End → high
+
+        // The emitted argv token is the chat-template kwargs JSON, not the raw value.
+        assert_eq!(cli_value("reasoning-effort", "high"), r#"{"reasoning_effort":"high"}"#);
+        assert_eq!(cli_value("temperature", "0.7"), "0.7"); // everything else passes through
+    }
+
+    #[test]
     fn mmap_is_a_flag_omitted_when_on() {
         assert!(is_flag("mmap"));
         assert_eq!(omit_token("mmap"), Some("on")); // on = llama default, omitted
         let s = spec("mmap").unwrap();
         assert_eq!(s.bump(&s.kind, "on", 1), Some("off".into())); // `e` toggles
+    }
+
+    #[test]
+    fn jinja_is_a_flag_omitted_when_on() {
+        // Same shape as mmap: on = llama.cpp's default (omitted); off emits
+        // the bare --no-jinja flag.
+        assert!(is_flag("jinja"));
+        assert_eq!(omit_token("jinja"), Some("on"));
+        let s = spec("jinja").unwrap();
+        assert_eq!(s.cli, "--no-jinja");
+        assert_eq!(s.bump(&s.kind, "on", 1), Some("off".into())); // `e` toggles
+    }
+
+    #[test]
+    fn chat_template_is_an_enum_of_builtins_omitted_at_default() {
+        assert_eq!(omit_token("chat-template"), Some(DEFAULT));
+        assert!(!uses_sentinel("chat-template")); // in-band variant, cycles
+        let s = spec("chat-template").unwrap();
+        assert_eq!(s.kind.extreme(-1), Some("default".into())); // Home → default
+        assert_eq!(s.bump(&s.kind, "default", 1), Some("bailing".into()));
+        assert_eq!(s.kind.validate("LLAMA3").unwrap(), "llama3"); // case-folded
+        assert!(s.kind.validate("not-a-template").is_err());
     }
 
     #[test]

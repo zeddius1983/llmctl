@@ -15,9 +15,11 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 
-use crate::app::{App, Message, Pane, Prompt, Screen};
+use crate::app::{App, Message, Pane, Prompt, Screen, Selector};
 use crate::domain::human_size;
 use crate::session::{Session, SessionStatus, format_uptime};
 
@@ -62,6 +64,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Some(prompt) = &app.prompt {
         render_prompt(frame, frame.area(), prompt);
+    }
+    if let Some(selector) = &app.selector {
+        render_selector(frame, frame.area(), selector);
     }
     if let Some(message) = &app.message {
         render_message(frame, frame.area(), message);
@@ -268,6 +273,8 @@ fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
             keys.push(("h", "back"));
             keys.push(("e", "edit"));
             keys.push(("-/+", "adjust"));
+            keys.push(("d", "default"));
+            keys.push(("Home/End", "min/max"));
             keys.push(("s", "start"));
             keys.push(("C", "chat"));
             keys.push(("y", "yank"));
@@ -511,10 +518,11 @@ fn render_help(frame: &mut Frame, area: Rect) {
         help_row("f", "toggle favorite"),
         Line::raw(""),
         Line::from("Options".bold()),
-        help_row("e", "edit / cycle value"),
+        help_row("e / Enter", "edit / cycle / pick value"),
         help_row("- / +", "decrement / increment"),
         help_row("[ / ]", "decrement / increment"),
-        help_row("Home/End", "default·min / max"),
+        help_row("d", "reset to default"),
+        help_row("Home/End", "min / max"),
         Line::raw(""),
         Line::from("Launch & sessions".bold()),
         help_row("s", "start server"),
@@ -543,6 +551,55 @@ fn render_help(frame: &mut Frame, area: Rect) {
 
     frame.render_widget(Clear, popup);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// Modal enum-variant selector (combo box): a filter line above the variant
+/// list, scrolled to the cursor.
+fn render_selector(frame: &mut Frame, area: Rect, selector: &Selector) {
+    let filtered = selector.filtered();
+
+    // Filter input line, styled like the text prompt.
+    let filter = Line::from(vec![
+        Span::styled("❯ ", Style::default().fg(ACCENT)),
+        Span::raw(selector.filter.clone()),
+        Span::styled("▏", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+    ]);
+
+    let list_height = filtered.len().clamp(1, 12) as u16;
+    let height = list_height + 4; // borders + filter + hint
+    let popup = center(area, Constraint::Length(40), Constraint::Length(height));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(format!(" {} ", selector.title));
+    let inner = block.inner(popup);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let [filter_area, list_area, hint_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+            .areas(inner);
+
+    frame.render_widget(Paragraph::new(filter), filter_area);
+
+    if filtered.is_empty() {
+        frame.render_widget(Paragraph::new(Line::from("(no matches)".dim().italic())), list_area);
+    } else {
+        let items: Vec<ListItem> = filtered.iter().map(|v| ListItem::new(*v)).collect();
+        let list = List::new(items).highlight_style(
+            Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
+        );
+        let mut state = ListState::default();
+        state.select(Some(selector.cursor.min(filtered.len() - 1)));
+        frame.render_stateful_widget(list, list_area, &mut state);
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from("type to filter · ↑/↓ · Enter pick · Esc".dim().italic())),
+        hint_area,
+    );
 }
 
 /// Modal text input for editing an option value or naming a profile.

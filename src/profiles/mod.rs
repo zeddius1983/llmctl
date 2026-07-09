@@ -61,8 +61,11 @@ pub fn resolve_options(
         .iter()
         .map(|spec| {
             let default = match registry::omit_token(spec.key) {
-                Some(token) => token.to_string(),
-                None => model_default(spec, model, defaults),
+                // ctx-size is omittable but must not *start* omitted: 'default'
+                // means the model's full trained context, which can exhaust
+                // memory. It starts at the ctx/8 heuristic instead.
+                Some(token) if spec.key != "ctx-size" => token.to_string(),
+                _ => model_default(spec, model, defaults),
             };
 
             let value = instance
@@ -107,8 +110,9 @@ pub fn resolved_values(profile: &Profile, defaults: &Defaults) -> BTreeMap<Strin
         .map(|spec| {
             let value = template.and_then(|t| override_value(t, spec.key)).unwrap_or_else(|| {
                 match registry::omit_token(spec.key) {
-                    Some(token) => token.to_string(),
-                    None => config_default(spec, defaults),
+                    // Same ctx-size carve-out as in [`resolve_options`].
+                    Some(token) if spec.key != "ctx-size" => token.to_string(),
+                    _ => config_default(spec, defaults),
                 }
             });
             (spec.key.to_string(), value)
@@ -218,8 +222,13 @@ mod tests {
             &empty_store(),
             &Defaults::default(),
         );
+        // ctx-size starts concrete (the ctx/8 heuristic / registry fallback),
+        // never at 'default' (= the model's full context).
         assert_eq!(value_of(&opts, "ctx-size"), "4096");
-        assert_eq!(value_of(&opts, "temperature"), "0.8");
+        // Sampling params start omitted — llama.cpp's own defaults apply.
+        for key in ["temperature", "top-p", "top-k", "min-p", "repeat-penalty"] {
+            assert_eq!(value_of(&opts, key), registry::DEFAULT, "{key} should start at default");
+        }
     }
 
     #[test]
@@ -289,9 +298,14 @@ mod tests {
         for key in ["flash-attn", "reasoning"] {
             assert_eq!(value_of(&opts, key), "auto", "{key} should start at auto");
         }
-        // ...numerics default to the sentinel.
-        for key in ["batch-size", "gpu-layers", "threads"] {
+        // ...numerics default to the sentinel, and reasoning-effort and
+        // chat-template to their in-band "default" variant.
+        for key in ["batch-size", "gpu-layers", "threads", "reasoning-effort", "chat-template"] {
             assert_eq!(value_of(&opts, key), registry::DEFAULT, "{key} should start at default");
+        }
+        // The valueless flags start at "on" (llama.cpp's defaults, omitted).
+        for key in ["mmap", "jinja"] {
+            assert_eq!(value_of(&opts, key), "on", "{key} should start at on");
         }
         // A profile that explicitly sets one still carries a concrete value.
         let server = resolve_options(
