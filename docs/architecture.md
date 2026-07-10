@@ -32,8 +32,9 @@ state.
 
 - **`main.rs`** — resolves XDG `Paths`, ensures dirs, initializes file-based
   tracing, loads `Config`, constructs `App`, runs the ratatui loop.
-- **`config/`** — `Config` (deserialized from `config.toml`, all-defaults when
-  absent) and `Paths` (config/state/cache/log/sessions locations).
+- **`config/`** — `Config` (deserialized from `config.toml`; a documented
+  standard-source file is generated on first run) and `Paths`
+  (config/state/cache/log/sessions locations).
 - **`domain/`** — IO-free types: `Runtime`, `Model`, `Profile`, `OptionItem`;
   helpers (`human_size`, `format_unix_date`); and `stubs` for the demo vLLM
   runtime/models.
@@ -109,8 +110,10 @@ a default never exceeds what the model supports.
 
 ## Persistence & paths (XDG)
 
-- `~/.config/llmctl/config.toml` — user config (model paths, runtime binary,
-  default host/port). Optional.
+- `~/.config/llmctl/config.toml` — generated first-run config (model sources,
+  runtime binary, default host/port); user editable.
+- `~/.config/llmctl/config.yaml` — ignored legacy config from the former
+  implementation; retained for manual preset migration/backup.
 - `~/.cache/llmctl/models.json` — model scan cache; `llama-server.help.txt`.
 - `~/.config/llmctl/models/` — managed source-aware tree; each model leaf has
   `.llmctl.yml`, `model.gguf`, and YAML files below `profiles/`.

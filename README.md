@@ -126,18 +126,11 @@ Any option left at its default value is omitted from the command line.
 
 ## Configuration
 
-llmctl follows the XDG base-directory spec and runs with **zero configuration** —
-a config file is optional. To customize, create
-`~/.config/llmctl/config.toml`:
+llmctl follows the XDG base-directory spec and runs with **zero setup**. On the
+first run it creates `~/.config/llmctl/config.toml` with the llama.cpp cache,
+Hugging Face, LM Studio, and `~/models` sources. Edit that file to add a source:
 
 ```toml
-# Directories scanned recursively for GGUF models. When set, ONLY these are
-# scanned; leave unset to fall back to the well-known locations listed below.
-[models]
-paths = ["/data/models", "~/work/ggufs"]
-
-# Named sources support explicit layout handling. `auto` recognizes LM Studio
-# and Hugging Face paths, then preserves unknown relative directory layouts.
 [[models.sources]]
 name = "nas"
 path = "/mnt/nas/llms"
@@ -157,16 +150,15 @@ port = 8000
 | Path | Purpose |
 |------|---------|
 | `~/.config/llmctl/config.toml` | Configuration |
+| `~/.config/llmctl/config.yaml` | Ignored legacy configuration; archive after migrating anything useful |
 | `~/.config/llmctl/models/` | Managed source tree, symlinks, and YAML profiles |
-| `~/.local/state/llmctl/` | Profile instances, session records, logs |
+| `~/.local/state/llmctl/` | Session records, logs, and profile migration fallback |
 | `~/.cache/llmctl/` | Model & runtime scan cache |
 
-When `[models].paths` is unset, llmctl falls back to scanning the well-known
-locations: `$LLAMA_CACHE` or `~/.cache/llama.cpp`, the HuggingFace hub cache
-(`$HUGGINGFACE_HUB_CACHE` / `$HF_HOME/hub` / `~/.cache/huggingface/hub`),
-`~/.lmstudio/models`, and `~/models`. Setting `paths` replaces this fallback —
-only the directories you list are scanned. Your `$HOME` is never scanned
-wholesale.
+The generated file explicitly lists the standard locations so they are easy to
+inspect and extend. Older `[models].paths` arrays remain supported, but named
+`[[models.sources]]` entries provide stable catalog names and layout control.
+Your `$HOME` is never scanned wholesale.
 
 ## Roadmap
 

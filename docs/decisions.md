@@ -207,6 +207,11 @@ mtime/revision/path ordering. Search results are cached per query, and selecting
 a GGUF result atomically switches to the compatible llama.cpp runtime and tree
 route.
 
+On first run, llmctl creates a readable `config.toml` that explicitly lists the
+four standard sources (llama.cpp cache, Hugging Face, LM Studio, and
+`~/models`). A `config.yaml` from the former implementation is ignored but never
+deleted automatically because it may contain model presets worth migrating.
+
 **Consequences:** Models with identical filenames remain distinguishable by
 source and provider, profiles live beside their model identity, and custom
 folders work without requiring a prescribed layout. Discovery now needs source

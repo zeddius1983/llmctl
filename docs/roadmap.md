@@ -94,7 +94,8 @@ fallbacks; variable-depth Miller navigation; per-model YAML profiles with
 legacy JSON migration and write-failure fallback; incremental global model
 search with atomic jump-to-result. Prefix collisions, Hugging Face snapshot
 selection, and catalog/profile write amplification are covered by regression
-tests.
+tests. First run creates an editable `config.toml` with the four standard model
+sources while retaining any legacy `config.yaml` as an ignored backup.
 
 ## Next (post-v0.1.0)
 

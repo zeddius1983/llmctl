@@ -39,7 +39,7 @@ component structure and data flow.
 src/
   main.rs        entry: XDG paths, file tracing, launch TUI
   app/           App state, event loop, navigation, prompts, actions
-  config/        Config (config.toml) + XDG Paths resolution
+  config/        Config (first-run config.toml generation) + XDG Paths resolution
   domain/        pure types (Runtime, Model, Profile, OptionItem), helpers, vLLM stubs
   discovery/     catalog.rs (source parsing + managed tree), gguf.rs (header parser),
                  models.rs (scan+cache), runtimes.rs (llama.cpp)
