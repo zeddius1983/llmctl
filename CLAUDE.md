@@ -52,7 +52,8 @@ docs/            requirements, architecture, decisions (ADRs), roadmap
 
 XDG paths used at runtime:
 `~/.config/llmctl/config.toml`, `~/.config/llmctl/models/` (managed model
-catalog + per-model YAML profiles; vLLM is namespaced below `models/vllm/`),
+catalog + per-model YAML profiles, namespaced below `models/llama.cpp/` and
+`models/vllm/`),
 `~/.local/state/llmctl/` (logs, sessions,
 legacy profile migration), `~/.cache/llmctl/` (model cache and runtime help snapshots).
 

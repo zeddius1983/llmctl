@@ -153,13 +153,73 @@ pub fn short_hash(path: &Path) -> String {
 
 /// Materialize the managed catalog without modifying source model files.
 pub fn reconcile(root: &Path, models: &mut [Model]) {
-    reconcile_for(root, RuntimeId::LlamaCpp, models);
+    migrate_legacy_llama_catalog(root);
+    reconcile_for(&root.join("llama.cpp"), RuntimeId::LlamaCpp, models);
 }
 
 /// vLLM uses its own physical namespace so a repository directory can be a
 /// model leaf without colliding with GGUF artifacts nested below that same repo.
 pub fn reconcile_vllm(root: &Path, models: &mut [Model]) {
     reconcile_for(&root.join("vllm"), RuntimeId::Vllm, models);
+}
+
+/// Move v0.2 runtime-less llama.cpp leaves into the explicit runtime namespace.
+/// Only manifest-owned leaves are moved; user directories without a manifest
+/// are never touched. `rename` preserves profile YAML and symlinks atomically.
+fn migrate_legacy_llama_catalog(root: &Path) {
+    if !root.exists() {
+        return;
+    }
+    let llama_root = root.join("llama.cpp");
+    let vllm_root = root.join("vllm");
+    let manifests: Vec<PathBuf> = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name() == ".llmctl.yml")
+        .map(|entry| entry.into_path())
+        .collect();
+    let mut cleanup = HashSet::new();
+
+    for path in manifests {
+        let Some(leaf) = path.parent() else { continue };
+        if leaf.starts_with(&llama_root) || leaf.starts_with(&vllm_root) {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else { continue };
+        let Ok(manifest) = serde_yaml::from_slice::<Manifest>(&bytes) else { continue };
+        if manifest.runtime != "llama.cpp" {
+            continue;
+        }
+        let Ok(relative) = leaf.strip_prefix(root) else { continue };
+        let target = llama_root.join(relative);
+        if target.exists() {
+            warn!(
+                source = %leaf.display(),
+                target = %target.display(),
+                "not migrating legacy catalog leaf because target already exists"
+            );
+            continue;
+        }
+        let Some(parent) = target.parent() else { continue };
+        if let Err(err) = fs::create_dir_all(parent).and_then(|_| fs::rename(leaf, &target)) {
+            warn!(source = %leaf.display(), target = %target.display(), %err, "failed to migrate llama.cpp catalog leaf");
+            continue;
+        }
+        let mut ancestor = leaf.parent();
+        while let Some(dir) = ancestor {
+            if dir == root {
+                break;
+            }
+            cleanup.insert(dir.to_path_buf());
+            ancestor = dir.parent();
+        }
+    }
+
+    let mut cleanup: Vec<PathBuf> = cleanup.into_iter().collect();
+    cleanup.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for dir in cleanup {
+        let _ = fs::remove_dir(dir); // succeeds only for empty legacy ancestors
+    }
 }
 
 fn reconcile_for(root: &Path, runtime: RuntimeId, models: &mut [Model]) {
@@ -339,10 +399,60 @@ mod tests {
         }];
         let catalog = root.join("catalog");
         reconcile(&catalog, &mut models);
-        let leaf = catalog.join("local/Test");
+        let leaf = catalog.join("llama.cpp/local/Test");
         assert_eq!(fs::read_link(leaf.join("model.gguf")).unwrap(), source);
         assert!(leaf.join(".llmctl.yml").is_file());
         assert!(leaf.join("profiles").is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migrates_legacy_llama_leaf_and_preserves_profiles() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("llmctl-catalog-migrate-{nonce}"));
+        let catalog = root.join("catalog");
+        let legacy = catalog.join("huggingface/team/model");
+        let source = root.join("source.gguf");
+        fs::create_dir_all(legacy.join("profiles")).unwrap();
+        fs::write(&source, b"GGUF").unwrap();
+        fs::write(legacy.join("profiles/Coding.yml"), b"user profile").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&source, legacy.join("model.gguf")).unwrap();
+        let manifest = Manifest {
+            schema: 1,
+            runtime: "llama.cpp".into(),
+            id: "legacy:test".into(),
+            source: "huggingface".into(),
+            artifact: Artifact {
+                name: "model.gguf".into(),
+                source_path: source.clone(),
+                size_bytes: 4,
+                modified: None,
+                shards: Vec::new(),
+            },
+            available: true,
+        };
+        fs::write(legacy.join(".llmctl.yml"), serde_yaml::to_string(&manifest).unwrap()).unwrap();
+        let mut models = vec![Model {
+            id: "legacy:test".into(),
+            name: "model.gguf".into(),
+            path: source,
+            shard_paths: Vec::new(),
+            catalog_path: vec!["huggingface".into(), "team".into(), "model".into()],
+            catalog_dir: PathBuf::new(),
+            size_bytes: 4,
+            quantization: None,
+            architecture: None,
+            context_length: None,
+            modified: None,
+            has_chat_template: false,
+        }];
+
+        reconcile(&catalog, &mut models);
+        let migrated = catalog.join("llama.cpp/huggingface/team/model");
+        assert_eq!(models[0].catalog_dir, migrated);
+        assert_eq!(fs::read(migrated.join("profiles/Coding.yml")).unwrap(), b"user profile");
+        assert!(!legacy.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

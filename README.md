@@ -156,7 +156,7 @@ port = 8000
 |------|---------|
 | `~/.config/llmctl/config.toml` | Configuration |
 | `~/.config/llmctl/config.yaml` | Ignored legacy configuration; archive after migrating anything useful |
-| `~/.config/llmctl/models/` | Managed source tree, symlinks, and YAML profiles |
+| `~/.config/llmctl/models/llama.cpp/` | Managed GGUF symlinks and llama.cpp profiles |
 | `~/.config/llmctl/models/vllm/` | Managed vLLM model-directory symlinks and profiles |
 | `~/.local/state/llmctl/` | Session records, logs, and profile migration fallback |
 | `~/.cache/llmctl/` | Model & runtime scan cache |

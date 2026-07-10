@@ -120,11 +120,12 @@ a default never exceeds what the model supports.
   implementation; retained for manual preset migration/backup.
 - `~/.cache/llmctl/models.json` — model scan cache;
   `llama-server.help.txt` — cached llama.cpp help.
-- `~/.config/llmctl/models/` — managed source-aware tree; each model leaf has
-  `.llmctl.yml`, `model.gguf`, and YAML files below `profiles/`.
+- `~/.config/llmctl/models/llama.cpp/` — managed source-aware GGUF tree; each
+  model leaf has `.llmctl.yml`, `model.gguf`, and YAML files below `profiles/`.
 - `~/.config/llmctl/models/vllm/` — managed vLLM tree; each leaf has a `model`
   directory symlink, a runtime-tagged manifest, and vLLM-specific profile YAML.
-  Existing llama.cpp catalog paths remain unchanged for compatibility.
+  Legacy runtime-less llama.cpp leaves are atomically moved into `llama.cpp/`
+  when manifest-owned; profile files and symlinks move with the leaf.
 - `~/.local/state/llmctl/profiles.json.bak` — backup made when migrating the
   former flat profile store (offline models remain in JSON until seen).
 - `~/.local/state/llmctl/logs/` — app log + (Phase 3) per-session server logs.
