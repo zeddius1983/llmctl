@@ -64,8 +64,9 @@ state.
   - `mod.rs` — resolution: `list_profiles`, `resolve_options`,
     `current_values`, `effective_kind` (model-aware ctx-size bound).
 - **`session/`**
-  - `command.rs` — pure launch-command builder (argv + shell-quoted display;
-    bool flags emitted only when on, model via `-m`).
+  - `command.rs` — pure runtime-aware launch-command builder (argv +
+    shell-quoted display): llama.cpp uses `-m <file>`, vLLM uses
+    `serve <directory>`, with per-runtime omit/flag semantics.
   - `supervisor.rs` — `SessionSupervisor` trait + `DetachedSupervisor` (`setsid`
     pre-exec, stdio→log file, `SIGCHLD` auto-reap, `kill(-pgid, …)`); plus the
     OSC 52 base64 helper used for clipboard yank.
@@ -148,6 +149,11 @@ to stop and the process is gone, else `Crashed` — and samples `/proc` for RSS 
 CPU%. Launch resolves a bindable port (skipping ports held by other live
 sessions) before spawning. A future `DaemonSupervisor` or `systemd-run` backend
 can implement the same trait. See ADR-005 and ADR-007.
+
+vLLM uses the same detached lifecycle, `/health` readiness probe, OpenAI `/v1`
+endpoint, logs, and restart/stop actions. Process rediscovery matches executable
+argv basename + exact model path + port rather than Linux `comm`, because Python
+and container wrappers commonly expose a different process name.
 
 ## Testing strategy
 

@@ -10,8 +10,7 @@ and watch them from a built-in session manager.
 
 > **Status:** v0.2.0. Targets **llama.cpp + GGUF on Linux**. vLLM support is in
 > development: configured binaries and local Hugging Face models are detected,
-> with runtime-isolated profile persistence; launching remains unavailable
-> until the integration is complete.
+> with runtime-isolated profile persistence and `vllm serve` session support.
 
 ## Features
 

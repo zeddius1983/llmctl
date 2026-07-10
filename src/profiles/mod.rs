@@ -19,6 +19,7 @@ pub use store::ProfileStore;
 pub fn effective_kind(spec: &registry::OptionSpec, model: &Model) -> OptionKind {
     match (spec.key, model.context_length) {
         ("ctx-size", Some(ctx)) => OptionKind::Int { min: Some(0), max: Some(ctx as i64) },
+        ("max-model-len", Some(ctx)) => OptionKind::Int { min: Some(1), max: Some(ctx as i64) },
         _ => spec.kind,
     }
 }
@@ -178,10 +179,9 @@ fn override_value(template: &templates::Template, key: &str) -> Option<String> {
     template.overrides.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_string())
 }
 
-/// Clamp a `ctx-size` value down to the model's trained context length so the
-/// default never exceeds what the model supports.
+/// Clamp runtime-specific context limits down to the model's trained context.
 fn clamp_ctx_to_model(key: &str, value: String, model: &Model) -> String {
-    if key != "ctx-size" {
+    if key != "ctx-size" && key != "max-model-len" {
         return value;
     }
     match (model.context_length, value.parse::<i64>()) {
@@ -277,6 +277,22 @@ mod tests {
         assert_eq!(value_of(&opts, "enable-prefix-caching"), "on");
         assert_eq!(value_of(&opts, "dtype"), "auto");
         assert!(opts.iter().all(|o| o.key != "gpu-layers"));
+    }
+
+    #[test]
+    fn vllm_max_model_len_respects_model_context() {
+        let mut m = model();
+        m.context_length = Some(2048);
+        let opts = resolve_options(
+            &vllm_runtime(),
+            &m,
+            &profile("Low Memory"),
+            &empty_store(),
+            &Defaults::default(),
+        );
+        assert_eq!(value_of(&opts, "max-model-len"), "2048");
+        let spec = registry::spec_for(RuntimeId::Vllm, "max-model-len").unwrap();
+        assert_eq!(effective_kind(spec, &m).extreme(1), Some("2048".into()));
     }
 
     #[test]

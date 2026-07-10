@@ -667,22 +667,20 @@ impl App {
 
     /// Build a launch request from the current selection and resolved options.
     fn build_launch_request(&self) -> Result<LaunchRequest, String> {
-        if self.is_vllm_pending() {
-            return Err("vLLM model discovery and launching are not available yet".into());
-        }
         let rt = self.runtimes.selected().ok_or("no runtime selected")?;
         let model = self.selected_model().ok_or("no model selected")?;
         let profile = self.profiles.selected().ok_or("no profile selected")?;
         let binary = rt
             .binary_path
             .as_ref()
-            .ok_or("llama-server binary not found on PATH")?
+            .ok_or_else(|| format!("{} binary not found on PATH", rt.name))?
             .display()
             .to_string();
         let options = self.options.items.clone();
         let host = option_value(&options, "host").unwrap_or_else(|| "127.0.0.1".into());
         let port = option_value(&options, "port").and_then(|v| v.parse().ok()).unwrap_or(8000);
         Ok(LaunchRequest {
+            runtime_id: rt.id,
             runtime: rt.name.clone(),
             binary,
             model: model.name.clone(),
@@ -701,8 +699,12 @@ impl App {
         }
         match self.build_launch_request() {
             Ok(req) => {
-                let cmd =
-                    session::command::Command::build(&req.binary, &req.model_path, &req.options);
+                let cmd = session::command::Command::build_for(
+                    req.runtime_id,
+                    &req.binary,
+                    &req.model_path,
+                    &req.options,
+                );
                 copy_to_clipboard(&cmd.display());
                 self.message = Some(Message {
                     title: "Launch command".into(),
@@ -760,6 +762,13 @@ impl App {
                 return;
             }
         };
+        if req.runtime_id != RuntimeId::LlamaCpp {
+            self.message = Some(Message {
+                title: "Chat unavailable".into(),
+                lines: vec!["Interactive chat currently requires llama-cli.".into()],
+            });
+            return;
+        }
         let Some(cli) = cli_binary(&req.binary) else {
             self.message = Some(Message {
                 title: "llama-cli not found".into(),
@@ -1241,11 +1250,6 @@ impl App {
                 self.rebuild_below(Pane::Profile);
             }
         }
-    }
-
-    /// True while the selected runtime is not yet launchable.
-    fn is_vllm_pending(&self) -> bool {
-        self.runtimes.selected().map(|r| r.id == RuntimeId::Vllm).unwrap_or(true)
     }
 
     /// The selected catalog leaf. Directory nodes intentionally have no path.

@@ -251,3 +251,9 @@ atomically moved only when marked by an llmctl manifest, preserving profile
 files and symlinks; unrelated user directories are untouched. The namespaces
 also avoid repository-as-leaf collisions with GGUF artifacts nested below the
 same Hugging Face repository.
+
+Launch dispatch follows the same typed runtime boundary: llama.cpp emits
+`llama-server -m <file>`, while vLLM emits `vllm serve <directory>`. Both reuse
+the detached supervisor and HTTP health lifecycle. vLLM process recovery uses
+argv identity rather than `comm` so Python and Distrobox-style wrappers remain
+discoverable.

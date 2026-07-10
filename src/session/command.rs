@@ -1,10 +1,10 @@
-//! Pure construction of the `llama-server` launch command from resolved options.
+//! Pure construction of runtime-specific server launch commands.
 //!
 //! No I/O: takes the runtime binary, the model file, and the resolved option
 //! values, and produces an argv plus shell-quoted display strings. This is the
 //! "never hand-type a complex command again" core, and is unit-tested.
 
-use crate::domain::OptionItem;
+use crate::domain::{OptionItem, RuntimeId};
 use crate::profiles::registry;
 
 /// A built launch command: program + arguments, ready to spawn or display.
@@ -19,21 +19,37 @@ impl Command {
     /// Every option is emitted as `--flag value`, in registry order (current
     /// llama-server flags all take an explicit value, including
     /// `--flash-attn on|off|auto`). The model is passed via `-m`. An option left
-    /// at its [`registry::omit_token`] (e.g. `flash-attn=auto`, or a numeric at
+    /// at its runtime-specific omit token (e.g. `flash-attn=auto`, or a numeric at
     /// the `default` sentinel) is skipped so llama.cpp applies its own default.
-    /// Valueless boolean flags ([`registry::is_flag`], e.g. `--no-mmap`) emit the
+    /// Valueless boolean flags (e.g. `--no-mmap`) emit the
     /// bare flag with no following value. Values pass through
     /// [`registry::cli_value`], which rewrites the ones whose on-disk form isn't
     /// the literal argv token (e.g. `reasoning-effort` → a JSON kwarg).
     pub fn build(binary: &str, model_path: &str, options: &[OptionItem]) -> Self {
-        let mut argv = vec![binary.to_string(), "-m".to_string(), model_path.to_string()];
+        Self::build_for(RuntimeId::LlamaCpp, binary, model_path, options)
+    }
+
+    pub fn build_for(
+        runtime: RuntimeId,
+        binary: &str,
+        model_path: &str,
+        options: &[OptionItem],
+    ) -> Self {
+        let mut argv = match runtime {
+            RuntimeId::LlamaCpp => {
+                vec![binary.to_string(), "-m".to_string(), model_path.to_string()]
+            }
+            RuntimeId::Vllm => {
+                vec![binary.to_string(), "serve".to_string(), model_path.to_string()]
+            }
+        };
 
         for opt in options {
-            if registry::omit_token(&opt.key) == Some(opt.value.as_str()) {
+            if registry::omit_token_for(runtime, &opt.key) == Some(opt.value.as_str()) {
                 continue;
             }
             argv.push(opt.cli.clone());
-            if !registry::is_flag(&opt.key) {
+            if !registry::is_flag_for(runtime, &opt.key) {
                 argv.push(registry::cli_value(&opt.key, &opt.value));
             }
         }
@@ -233,5 +249,36 @@ mod tests {
         assert!(pretty.contains("--ctx-size 32768"));
         assert!(pretty.contains("--flash-attn on")); // flag + value grouped
         assert!(pretty.contains(" \\\n")); // line continuations
+    }
+
+    #[test]
+    fn builds_vllm_serve_command_with_runtime_specific_omissions_and_flags() {
+        let opts = vec![
+            opt("max-model-len", registry::DEFAULT, "--max-model-len"),
+            opt("tensor-parallel-size", "2", "--tensor-parallel-size"),
+            opt("dtype", "auto", "--dtype"),
+            opt("enable-prefix-caching", "on", "--enable-prefix-caching"),
+            opt("enforce-eager", "off", "--enforce-eager"),
+            opt("host", "127.0.0.1", "--host"),
+            opt("port", "8000", "--port"),
+        ];
+        let cmd = Command::build_for(RuntimeId::Vllm, "/usr/bin/vllm", "/models/acme/demo", &opts);
+        assert_eq!(
+            cmd.argv,
+            vec![
+                "/usr/bin/vllm",
+                "serve",
+                "/models/acme/demo",
+                "--tensor-parallel-size",
+                "2",
+                "--enable-prefix-caching",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8000",
+            ]
+        );
+        assert!(!cmd.argv.iter().any(|arg| arg == "--dtype" || arg == "--enforce-eager"));
+        assert!(cmd.display().starts_with("/usr/bin/vllm serve /models/acme/demo"));
     }
 }

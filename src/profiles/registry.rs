@@ -127,6 +127,7 @@ pub const DEFAULT: &str = "default";
 /// (llama's own default); enums that carry an explicit `"default"` variant
 /// (e.g. the cache types) omit at that variant; for numeric options with no
 /// in-band sentinel it's the [`DEFAULT`] sentinel. `None` means always emitted.
+#[cfg(test)]
 pub fn omit_token(key: &str) -> Option<&'static str> {
     omit_token_for(RuntimeId::LlamaCpp, key)
 }
@@ -165,6 +166,7 @@ pub fn omit_token_for(runtime: RuntimeId, key: &str) -> Option<&'static str> {
 
 /// Whether the option is a valueless boolean flag (e.g. `mmap` → `--no-mmap`):
 /// when not at its [`omit_token`] it emits the bare flag with no value token.
+#[cfg(test)]
 pub fn is_flag(key: &str) -> bool {
     is_flag_for(RuntimeId::LlamaCpp, key)
 }

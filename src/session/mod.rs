@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 
-use crate::domain::OptionItem;
+use crate::domain::{OptionItem, RuntimeId};
 use command::Command;
 use health::Health;
 use proc::CpuSample;
@@ -106,6 +106,7 @@ impl Session {
 /// Everything the manager needs to launch a server. Built by the app from the
 /// current runtime/model/profile selection and resolved options.
 pub struct LaunchRequest {
+    pub runtime_id: RuntimeId,
     pub runtime: String,
     pub binary: String,
     pub model: String,
@@ -144,10 +145,18 @@ impl SessionManager {
     /// matches, delete the JSON for the rest (the spec's "stale records removed").
     pub fn rediscover(&mut self) {
         self.sessions.clear();
-        for record in record::load_all(&self.dir) {
-            let alive =
+        for mut record in record::load_all(&self.dir) {
+            let direct =
                 proc::is_alive(record.pid) && proc::cmdline_matches(record.pid, &record.model_path);
-            if alive {
+            let live_pid = direct.then_some(record.pid).or_else(|| {
+                let binary = record.command.first()?;
+                proc::find_server(binary, &record.model_path, record.port)
+            });
+            if let Some(pid) = live_pid {
+                if pid != record.pid {
+                    record.pid = pid;
+                    record.save(&self.dir);
+                }
                 let status = match health::probe(&record.host, record.port) {
                     Health::Ready => SessionStatus::Running,
                     _ => SessionStatus::Starting,
@@ -169,7 +178,7 @@ impl SessionManager {
         if let Some(opt) = options.iter_mut().find(|o| o.key == "port") {
             opt.value = port.to_string();
         }
-        let command = Command::build(&req.binary, &req.model_path, &options);
+        let command = Command::build_for(req.runtime_id, &req.binary, &req.model_path, &options);
 
         let id = next_id();
         let log_file = supervisor::log_path(&self.log_dir, &id);
@@ -205,15 +214,10 @@ impl SessionManager {
             let binary = s.record.command.first().cloned().unwrap_or_default();
             (s.record.pid, binary, s.record.model_path.clone(), s.record.port)
         };
-        let exe = std::path::Path::new(&binary)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        // The recorded pid is authoritative only while it is the server binary.
-        if proc::is_alive(pid)
-            && proc::comm(pid).as_deref() == Some(&exe[..exe.len().min(15)])
-            && proc::cmdline_matches(pid, &model_path)
-        {
+        // Exact model identity is the PID-reuse guard. Do not require `comm` to
+        // equal the configured executable: Python and container wrappers often
+        // expose a different process name while retaining the launch argv.
+        if proc::is_alive(pid) && proc::cmdline_matches(pid, &model_path) {
             return Some(pid);
         }
         // Otherwise the recorded pid is a launcher (or gone); find the real one.
@@ -486,6 +490,7 @@ mod tests {
             .unwrap();
 
         let req = LaunchRequest {
+            runtime_id: RuntimeId::LlamaCpp,
             runtime: "llama.cpp".into(),
             binary: server.display().to_string(),
             model: "fake.gguf".into(),

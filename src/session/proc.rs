@@ -35,33 +35,34 @@ pub fn cmdline_matches(pid: i32, needle: &str) -> bool {
     cmdline(pid).iter().any(|arg| arg == needle)
 }
 
-/// The process's `comm` (executable name, truncated to 15 chars by the kernel).
-pub fn comm(pid: i32) -> Option<String> {
-    fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|s| s.trim_end().to_string())
-}
-
 /// Re-acquire a running server by identity when its launcher re-exec'd or
-/// daemonized it under a different pid (and possibly its own session). We match
-/// the server executable's name plus the unique model path and port from the
-/// launch command, ignoring shell/launcher wrappers that merely carry the same
-/// args. Returns the lowest matching live pid.
+/// daemonized it under a different pid (and possibly its own session). Match an
+/// executable argv token by basename plus the unique model path and port; `comm`
+/// is intentionally ignored because Python/container wrappers rename processes.
+/// Returns the lowest matching live pid.
 pub fn find_server(binary: &str, model_path: &str, port: u16) -> Option<i32> {
     let exe = std::path::Path::new(binary).file_name()?.to_string_lossy().into_owned();
-    let exe = &exe[..exe.len().min(15)]; // kernel truncates comm to TASK_COMM_LEN-1
     let port = port.to_string();
     let mut best: Option<i32> = None;
     for entry in fs::read_dir("/proc").ok()?.filter_map(|e| e.ok()) {
         let Ok(name) = entry.file_name().into_string() else { continue };
         let Ok(pid) = name.parse::<i32>() else { continue };
-        if comm(pid).as_deref() != Some(exe) || !is_alive(pid) {
+        if !is_alive(pid) {
             continue;
         }
         let args = cmdline(pid);
-        if args.iter().any(|a| a == model_path) && args.iter().any(|a| *a == port) {
+        if matches_server_args(&args, &exe, model_path, &port) {
             best = Some(best.map_or(pid, |b| b.min(pid)));
         }
     }
     best
+}
+
+fn matches_server_args(args: &[String], exe: &str, model_path: &str, port: &str) -> bool {
+    let has_exe = args
+        .iter()
+        .any(|arg| std::path::Path::new(arg).file_name().is_some_and(|name| name == exe));
+    has_exe && args.iter().any(|arg| arg == model_path) && args.iter().any(|arg| arg == port)
 }
 
 /// Parent PID from `/proc/<pid>/status`, or `None` if unreadable.
@@ -155,4 +156,24 @@ fn num_cpus() -> usize {
     // SAFETY: sysconf with a constant name has no preconditions.
     let v = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
     if v > 0 { v as usize } else { 1 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_args_match_python_or_container_wrapped_vllm() {
+        let args = vec![
+            "python3".into(),
+            "/usr/local/bin/vllm".into(),
+            "serve".into(),
+            "/models/acme/demo".into(),
+            "--port".into(),
+            "8000".into(),
+        ];
+        assert!(matches_server_args(&args, "vllm", "/models/acme/demo", "8000"));
+        assert!(!matches_server_args(&args, "vllm", "/models/other", "8000"));
+        assert!(!matches_server_args(&args, "llama-server", "/models/acme/demo", "8000"));
+    }
 }

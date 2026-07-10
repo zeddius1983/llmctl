@@ -44,7 +44,7 @@ src/
   discovery/     catalog.rs (source parsing + managed tree), gguf.rs (header parser),
                  models.rs (GGUF), hf.rs (local HF/vLLM), runtimes.rs (binaries)
   profiles/      runtime-specific option registries/templates, per-model YAML store, resolution
-  session/       command.rs (builder), supervisor.rs (DetachedSupervisor: setsid/signals),
+  session/       runtime-aware command builder, supervisor (setsid/signals),
                  record.rs (session-<id>.json), proc.rs (/proc), health.rs (/health), mod.rs (SessionManager)
   ui/            ratatui rendering (browser columns, Session Manager, log view, footer, prompts, help)
 docs/            requirements, architecture, decisions (ADRs), roadmap

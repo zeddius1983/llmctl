@@ -112,7 +112,7 @@ sources while retaining any legacy `config.yaml` as an ignored backup.
 - [x] Runtime-specific option registries and built-in templates
 - [x] Local Hugging Face/safetensors discovery, metadata parsing, and navigation
 - [x] Runtime-namespaced managed catalog and profile persistence
-- [ ] `vllm serve` command construction and session lifecycle
+- [x] `vllm serve` command construction and detached session lifecycle
 - [ ] Runtime-aware UI actions, startup diagnostics, and real-GPU acceptance test
 
 The first vLLM release is local-first: it discovers cached Hugging Face models
