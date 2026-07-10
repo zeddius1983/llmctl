@@ -14,13 +14,16 @@ and watch them from a built-in session manager.
 ## Features
 
 - **Yazi-style navigation** — a sliding three-column view over the hierarchy
-  `Runtime ▸ Model ▸ Profile ▸ Options`, driven entirely from the keyboard
+  `Runtime ▸ source ▸ provider/repository ▸ Model ▸ Profile ▸ Options`, driven entirely from the keyboard
   (`hjkl`, `g`/`G`, drill in / back out).
 - **Model discovery** — recursively scans your configured directories, or (when
   none are configured) well-known locations (llama.cpp cache, HuggingFace hub,
   LM Studio, `~/models`).
   Reads GGUF headers for architecture, context length, quantization, and embedded
   chat template; dedupes multi-shard models and sums their sizes. `F5` to rescan.
+- **Physical model catalog** — mirrors discovery below
+  `~/.config/llmctl/models` using source-aware folders, safe manifests, model
+  symlinks, and per-model YAML profiles. Press `/` for global model search.
 - **Profiles & options** — built-in, read-only templates (Default, Chat, Coding,
   Long Context, Server) that fork into per-model editable instances on first edit.
   Edit options with live validation, cycle enums/flags in place, and adjust
@@ -88,6 +91,7 @@ overlay.
 | `l` / `→` | Drill into selection |
 | `h` / `←` | Back up a level |
 | `g` / `G` | First / last item |
+| `/` | Search all models and jump to a result |
 | **Profiles** | |
 | `a` | Create profile |
 | `r` | Rename (custom profiles only) |
@@ -132,6 +136,13 @@ a config file is optional. To customize, create
 [models]
 paths = ["/data/models", "~/work/ggufs"]
 
+# Named sources support explicit layout handling. `auto` recognizes LM Studio
+# and Hugging Face paths, then preserves unknown relative directory layouts.
+[[models.sources]]
+name = "nas"
+path = "/mnt/nas/llms"
+layout = "directory" # auto, directory, flat, lm-studio, or hugging-face
+
 [runtime.llama_cpp]
 # Binary name (resolved on $PATH) or an absolute path.
 binary = "llama-server"
@@ -146,6 +157,7 @@ port = 8000
 | Path | Purpose |
 |------|---------|
 | `~/.config/llmctl/config.toml` | Configuration |
+| `~/.config/llmctl/models/` | Managed source tree, symlinks, and YAML profiles |
 | `~/.local/state/llmctl/` | Profile instances, session records, logs |
 | `~/.cache/llmctl/` | Model & runtime scan cache |
 

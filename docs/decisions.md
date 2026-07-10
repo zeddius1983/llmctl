@@ -170,3 +170,47 @@ classification.
 classification (port-in-use, OOM, GPU/Vulkan/CUDA init, …) and log search remain
 for Phase 4; the `Unknown` session state is reserved for that richer
 classification.
+
+---
+
+## ADR-009: Managed model catalog with source-aware identity
+
+**Status:** Accepted
+
+**Context:** A flat list keyed and displayed by GGUF filename is ambiguous when
+the same artifact name exists under multiple providers or model stores. Profiles
+were also persisted in one `profiles.json`, keyed by an absolute model path,
+which made the user-visible hierarchy and the persistence identity diverge.
+Users need a Yazi-style source/provider/repository/artifact hierarchy, global
+model search, and support for arbitrary configured model directories.
+
+**Decision:** Discovery normalizes models into a managed physical catalog under
+`~/.config/llmctl/models`. Known LM Studio and Hugging Face layouts receive
+source-specific parsing; arbitrary configured sources preserve their relative
+directory layout as a best-effort fallback. Each artifact leaf contains a
+`model.gguf` symlink, a generated hidden `.llmctl.yml` identity/ownership
+manifest, and a `profiles/` directory containing YAML profile instances. The
+TUI mirrors this variable-depth catalog in its Miller columns. Search indexes
+catalog leaves and jumps back to the regular hierarchy.
+
+The catalog is derived from discovery but is the stable user-visible identity
+layer. Launches continue to use the original path recorded in the manifest,
+which avoids split-GGUF sibling lookup problems. Generated entries are only
+reconciled when marked by an llmctl manifest; user profile data is never removed
+merely because a source is temporarily unavailable.
+
+Catalog/profile writes are change-aware and profile mutations persist only the
+affected YAML file. If a catalog leaf cannot be created or written, that
+profile remains in the legacy JSON fallback until YAML persistence succeeds.
+Hugging Face snapshot selection prefers `refs/main`, then uses a deterministic
+mtime/revision/path ordering. Search results are cached per query, and selecting
+a GGUF result atomically switches to the compatible llama.cpp runtime and tree
+route.
+
+**Consequences:** Models with identical filenames remain distinguishable by
+source and provider, profiles live beside their model identity, and custom
+folders work without requiring a prescribed layout. Discovery now needs source
+descriptors, catalog reconciliation, collision-safe path normalization, legacy
+profile migration, and variable-depth browser state. The catalog contains
+absolute source paths and is therefore local machine state despite residing in
+the XDG configuration directory.

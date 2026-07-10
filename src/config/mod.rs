@@ -27,6 +27,28 @@ pub struct ModelsConfig {
     /// Directories scanned (recursively) for GGUF models. Never defaults to
     /// `$HOME` — recursive scanning only happens inside configured paths.
     pub paths: Vec<PathBuf>,
+    /// Named model roots. Known layouts are parsed semantically; arbitrary
+    /// directories retain their relative hierarchy below `name`.
+    pub sources: Vec<ModelSourceConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelSourceConfig {
+    pub name: String,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub layout: ModelLayout,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelLayout {
+    #[default]
+    Auto,
+    Directory,
+    Flat,
+    LmStudio,
+    HuggingFace,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -81,6 +103,7 @@ impl Config {
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub config_file: PathBuf,
+    pub models_dir: PathBuf,
     pub state_dir: PathBuf,
     pub cache_dir: PathBuf,
     pub log_dir: PathBuf,
@@ -94,6 +117,7 @@ impl Paths {
         let state_dir = dirs.state_dir().unwrap_or_else(|| dirs.data_dir()).to_path_buf();
         Ok(Self {
             config_file: dirs.config_dir().join("config.toml"),
+            models_dir: dirs.config_dir().join("models"),
             log_dir: state_dir.join("logs"),
             sessions_dir: state_dir.join("sessions"),
             state_dir,
@@ -103,7 +127,9 @@ impl Paths {
 
     /// Create the state/cache directory tree if it does not exist yet.
     pub fn ensure_dirs(&self) -> Result<()> {
-        for dir in [&self.state_dir, &self.cache_dir, &self.log_dir, &self.sessions_dir] {
+        for dir in
+            [&self.state_dir, &self.cache_dir, &self.log_dir, &self.sessions_dir, &self.models_dir]
+        {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         Ok(())

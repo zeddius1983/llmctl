@@ -38,6 +38,8 @@ state.
   helpers (`human_size`, `format_unix_date`); and `stubs` for the demo vLLM
   runtime/models.
 - **`discovery/`**
+  - `catalog.rs` — normalize known/custom source layouts and reconcile the
+    managed directory tree, identity manifests, and model symlinks.
   - `gguf.rs` — minimal GGUF header reader. Parses only the KV metadata section
     (token arrays skipped via buffered skipping, never loaded) to extract
     architecture, context length, `general.file_type`, and chat-template presence.
@@ -52,8 +54,8 @@ state.
     step, CLI flag, description) plus `OptionKind` validate/adjust/extreme logic.
   - `templates.rs` — built-in global templates (Default/Chat/Coding/Long
     Context/Server) as option overrides.
-  - `store.rs` — `ProfileStore`: model-scoped instances persisted to
-    `profiles.json`; create/rename/delete/favorite/set-value, auto-saved.
+  - `store.rs` — `ProfileStore`: model-scoped instances persisted as YAML in
+    each catalog leaf; create/rename/delete/favorite/set-value, auto-saved.
   - `mod.rs` — resolution: `list_profiles`, `resolve_options`,
     `current_values`, `effective_kind` (model-aware ctx-size bound).
 - **`session/`**
@@ -73,15 +75,18 @@ state.
 
 ## Navigation model (Yazi sliding three-column)
 
-The UI shows **Parent | Current | Preview** over `root ▸ Runtime ▸ Model ▸
-Profile ▸ Options`. Drilling in (`l`/`→`) slides columns left; `h`/`←` slides
-right. The Preview column shows the hovered item's children; at the Options
+The UI shows **Parent | Current | Preview** over `root ▸ Runtime ▸ model
+catalog… ▸ Model ▸ Profile ▸ Options`. The catalog has variable depth and
+normally reads `source ▸ provider ▸ repository ▸ artifact`; arbitrary configured
+directories preserve their relative hierarchy. Drilling in (`l`/`→`) slides
+columns left; `h`/`←` slides right. The Preview column shows the hovered item's children; at the Options
 leaf it becomes the option detail/editor.
 
 | Current | Parent (left) | Current (middle) | Preview (right)   |
 |---------|---------------|------------------|-------------------|
 | Runtime | root (virtual)| runtimes         | models            |
-| Model   | runtimes      | models           | profiles          |
+| Catalog | previous level| directories      | children          |
+| Model   | repository    | model artifacts  | profiles          |
 | Profile | models        | profiles         | options (values)  |
 | Options | profiles      | options          | option detail     |
 
@@ -107,7 +112,10 @@ a default never exceeds what the model supports.
 - `~/.config/llmctl/config.toml` — user config (model paths, runtime binary,
   default host/port). Optional.
 - `~/.cache/llmctl/models.json` — model scan cache; `llama-server.help.txt`.
-- `~/.local/state/llmctl/profiles.json` — model-scoped profile instances.
+- `~/.config/llmctl/models/` — managed source-aware tree; each model leaf has
+  `.llmctl.yml`, `model.gguf`, and YAML files below `profiles/`.
+- `~/.local/state/llmctl/profiles.json.bak` — backup made when migrating the
+  former flat profile store (offline models remain in JSON until seen).
 - `~/.local/state/llmctl/logs/` — app log + (Phase 3) per-session server logs.
 - `~/.local/state/llmctl/sessions/` — (Phase 3) session metadata for rediscovery.
 

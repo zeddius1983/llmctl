@@ -21,8 +21,20 @@ pub struct Runtime {
 /// A discovered GGUF model. Serializable so the scanner can cache results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
+    /// Stable catalog identity, distinct from the display filename.
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub path: PathBuf,
+    /// All physical shards (one entry for a non-split model).
+    #[serde(default)]
+    pub shard_paths: Vec<PathBuf>,
+    /// Source/provider/repository/artifact path shown by the model browser.
+    #[serde(default)]
+    pub catalog_path: Vec<String>,
+    /// Managed catalog leaf containing the manifest, symlink, and profiles.
+    #[serde(default)]
+    pub catalog_dir: PathBuf,
     pub size_bytes: u64,
     pub quantization: Option<String>,
     pub architecture: Option<String>,
@@ -61,6 +73,21 @@ impl Runtime {
     /// Human-readable size, e.g. "23.8 GB".
     pub fn formats_label(&self) -> String {
         self.formats.join(", ")
+    }
+}
+
+impl Model {
+    /// Synthetic catalog directories have no launchable source path.
+    pub fn is_catalog_dir(&self) -> bool {
+        self.path.as_os_str().is_empty()
+    }
+
+    pub fn is_model(&self) -> bool {
+        !self.is_catalog_dir()
+    }
+
+    pub fn display_label(&self) -> &str {
+        self.catalog_path.last().map(String::as_str).unwrap_or(&self.name)
     }
 }
 
@@ -125,8 +152,12 @@ pub mod stubs {
     /// Stub models for the vLLM runtime (HF/safetensors style names).
     pub fn vllm_models() -> Vec<Model> {
         let model = |name: &str, path: &str, size: u64, quant: &str, arch: &str| Model {
+            id: path.into(),
             name: name.into(),
             path: path.into(),
+            shard_paths: vec![path.into()],
+            catalog_path: vec![name.into()],
+            catalog_dir: PathBuf::new(),
             size_bytes: size,
             quantization: Some(quant.into()),
             architecture: Some(arch.into()),
