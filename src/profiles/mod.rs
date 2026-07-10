@@ -195,6 +195,7 @@ mod tests {
             version: None,
             binary_path: None,
             formats: vec![],
+            devices: vec![],
         }
     }
 

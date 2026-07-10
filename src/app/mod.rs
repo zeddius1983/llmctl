@@ -55,7 +55,7 @@ pub struct Selector {
     pub key: String,
     pub title: String,
     /// All enum variants, in registry order.
-    pub variants: Vec<&'static str>,
+    pub variants: Vec<String>,
     /// Case-insensitive substring filter typed so far.
     pub filter: String,
     /// Cursor index into [`Self::filtered`].
@@ -77,13 +77,17 @@ struct CatalogRoute {
 
 impl Selector {
     /// Variants matching the current filter (case-insensitive substring).
-    pub fn filtered(&self) -> Vec<&'static str> {
+    pub fn filtered(&self) -> Vec<&str> {
         let needle = self.filter.to_lowercase();
-        self.variants.iter().filter(|v| v.to_lowercase().contains(&needle)).copied().collect()
+        self.variants
+            .iter()
+            .filter(|v| v.to_lowercase().contains(&needle))
+            .map(String::as_str)
+            .collect()
     }
 
     /// The variant under the cursor, if any survives the filter.
-    pub fn selected(&self) -> Option<&'static str> {
+    pub fn selected(&self) -> Option<&str> {
         self.filtered().get(self.cursor).copied()
     }
 }
@@ -867,8 +871,8 @@ impl App {
             KeyCode::Esc => self.selector = None,
             KeyCode::Enter => {
                 if let Some(sel) = self.selector.take() {
-                    if let Some(value) = sel.selected() {
-                        self.apply_option_value(&sel.key, value.to_string());
+                    if let Some(value) = sel.selected().map(str::to_string) {
+                        self.apply_option_value(&sel.key, value);
                     }
                 }
             }
@@ -910,6 +914,21 @@ impl App {
         let key = option.key.clone();
         let current = option.value.clone();
 
+        if key == "device" {
+            let mut variants = vec![profiles::registry::DEFAULT.to_string()];
+            if let Some(runtime) = self.runtimes.selected() {
+                variants.extend(runtime.devices.iter().cloned());
+            }
+            self.selector = Some(Selector {
+                title: "Select device".into(),
+                key,
+                cursor: variants.iter().position(|v| *v == current).unwrap_or(0),
+                variants,
+                filter: String::new(),
+            });
+            return;
+        }
+
         if let Some(spec) = profiles::registry::spec(&key) {
             use profiles::registry::OptionKind;
             if let OptionKind::Enum(variants) = spec.kind {
@@ -917,7 +936,7 @@ impl App {
                     self.selector = Some(Selector {
                         title: format!("Select {key}"),
                         key,
-                        variants: variants.to_vec(),
+                        variants: variants.iter().map(|v| (*v).to_string()).collect(),
                         filter: String::new(),
                         // Start on the current value.
                         cursor: variants.iter().position(|v| *v == current).unwrap_or(0),
@@ -962,6 +981,18 @@ impl App {
 
     /// Increment/decrement the selected option in place (auto-saves).
     fn adjust_option(&mut self, dir: i32) {
+        if let Some(option) = self.options.selected() {
+            if option.key == "device" {
+                let next = self
+                    .runtimes
+                    .selected()
+                    .map(|runtime| cycle_device(&runtime.devices, &option.value, dir));
+                if let Some(next) = next {
+                    self.apply_option_value("device", next);
+                }
+                return;
+            }
+        }
         self.transform_option(|spec, kind, current| spec.bump(kind, current, dir));
     }
 
@@ -1646,6 +1677,17 @@ fn read_log_tail(path: &std::path::Path, max_lines: usize) -> Vec<String> {
     lines
 }
 
+/// Cycle through automatic device selection and the devices discovered from
+/// `llama-server --list-devices`, wrapping in either direction.
+fn cycle_device(devices: &[String], current: &str, dir: i32) -> String {
+    let variants = std::iter::once(profiles::registry::DEFAULT)
+        .chain(devices.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    let current = variants.iter().position(|value| *value == current).unwrap_or(0) as i32;
+    let next = (current + dir.signum()).rem_euclid(variants.len() as i32) as usize;
+    variants[next].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1654,7 +1696,10 @@ mod tests {
         Selector {
             key: "chat-template".into(),
             title: "Select chat-template".into(),
-            variants: vec!["default", "chatml", "llama2", "llama3", "mistral-v1", "zephyr"],
+            variants: ["default", "chatml", "llama2", "llama3", "mistral-v1", "zephyr"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             filter: String::new(),
             cursor: 0,
         }
@@ -1697,5 +1742,21 @@ mod tests {
             panic!("flash-attn should be an enum");
         };
         assert!(variants.len() <= SELECTOR_THRESHOLD);
+    }
+
+    #[test]
+    fn device_hotkeys_cycle_and_wrap_in_both_directions() {
+        let devices = vec!["ROCm0".into(), "Vulkan0".into()];
+        assert_eq!(cycle_device(&devices, "default", 1), "ROCm0");
+        assert_eq!(cycle_device(&devices, "ROCm0", 1), "Vulkan0");
+        assert_eq!(cycle_device(&devices, "Vulkan0", 1), "default");
+        assert_eq!(cycle_device(&devices, "default", -1), "Vulkan0");
+        assert_eq!(cycle_device(&devices, "ROCm0", -1), "default");
+    }
+
+    #[test]
+    fn device_hotkeys_stay_at_default_when_no_devices_are_discovered() {
+        assert_eq!(cycle_device(&[], "default", 1), "default");
+        assert_eq!(cycle_device(&[], "stale-device", -1), "default");
     }
 }

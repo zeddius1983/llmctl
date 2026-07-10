@@ -136,7 +136,7 @@ pub fn omit_token(key: &str) -> Option<&'static str> {
         // `jinja=on` is llama.cpp's default (omitted); `off` adds the bare
         // `--no-jinja` flag (see [`is_flag`]).
         "jinja" => Some("on"),
-        "batch-size" | "gpu-layers" | "threads" | "cache-type-k" | "cache-type-v"
+        "batch-size" | "device" | "gpu-layers" | "threads" | "cache-type-k" | "cache-type-v"
         | "spec-draft-n-max" | "spec-draft-n-min" | "reasoning-effort" | "chat-template"
         | "ctx-size" | "temperature" | "top-p" | "top-k" | "min-p" | "repeat-penalty" => {
             Some(DEFAULT)
@@ -306,6 +306,15 @@ pub static REGISTRY: &[OptionSpec] = &[
         default: "999",
         step: 1.0,
         description: "Layers to offload to the GPU (999 = all; 'default' lets llama.cpp decide).",
+    },
+    OptionSpec {
+        key: "device",
+        cli: "--device",
+        kind: Str,
+        default: "default",
+        step: 0.0,
+        description: "Device to use for offloading, selected from llama-server --list-devices \
+                      ('default' lets llama.cpp choose).",
     },
     OptionSpec {
         key: "temperature",
@@ -550,6 +559,14 @@ mod tests {
         // Home/End are pure min/max jumps; resetting to DEFAULT is `d` (app-level).
         assert_eq!(ngl.kind.extreme(-1), Some("0".into())); // Home → min
         assert_eq!(ngl.kind.extreme(1), Some("999".into())); // End → max
+    }
+
+    #[test]
+    fn device_uses_runtime_selector_and_is_omitted_at_default() {
+        let device = spec("device").unwrap();
+        assert_eq!(device.cli, "--device");
+        assert_eq!(omit_token("device"), Some(DEFAULT));
+        assert!(uses_sentinel("device"));
     }
 
     #[test]
