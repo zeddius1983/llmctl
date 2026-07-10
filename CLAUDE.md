@@ -95,8 +95,8 @@ legacy profile migration), `~/.cache/llmctl/` (models.json, llama-server.help.tx
   **`feature/v0.1.0`** (the release umbrella), which is then merged to `main`.
   (The early `phase-*` and `docs` branches predate this policy and are
   grandfathered.)
-- Commit only when asked. Commit messages end with:
-  `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
+- Commit only when asked. Do not add AI co-author trailers or attribution to
+  commit messages unless the user explicitly requests it.
 - Don't commit the legacy Go `llmctl` binary or `/target` (see `.gitignore`).
 
 ## Context compaction companion
