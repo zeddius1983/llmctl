@@ -8,9 +8,9 @@ Stable, slow-changing context for working in this repo. For volatile details
 
 `llmctl` is a keyboard-driven terminal UI (TUI) for discovering, configuring,
 launching, and managing local LLM inference servers — in the style of Yazi,
-Lazygit, and systemctl. The goal: never hand-type a complex `llama-server`
-command again. The MVP targets **llama.cpp + GGUF on Linux**; other runtimes
-(vLLM, Ollama, …) are future work. Full spec: [docs/requirements.md](docs/requirements.md).
+Lazygit, and systemctl. The goal: never hand-type a complex inference-server
+command again. The released v0.2.0 supports **llama.cpp + GGUF on Linux**;
+vLLM support is the active next runtime. Full spec: [docs/requirements.md](docs/requirements.md).
 
 ## Tech stack
 
@@ -40,10 +40,10 @@ src/
   main.rs        entry: XDG paths, file tracing, launch TUI
   app/           App state, event loop, navigation, prompts, actions
   config/        Config (first-run config.toml generation) + XDG Paths resolution
-  domain/        pure types (Runtime, Model, Profile, OptionItem), helpers, vLLM stubs
+  domain/        pure types (RuntimeId, Runtime, Model, Profile, OptionItem), helpers
   discovery/     catalog.rs (source parsing + managed tree), gguf.rs (header parser),
-                 models.rs (scan+cache), runtimes.rs (llama.cpp)
-  profiles/      registry.rs (option specs), templates.rs, store.rs (per-model YAML), mod.rs (resolution)
+                 models.rs (GGUF), hf.rs (local HF/vLLM), runtimes.rs (binaries)
+  profiles/      runtime-specific option registries/templates, per-model YAML store, resolution
   session/       command.rs (builder), supervisor.rs (DetachedSupervisor: setsid/signals),
                  record.rs (session-<id>.json), proc.rs (/proc), health.rs (/health), mod.rs (SessionManager)
   ui/            ratatui rendering (browser columns, Session Manager, log view, footer, prompts, help)
@@ -53,7 +53,7 @@ docs/            requirements, architecture, decisions (ADRs), roadmap
 XDG paths used at runtime:
 `~/.config/llmctl/config.toml`, `~/.config/llmctl/models/` (managed model
 catalog + per-model YAML profiles), `~/.local/state/llmctl/` (logs, sessions,
-legacy profile migration), `~/.cache/llmctl/` (models.json, llama-server.help.txt).
+legacy profile migration), `~/.cache/llmctl/` (model cache and runtime help snapshots).
 
 ## Key design decisions (see decisions.md for full ADRs)
 

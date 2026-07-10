@@ -2,6 +2,8 @@
 //! exist and their type, default, range, step, CLI flag, and description. Used
 //! to render the Options pane, validate edits, and drive inline adjustment.
 
+use crate::domain::RuntimeId;
+
 /// The kind/domain of an option value, used for validation and adjustment.
 #[derive(Debug, Clone, Copy)]
 pub enum OptionKind {
@@ -126,6 +128,20 @@ pub const DEFAULT: &str = "default";
 /// (e.g. the cache types) omit at that variant; for numeric options with no
 /// in-band sentinel it's the [`DEFAULT`] sentinel. `None` means always emitted.
 pub fn omit_token(key: &str) -> Option<&'static str> {
+    omit_token_for(RuntimeId::LlamaCpp, key)
+}
+
+/// Runtime-aware omitted value. Keeping this policy beside each runtime's
+/// registry prevents same-named options from inheriting another CLI's rules.
+pub fn omit_token_for(runtime: RuntimeId, key: &str) -> Option<&'static str> {
+    if runtime == RuntimeId::Vllm {
+        return match key {
+            "host" | "port" => None,
+            "enable-prefix-caching" | "enforce-eager" | "trust-remote-code" => Some("off"),
+            "dtype" | "kv-cache-dtype" => Some("auto"),
+            _ => Some(DEFAULT),
+        };
+    }
     match key {
         "flash-attn" | "reasoning" => Some("auto"),
         // `mmap=on` is llama.cpp's default (omitted); `off` adds the bare
@@ -150,7 +166,16 @@ pub fn omit_token(key: &str) -> Option<&'static str> {
 /// Whether the option is a valueless boolean flag (e.g. `mmap` → `--no-mmap`):
 /// when not at its [`omit_token`] it emits the bare flag with no value token.
 pub fn is_flag(key: &str) -> bool {
-    matches!(key, "mmap" | "jinja")
+    is_flag_for(RuntimeId::LlamaCpp, key)
+}
+
+pub fn is_flag_for(runtime: RuntimeId, key: &str) -> bool {
+    match runtime {
+        RuntimeId::LlamaCpp => matches!(key, "mmap" | "jinja"),
+        RuntimeId::Vllm => {
+            matches!(key, "enable-prefix-caching" | "enforce-eager" | "trust-remote-code")
+        }
+    }
 }
 
 /// The value token actually emitted on the command line. Most options pass
@@ -168,9 +193,14 @@ pub fn cli_value(key: &str, value: &str) -> String {
 /// enum variant like `"auto"` or an enum's own `"default"` choice). Only these
 /// get the sentinel editing affordances (the `default` text entry); enums cycle
 /// through their variants instead.
+#[cfg(test)]
 pub fn uses_sentinel(key: &str) -> bool {
-    omit_token(key) == Some(DEFAULT)
-        && !matches!(spec(key).map(|s| s.kind), Some(OptionKind::Enum(_)))
+    uses_sentinel_for(RuntimeId::LlamaCpp, key)
+}
+
+pub fn uses_sentinel_for(runtime: RuntimeId, key: &str) -> bool {
+    omit_token_for(runtime, key) == Some(DEFAULT)
+        && !matches!(spec_for(runtime, key).map(|s| s.kind), Some(OptionKind::Enum(_)))
 }
 
 impl OptionSpec {
@@ -178,8 +208,19 @@ impl OptionSpec {
     /// cycle. For sentinel options [`DEFAULT`] sits just below the numeric range:
     /// stepping up from it enters the concrete default; enums (whose omitted
     /// state is an ordinary `"auto"` variant) just cycle normally.
+    #[cfg(test)]
     pub fn bump(&self, kind: &OptionKind, current: &str, dir: i32) -> Option<String> {
-        if uses_sentinel(self.key) && current == DEFAULT {
+        self.bump_for(RuntimeId::LlamaCpp, kind, current, dir)
+    }
+
+    pub fn bump_for(
+        &self,
+        runtime: RuntimeId,
+        kind: &OptionKind,
+        current: &str,
+        dir: i32,
+    ) -> Option<String> {
+        if uses_sentinel_for(runtime, self.key) && current == DEFAULT {
             return Some(if dir > 0 { self.default.to_string() } else { DEFAULT.to_string() });
         }
         kind.adjust(current, dir, self.step)
@@ -494,9 +535,147 @@ pub static REGISTRY: &[OptionSpec] = &[
     },
 ];
 
+/// Curated first-slice registry for `vllm serve`. Sampling parameters are
+/// intentionally absent: vLLM clients provide those per request rather than at
+/// server startup.
+pub static VLLM_REGISTRY: &[OptionSpec] = &[
+    OptionSpec {
+        key: "max-model-len",
+        cli: "--max-model-len",
+        kind: Int { min: Some(1), max: None },
+        default: "4096",
+        step: 1024.0,
+        description: "Maximum combined prompt and output length ('default' lets vLLM derive it).",
+    },
+    OptionSpec {
+        key: "tensor-parallel-size",
+        cli: "--tensor-parallel-size",
+        kind: Int { min: Some(1), max: None },
+        default: "1",
+        step: 1.0,
+        description: "Number of tensor-parallel GPU workers ('default' uses one).",
+    },
+    OptionSpec {
+        key: "pipeline-parallel-size",
+        cli: "--pipeline-parallel-size",
+        kind: Int { min: Some(1), max: None },
+        default: "1",
+        step: 1.0,
+        description: "Number of pipeline-parallel stages ('default' uses one).",
+    },
+    OptionSpec {
+        key: "gpu-memory-utilization",
+        cli: "--gpu-memory-utilization",
+        kind: Float { min: Some(0.0), max: Some(1.0) },
+        default: "0.92",
+        step: 0.05,
+        description: "Fraction of each GPU's memory available to this vLLM instance.",
+    },
+    OptionSpec {
+        key: "dtype",
+        cli: "--dtype",
+        kind: Enum(&["auto", "bfloat16", "float16", "float32"]),
+        default: "auto",
+        step: 1.0,
+        description: "Model weight and activation data type ('default' lets vLLM choose).",
+    },
+    OptionSpec {
+        key: "quantization",
+        cli: "--quantization",
+        kind: Str,
+        default: "auto",
+        step: 0.0,
+        description: "Quantization method override; leave at default to read the model config.",
+    },
+    OptionSpec {
+        key: "kv-cache-dtype",
+        cli: "--kv-cache-dtype",
+        kind: Enum(&["auto", "bfloat16", "float16", "fp8", "fp8_e4m3", "fp8_e5m2"]),
+        default: "auto",
+        step: 1.0,
+        description: "KV-cache storage type ('default' follows the model data type).",
+    },
+    OptionSpec {
+        key: "max-num-seqs",
+        cli: "--max-num-seqs",
+        kind: Int { min: Some(1), max: None },
+        default: "256",
+        step: 16.0,
+        description: "Maximum sequences processed in one iteration.",
+    },
+    OptionSpec {
+        key: "enable-prefix-caching",
+        cli: "--enable-prefix-caching",
+        kind: Enum(&["off", "on"]),
+        default: "off",
+        step: 1.0,
+        description: "Reuse KV-cache blocks shared by prompts with matching prefixes.",
+    },
+    OptionSpec {
+        key: "enforce-eager",
+        cli: "--enforce-eager",
+        kind: Enum(&["off", "on"]),
+        default: "off",
+        step: 1.0,
+        description: "Disable CUDA graphs and always execute eagerly for compatibility.",
+    },
+    OptionSpec {
+        key: "cpu-offload-gb",
+        cli: "--cpu-offload-gb",
+        kind: Float { min: Some(0.0), max: None },
+        default: "0",
+        step: 1.0,
+        description: "GiB of model weights to offload from each GPU to CPU memory.",
+    },
+    OptionSpec {
+        key: "trust-remote-code",
+        cli: "--trust-remote-code",
+        kind: Enum(&["off", "on"]),
+        default: "off",
+        step: 1.0,
+        description: "Allow model repositories to execute custom code (security-sensitive).",
+    },
+    OptionSpec {
+        key: "served-model-name",
+        cli: "--served-model-name",
+        kind: Str,
+        default: "model",
+        step: 0.0,
+        description: "Model name advertised by the OpenAI-compatible API.",
+    },
+    OptionSpec {
+        key: "host",
+        cli: "--host",
+        kind: Str,
+        default: "127.0.0.1",
+        step: 0.0,
+        description: "Network interface to bind the server to.",
+    },
+    OptionSpec {
+        key: "port",
+        cli: "--port",
+        kind: Int { min: Some(1), max: Some(65535) },
+        default: "8000",
+        step: 1.0,
+        description: "TCP port the server listens on.",
+    },
+];
+
+pub fn registry(runtime: RuntimeId) -> &'static [OptionSpec] {
+    match runtime {
+        RuntimeId::LlamaCpp => REGISTRY,
+        RuntimeId::Vllm => VLLM_REGISTRY,
+    }
+}
+
 /// Look up an option spec by key.
+#[cfg(test)]
 pub fn spec(key: &str) -> Option<&'static OptionSpec> {
-    REGISTRY.iter().find(|s| s.key == key)
+    spec_for(RuntimeId::LlamaCpp, key)
+}
+
+pub fn spec_for(runtime: RuntimeId, key: &str) -> Option<&'static OptionSpec> {
+    registry(runtime).iter().find(|s| s.key == key)
 }
 
 #[cfg(test)]
@@ -561,6 +740,17 @@ mod tests {
         let cache = spec("cache-type-k").unwrap().kind;
         assert_eq!(cache.adjust("f16", 1, 1.0), Some("q8_0".into()));
         assert_eq!(cache.adjust("f16", -1, 1.0), Some("default".into())); // back toward "default"
+    }
+
+    #[test]
+    fn vllm_registry_is_independent_from_llama_cpp() {
+        assert!(spec_for(RuntimeId::Vllm, "tensor-parallel-size").is_some());
+        assert!(spec_for(RuntimeId::LlamaCpp, "tensor-parallel-size").is_none());
+        assert!(spec_for(RuntimeId::Vllm, "gpu-layers").is_none());
+        assert_eq!(omit_token_for(RuntimeId::Vllm, "host"), None);
+        assert_eq!(omit_token_for(RuntimeId::Vllm, "enforce-eager"), Some("off"));
+        assert_eq!(omit_token_for(RuntimeId::Vllm, "dtype"), Some("auto"));
+        assert!(is_flag_for(RuntimeId::Vllm, "enforce-eager"));
     }
 
     #[test]

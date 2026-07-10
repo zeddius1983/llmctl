@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use crate::config::{Config, ModelLayout, ModelSourceConfig, Paths};
 use crate::discovery;
 use crate::discovery::ModelSource;
-use crate::domain::{Model, OptionItem, Profile, Runtime, format_unix_date, human_size, stubs};
+use crate::domain::{Model, OptionItem, Profile, Runtime, RuntimeId, format_unix_date, human_size};
 use crate::profiles::{self, ProfileStore, store};
 use crate::session::{self, LaunchRequest, SessionManager};
 use crate::ui;
@@ -228,6 +228,8 @@ pub struct App {
     should_quit: bool,
     /// Discovered GGUF models for the llama.cpp runtime.
     scanned_models: Vec<Model>,
+    /// Discovered local Hugging Face models for vLLM.
+    vllm_models: Vec<Model>,
     catalog_prefix: Vec<String>,
     catalog_history: Vec<(Vec<Model>, Option<usize>, Vec<String>)>,
     /// Expanded, absolute model search directories.
@@ -245,11 +247,15 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config, paths: Paths) -> Self {
-        // Discover the real llama.cpp runtime; keep vLLM as a demo stub.
+        // Discover both configured runtimes. vLLM model discovery and launching
+        // arrive in later slices, but installation state is real from here on.
         let llama = discovery::discover_llama_cpp(&config.runtime.llama_cpp, &paths.cache_dir);
+        let vllm = discovery::discover_vllm(&config.runtime.vllm);
         let model_sources = resolve_model_sources(&config.models.paths, &config.models.sources);
         let model_cache = paths.cache_dir.join("models.json");
         let mut scanned_models = discovery::scan_models(&model_sources, &model_cache);
+        let vllm_models =
+            discovery::scan_vllm_models(&model_sources, &paths.cache_dir.join("vllm-models.json"));
         discovery::reconcile(&paths.models_dir, &mut scanned_models);
         let store = ProfileStore::load(paths.state_dir.join("profiles.json"), &scanned_models);
         // Built after discovery's one-shot `Command`s: the supervisor ignores
@@ -259,7 +265,7 @@ impl App {
         let mut app = Self {
             config,
             focus: Pane::Runtime,
-            runtimes: PaneList::new(vec![llama, stubs::vllm_runtime()]),
+            runtimes: PaneList::new(vec![llama, vllm]),
             models: PaneList::new(Vec::new()),
             catalog_preview: Vec::new(),
             profiles: PaneList::new(Vec::new()),
@@ -277,6 +283,7 @@ impl App {
             log_scroll: 0,
             should_quit: false,
             scanned_models,
+            vllm_models,
             catalog_prefix: Vec::new(),
             catalog_history: Vec::new(),
             model_sources,
@@ -518,7 +525,8 @@ impl App {
             return;
         };
         let Some(route) = self.catalog_route(&path) else { return };
-        let Some(runtime) = self.runtimes.items.iter().position(|rt| rt.name == "llama.cpp") else {
+        let Some(runtime) = self.runtimes.items.iter().position(|rt| rt.id == RuntimeId::LlamaCpp)
+        else {
             return;
         };
 
@@ -533,7 +541,7 @@ impl App {
     }
 
     fn catalog_route(&self, path: &[String]) -> Option<CatalogRoute> {
-        let mut items = self.catalog_children(&[]);
+        let mut items = Self::catalog_children_from(&self.scanned_models, &[]);
         let mut prefix = Vec::new();
         let mut history = Vec::new();
         for (depth, component) in path.iter().enumerate() {
@@ -546,7 +554,7 @@ impl App {
                 }
                 history.push((items.clone(), Some(selected), prefix.clone()));
                 prefix = node.catalog_path.clone();
-                items = self.catalog_children(&prefix);
+                items = Self::catalog_children_from(&self.scanned_models, &prefix);
             } else if last {
                 return Some(CatalogRoute { items, selected, prefix, history });
             } else {
@@ -654,8 +662,8 @@ impl App {
 
     /// Build a launch request from the current selection and resolved options.
     fn build_launch_request(&self) -> Result<LaunchRequest, String> {
-        if self.is_stub_runtime() {
-            return Err("vLLM is a navigation-only stub (not launchable)".into());
+        if self.is_vllm_pending() {
+            return Err("vLLM model discovery and launching are not available yet".into());
         }
         let rt = self.runtimes.selected().ok_or("no runtime selected")?;
         let model = self.selected_model().ok_or("no model selected")?;
@@ -899,9 +907,9 @@ impl App {
 
     /// Open the option editor. Small enums cycle in place, large ones
     /// ([`SELECTOR_THRESHOLD`]) open the filterable selector popup; numeric/
-    /// string open a text prompt. Applies only to real (non-stub) runtimes.
+    /// string open a text prompt. Applies only to runtimes with model support.
     fn open_editor(&mut self) {
-        if self.focus != Pane::Options || self.is_stub_runtime() {
+        if self.focus != Pane::Options || self.is_vllm_pending() {
             return;
         }
         let Some(option) = self.options.selected() else {
@@ -910,7 +918,8 @@ impl App {
         let key = option.key.clone();
         let current = option.value.clone();
 
-        if let Some(spec) = profiles::registry::spec(&key) {
+        let runtime = self.runtimes.selected().map(|r| r.id).unwrap_or(RuntimeId::LlamaCpp);
+        if let Some(spec) = profiles::registry::spec_for(runtime, &key) {
             use profiles::registry::OptionKind;
             if let OptionKind::Enum(variants) = spec.kind {
                 if variants.len() > SELECTOR_THRESHOLD {
@@ -926,13 +935,13 @@ impl App {
                 }
                 // Small enums don't need a popup — `e` advances to the next
                 // state (which, for omittable options, cycles "default" too).
-                if let Some(next) = spec.bump(&spec.kind, &current, 1) {
+                if let Some(next) = spec.bump_for(runtime, &spec.kind, &current, 1) {
                     self.apply_option_value(&key, next);
                 }
                 return;
             }
         }
-        let title = if profiles::registry::uses_sentinel(&key) {
+        let title = if profiles::registry::uses_sentinel_for(runtime, &key) {
             format!("Edit {key} (number or 'default')")
         } else {
             format!("Edit {key}")
@@ -949,7 +958,7 @@ impl App {
     /// Unlike `Home`, this restores the *resolved* default — the omit token for
     /// omittable options, but e.g. ctx/8 for ctx-size or the config host/port.
     fn reset_option_default(&mut self) {
-        if self.focus != Pane::Options || self.is_stub_runtime() {
+        if self.focus != Pane::Options || self.is_vllm_pending() {
             return;
         }
         let Some(option) = self.options.selected() else {
@@ -962,7 +971,8 @@ impl App {
 
     /// Increment/decrement the selected option in place (auto-saves).
     fn adjust_option(&mut self, dir: i32) {
-        self.transform_option(|spec, kind, current| spec.bump(kind, current, dir));
+        let runtime = self.runtimes.selected().map(|r| r.id).unwrap_or(RuntimeId::LlamaCpp);
+        self.transform_option(|spec, kind, current| spec.bump_for(runtime, kind, current, dir));
     }
 
     /// Set the selected option to its min (`dir < 0`) or max (`dir > 0`).
@@ -979,7 +989,7 @@ impl App {
             &str,
         ) -> Option<String>,
     ) {
-        if self.focus != Pane::Options || self.is_stub_runtime() {
+        if self.focus != Pane::Options || self.is_vllm_pending() {
             return;
         }
         let Some(option) = self.options.selected() else {
@@ -987,7 +997,8 @@ impl App {
         };
         let key = option.key.clone();
         let current = option.value.clone();
-        let Some(spec) = profiles::registry::spec(&key) else {
+        let runtime = self.runtimes.selected().map(|r| r.id).unwrap_or(RuntimeId::LlamaCpp);
+        let Some(spec) = profiles::registry::spec_for(runtime, &key) else {
             return;
         };
         // Use the model-aware kind so ctx-size respects the model's max context.
@@ -1024,9 +1035,10 @@ impl App {
     }
 
     fn commit_option_edit(&mut self, key: &str, input: &str) -> Result<(), String> {
-        let spec = profiles::registry::spec(key).ok_or("unknown option")?;
+        let runtime = self.runtimes.selected().map(|r| r.id).ok_or("no runtime selected")?;
+        let spec = profiles::registry::spec_for(runtime, key).ok_or("unknown option")?;
         // Sentinel options accept "default" (or an empty entry) to drop the flag.
-        if profiles::registry::uses_sentinel(key)
+        if profiles::registry::uses_sentinel_for(runtime, key)
             && (input.is_empty() || input.eq_ignore_ascii_case(profiles::registry::DEFAULT))
         {
             self.apply_option_value(key, profiles::registry::DEFAULT.to_string());
@@ -1052,7 +1064,7 @@ impl App {
         let runtime = rt.name.clone();
         let model = store::model_key(&m.path);
         let profile = p.clone();
-        let base = profiles::resolved_values(&profile, m, &self.config.defaults);
+        let base = profiles::resolved_values(rt.id, &profile, m, &self.config.defaults);
 
         let cursor = self.options.state.selected();
         self.store.set_value(&runtime, &model, &profile.name, key, value, &base);
@@ -1062,7 +1074,7 @@ impl App {
 
     /// Toggle the favorite flag on the selected profile (real runtimes only).
     fn toggle_favorite(&mut self) {
-        if self.focus != Pane::Profile || self.is_stub_runtime() {
+        if self.focus != Pane::Profile || self.is_vllm_pending() {
             return;
         }
         let (Some(rt), Some(m), Some(p)) =
@@ -1073,7 +1085,7 @@ impl App {
         let runtime = rt.name.clone();
         let model = store::model_key(&m.path);
         let profile = p.clone();
-        let base = profiles::resolved_values(&profile, m, &self.config.defaults);
+        let base = profiles::resolved_values(rt.id, &profile, m, &self.config.defaults);
 
         let cursor = self.profiles.state.selected();
         self.store.toggle_favorite(&runtime, &model, &profile.name, &base);
@@ -1084,7 +1096,7 @@ impl App {
     // --- profile management (Profile pane) ---------------------------------
 
     fn prompt_new_profile(&mut self) {
-        if self.focus != Pane::Profile || self.is_stub_runtime() {
+        if self.focus != Pane::Profile || self.is_vllm_pending() {
             return;
         }
         self.prompt = Some(Prompt {
@@ -1096,7 +1108,7 @@ impl App {
     }
 
     fn prompt_rename_profile(&mut self) {
-        if self.focus != Pane::Profile || self.is_stub_runtime() {
+        if self.focus != Pane::Profile || self.is_vllm_pending() {
             return;
         }
         let Some(p) = self.profiles.selected() else {
@@ -1115,7 +1127,7 @@ impl App {
     }
 
     fn prompt_duplicate_profile(&mut self) {
-        if self.focus != Pane::Profile || self.is_stub_runtime() {
+        if self.focus != Pane::Profile || self.is_vllm_pending() {
             return;
         }
         let Some(p) = self.profiles.selected() else {
@@ -1132,7 +1144,7 @@ impl App {
 
     /// Delete a custom profile, or reset a built-in to its template defaults.
     fn delete_profile(&mut self) {
-        if self.focus != Pane::Profile || self.is_stub_runtime() {
+        if self.focus != Pane::Profile || self.is_vllm_pending() {
             return;
         }
         let (Some(rt), Some(m), Some(p)) =
@@ -1160,7 +1172,8 @@ impl App {
         let m = self.selected_model().ok_or("no model selected")?;
         // Seed from the Default template's resolved values for this model.
         let default = Profile { name: "Default".into(), builtin: true, favorite: false };
-        let values = profiles::resolved_values(&default, m, &self.config.defaults);
+        let runtime_id = self.runtimes.selected().ok_or("no runtime selected")?.id;
+        let values = profiles::resolved_values(runtime_id, &default, m, &self.config.defaults);
         self.store.create(&runtime, &model, name, values, true);
         self.refresh_profiles(Some(name));
         Ok(())
@@ -1186,7 +1199,7 @@ impl App {
         let model = store::model_key(&m.path);
         let src_profile = Profile {
             name: src.to_string(),
-            builtin: profiles::templates::is_builtin(src),
+            builtin: profiles::templates::is_builtin(rt.id, src),
             favorite: false,
         };
         // Copy the source's *current* values (including any instance edits).
@@ -1225,9 +1238,10 @@ impl App {
         }
     }
 
-    /// True when the selected runtime is the vLLM stub (no editing/persistence).
-    fn is_stub_runtime(&self) -> bool {
-        self.runtimes.selected().map(|r| r.name == "vLLM").unwrap_or(true)
+    /// True while the selected runtime has discovery/profile plumbing but not
+    /// yet a launchable model implementation.
+    fn is_vllm_pending(&self) -> bool {
+        self.runtimes.selected().map(|r| r.id == RuntimeId::Vllm).unwrap_or(true)
     }
 
     /// The selected catalog leaf. Directory nodes intentionally have no path.
@@ -1240,9 +1254,17 @@ impl App {
     }
 
     fn catalog_children(&self, prefix: &[String]) -> Vec<Model> {
+        let models = match self.runtimes.selected().map(|runtime| runtime.id) {
+            Some(RuntimeId::Vllm) => &self.vllm_models,
+            _ => &self.scanned_models,
+        };
+        Self::catalog_children_from(models, prefix)
+    }
+
+    fn catalog_children_from(models: &[Model], prefix: &[String]) -> Vec<Model> {
         use std::collections::BTreeMap;
         let mut children: BTreeMap<String, Model> = BTreeMap::new();
-        for model in &self.scanned_models {
+        for model in models {
             if !model.catalog_path.starts_with(prefix) || model.catalog_path.len() <= prefix.len() {
                 continue;
             }
@@ -1275,6 +1297,10 @@ impl App {
     /// Re-scan configured model directories (the `F5` refresh).
     fn refresh_models(&mut self) {
         self.scanned_models = discovery::scan_models(&self.model_sources, &self.model_cache);
+        self.vllm_models = discovery::scan_vllm_models(
+            &self.model_sources,
+            &self.model_cache.with_file_name("vllm-models.json"),
+        );
         discovery::reconcile(&self.models_dir, &mut self.scanned_models);
         self.store.sync_models(&self.scanned_models);
         self.catalog_history.clear();
@@ -1376,27 +1402,18 @@ impl App {
         if level < Pane::Model.index() {
             self.catalog_history.clear();
             self.catalog_prefix.clear();
-            let models = match self.runtimes.selected() {
-                // vLLM is a stub; llama.cpp uses the discovered GGUF models.
-                Some(rt) if rt.name == "vLLM" => stubs::vllm_models(),
-                Some(_) => self.catalog_children(&[]),
+            let models = match self.runtimes.selected().map(|rt| rt.id) {
+                Some(RuntimeId::Vllm | RuntimeId::LlamaCpp) => self.catalog_children(&[]),
                 None => Vec::new(),
             };
             self.models.replace(models);
         }
         if level < Pane::Profile.index() {
             self.catalog_preview = match self.models.selected() {
-                Some(m) if m.is_catalog_dir() => {
-                    if self.is_stub_runtime() {
-                        Vec::new()
-                    } else {
-                        self.catalog_children(&m.catalog_path)
-                    }
-                }
+                Some(m) if m.is_catalog_dir() => self.catalog_children(&m.catalog_path),
                 _ => Vec::new(),
             };
             let profiles = match (self.runtimes.selected(), self.selected_model()) {
-                (Some(rt), Some(m)) if rt.name == "vLLM" => stubs::profiles_for(m),
                 (Some(rt), Some(m)) => profiles::list_profiles(rt, m, &self.store),
                 _ => Vec::new(),
             };
@@ -1405,7 +1422,6 @@ impl App {
         if level < Pane::Options.index() {
             let options =
                 match (self.runtimes.selected(), self.selected_model(), self.profiles.selected()) {
-                    (Some(rt), _, Some(p)) if rt.name == "vLLM" => stubs::options_for(p),
                     (Some(rt), Some(m), Some(p)) => {
                         profiles::resolve_options(rt, m, p, &self.store, &self.config.defaults)
                     }

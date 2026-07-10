@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::domain::Model;
+use crate::domain::{Model, RuntimeId};
 
 /// (runtime, model, profile) — uniquely identifies an instance.
 type Key = (String, String, String);
@@ -100,7 +100,7 @@ impl ProfileStore {
             for loaded in load_model_profiles(model, &mut instances) {
                 fallback.remove(&loaded);
             }
-            for profile in super::templates::names() {
+            for profile in super::templates::names(RuntimeId::LlamaCpp) {
                 instances.entry(key("llama.cpp", &model_key(&model.path), profile)).or_default();
             }
         }
@@ -121,7 +121,7 @@ impl ProfileStore {
             for loaded in load_model_profiles(model, &mut self.instances) {
                 self.fallback.remove(&loaded);
             }
-            for profile in super::templates::names() {
+            for profile in super::templates::names(RuntimeId::LlamaCpp) {
                 self.instances
                     .entry(key("llama.cpp", &model_key(&model.path), profile))
                     .or_default();
@@ -222,7 +222,8 @@ impl ProfileStore {
         self.instances.entry(key(runtime, model, profile)).or_insert_with(|| Instance {
             values: base.clone(),
             favorite: false,
-            custom: !super::templates::is_builtin(profile),
+            custom: RuntimeId::from_name(runtime)
+                .is_none_or(|runtime| !super::templates::is_builtin(runtime, profile)),
         })
     }
 

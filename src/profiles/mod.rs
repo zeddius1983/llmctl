@@ -8,7 +8,7 @@ pub mod templates;
 use std::collections::BTreeMap;
 
 use crate::config::Defaults;
-use crate::domain::{Model, OptionItem, Profile, Runtime};
+use crate::domain::{Model, OptionItem, Profile, Runtime, RuntimeId};
 use crate::profiles::registry::OptionKind;
 
 pub use store::ProfileStore;
@@ -27,7 +27,7 @@ pub fn effective_kind(spec: &registry::OptionSpec, model: &Model) -> OptionKind 
 /// user-created custom profiles, with favorite flags from the store.
 pub fn list_profiles(runtime: &Runtime, model: &Model, store: &ProfileStore) -> Vec<Profile> {
     let model_key = store::model_key(&model.path);
-    let mut profiles: Vec<Profile> = templates::names()
+    let mut profiles: Vec<Profile> = templates::names(runtime.id)
         .map(|name| Profile {
             name: name.to_string(),
             builtin: true,
@@ -55,12 +55,12 @@ pub fn resolve_options(
 ) -> Vec<OptionItem> {
     let model_key = store::model_key(&model.path);
     let instance = store.get(&runtime.name, &model_key, &profile.name);
-    let template = templates::find(&profile.name);
+    let template = templates::find(runtime.id, &profile.name);
 
-    registry::REGISTRY
+    registry::registry(runtime.id)
         .iter()
         .map(|spec| {
-            let default = spec_default(spec, model, defaults);
+            let default = spec_default(runtime.id, spec, model, defaults);
 
             let value = instance
                 .and_then(|i| i.values.get(spec.key).cloned())
@@ -102,17 +102,18 @@ pub fn current_values(
 /// showing, or the first edit would silently shift unedited options (e.g.
 /// ctx-size from the model-aware ctx/8 back to the global 4096).
 pub fn resolved_values(
+    runtime: RuntimeId,
     profile: &Profile,
     model: &Model,
     defaults: &Defaults,
 ) -> BTreeMap<String, String> {
-    let template = templates::find(&profile.name);
-    registry::REGISTRY
+    let template = templates::find(runtime, &profile.name);
+    registry::registry(runtime)
         .iter()
         .map(|spec| {
             let value = template
                 .and_then(|t| override_value(t, spec.key))
-                .unwrap_or_else(|| spec_default(spec, model, defaults));
+                .unwrap_or_else(|| spec_default(runtime, spec, model, defaults));
             let value = clamp_ctx_to_model(spec.key, value, model);
             (spec.key.to_string(), normalize_legacy(spec.key, value))
         })
@@ -123,8 +124,13 @@ pub fn resolved_values(
 /// except ctx-size, which must not *start* omitted — its 'default' means the
 /// model's full trained context, which can exhaust memory — and begins at the
 /// ctx/8 heuristic instead.
-fn spec_default(spec: &registry::OptionSpec, model: &Model, defaults: &Defaults) -> String {
-    match registry::omit_token(spec.key) {
+fn spec_default(
+    runtime: RuntimeId,
+    spec: &registry::OptionSpec,
+    model: &Model,
+    defaults: &Defaults,
+) -> String {
+    match registry::omit_token_for(runtime, spec.key) {
         Some(token) if spec.key != "ctx-size" => token.to_string(),
         _ => model_default(spec, model, defaults),
     }
@@ -190,7 +196,19 @@ mod tests {
 
     fn runtime() -> Runtime {
         Runtime {
+            id: RuntimeId::LlamaCpp,
             name: "llama.cpp".into(),
+            description: String::new(),
+            version: None,
+            binary_path: None,
+            formats: vec![],
+        }
+    }
+
+    fn vllm_runtime() -> Runtime {
+        Runtime {
+            id: RuntimeId::Vllm,
+            name: "vLLM".into(),
             description: String::new(),
             version: None,
             binary_path: None,
@@ -243,6 +261,22 @@ mod tests {
         for key in ["temperature", "top-p", "top-k", "min-p", "repeat-penalty"] {
             assert_eq!(value_of(&opts, key), registry::DEFAULT, "{key} should start at default");
         }
+    }
+
+    #[test]
+    fn vllm_profiles_use_their_own_templates_and_registry() {
+        let m = model();
+        let store = empty_store();
+        let rt = vllm_runtime();
+        let profiles = list_profiles(&rt, &m, &store);
+        assert!(profiles.iter().any(|p| p.name == "Multi-GPU"));
+        assert!(!profiles.iter().any(|p| p.name == "Chat"));
+
+        let opts = resolve_options(&rt, &m, &profile("Multi-GPU"), &store, &Defaults::default());
+        assert_eq!(value_of(&opts, "tensor-parallel-size"), "2");
+        assert_eq!(value_of(&opts, "enable-prefix-caching"), "on");
+        assert_eq!(value_of(&opts, "dtype"), "auto");
+        assert!(opts.iter().all(|o| o.key != "gpu-layers"));
     }
 
     #[test]
@@ -355,7 +389,8 @@ mod tests {
         // silently shift (ctx-size from ctx/8 = 32768 back to the global 4096).
         let m = model_with_ctx(Some(262144));
         let mut store = empty_store();
-        let base = resolved_values(&profile("Default"), &m, &Defaults::default());
+        let base =
+            resolved_values(RuntimeId::LlamaCpp, &profile("Default"), &m, &Defaults::default());
         store.set_value("llama.cpp", "/tmp/x.gguf", "Default", "temperature", "0.5".into(), &base);
         let opts =
             resolve_options(&runtime(), &m, &profile("Default"), &store, &Defaults::default());
@@ -368,7 +403,12 @@ mod tests {
         // The base snapshot applies the same ctx clamp as the display path:
         // Long Context's 131072 override folds to a 2048-ctx model's max.
         let m = model_with_ctx(Some(2048));
-        let base = resolved_values(&profile("Long Context"), &m, &Defaults::default());
+        let base = resolved_values(
+            RuntimeId::LlamaCpp,
+            &profile("Long Context"),
+            &m,
+            &Defaults::default(),
+        );
         assert_eq!(base.get("ctx-size").unwrap(), "2048");
     }
 

@@ -25,7 +25,7 @@ state.
          config/             discovery/         profiles/            domain/
        Config, Paths     gguf, models,      registry, templates,   pure types,
        (config.toml,     runtimes           store, resolution      helpers,
-        XDG dirs)        (scan + cache)      (per runtime+model)    vLLM stubs
+        XDG dirs)        (scan + cache)      (per runtime+model)    runtime IDs
 ```
 
 ## Modules
@@ -35,9 +35,8 @@ state.
 - **`config/`** — `Config` (deserialized from `config.toml`; a documented
   standard-source file is generated on first run) and `Paths`
   (config/state/cache/log/sessions locations).
-- **`domain/`** — IO-free types: `Runtime`, `Model`, `Profile`, `OptionItem`;
-  helpers (`human_size`, `format_unix_date`); and `stubs` for the demo vLLM
-  runtime/models.
+- **`domain/`** — IO-free types: stable `RuntimeId`, `Runtime`, `Model`,
+  `Profile`, `OptionItem`; and formatting helpers.
 - **`discovery/`**
   - `catalog.rs` — normalize known/custom source layouts and reconcile the
     managed directory tree, identity manifests, and model symlinks.
@@ -48,13 +47,18 @@ state.
     (first shard only, suffix stripped, sizes summed); projector (`mmproj`)
     filtering; filename-first quant detection; cache to `models.json` keyed by
     size+mtime; `F5` rescan.
-  - `runtimes.rs` — locate `llama-server` (explicit path or `$PATH`), capture
-    `--version`, cache `--help`.
+  - `hf.rs` — local vLLM model discovery: directories with `config.json` plus
+    safetensors/PyTorch weights; parses architecture, context, quantization, and
+    chat-template metadata; normalizes Hugging Face snapshots and prefers
+    `refs/main`; caches parsed configs in `vllm-models.json`.
+  - `runtimes.rs` — locate configured `llama-server` and `vllm` binaries.
+    llama.cpp version/help is captured at startup; slow vLLM version/help
+    execution is deferred to a future explicit inspection action.
 - **`profiles/`**
-  - `registry.rs` — static `REGISTRY` of `OptionSpec`s (kind, default, range,
-    step, CLI flag, description) plus `OptionKind` validate/adjust/extreme logic.
-  - `templates.rs` — built-in global templates (Default/Chat/Coding/Long
-    Context/Server) as option overrides.
+  - `registry.rs` — static per-runtime `OptionSpec` registries (kind, default,
+    range, step, CLI flag, description) plus validation/adjustment logic.
+  - `templates.rs` — runtime-specific built-in profile templates as option
+    overrides.
   - `store.rs` — `ProfileStore`: model-scoped instances persisted as YAML in
     each catalog leaf; create/rename/delete/favorite/set-value, auto-saved.
   - `mod.rs` — resolution: `list_profiles`, `resolve_options`,
@@ -114,7 +118,8 @@ a default never exceeds what the model supports.
   runtime binary, default host/port); user editable.
 - `~/.config/llmctl/config.yaml` — ignored legacy config from the former
   implementation; retained for manual preset migration/backup.
-- `~/.cache/llmctl/models.json` — model scan cache; `llama-server.help.txt`.
+- `~/.cache/llmctl/models.json` — model scan cache;
+  `llama-server.help.txt` — cached llama.cpp help.
 - `~/.config/llmctl/models/` — managed source-aware tree; each model leaf has
   `.llmctl.yml`, `model.gguf`, and YAML files below `profiles/`.
 - `~/.local/state/llmctl/profiles.json.bak` — backup made when migrating the
