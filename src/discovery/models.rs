@@ -109,7 +109,7 @@ pub fn scan(sources: &[ModelSource], cache_path: &Path) -> Vec<Model> {
     models
 }
 
-fn prefer_huggingface_candidate(
+pub(super) fn prefer_huggingface_candidate(
     source: &ModelSource,
     candidate: &Path,
     candidate_modified: Option<u64>,

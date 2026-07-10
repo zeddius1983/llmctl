@@ -47,6 +47,10 @@ state.
     (first shard only, suffix stripped, sizes summed); projector (`mmproj`)
     filtering; filename-first quant detection; cache to `models.json` keyed by
     size+mtime; `F5` rescan.
+  - `hf.rs` — local vLLM model discovery: directories with `config.json` plus
+    safetensors/PyTorch weights; parses architecture, context, quantization, and
+    chat-template metadata; normalizes Hugging Face snapshots and prefers
+    `refs/main`; caches parsed configs in `vllm-models.json`.
   - `runtimes.rs` — locate configured `llama-server` and `vllm` binaries.
     llama.cpp version/help is captured at startup; slow vLLM version/help
     execution is deferred to a future explicit inspection action.

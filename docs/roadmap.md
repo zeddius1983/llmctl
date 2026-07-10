@@ -110,7 +110,7 @@ sources while retaining any legacy `config.yaml` as an ignored backup.
 - [x] Configured vLLM binary discovery without executing the slow entrypoint
 - [ ] Explicit/lazy version and option compatibility inspection
 - [x] Runtime-specific option registries and built-in templates
-- [ ] Local Hugging Face/safetensors discovery and metadata parsing
+- [x] Local Hugging Face/safetensors discovery, metadata parsing, and navigation
 - [ ] Runtime-namespaced catalog profiles with llama.cpp migration
 - [ ] `vllm serve` command construction and session lifecycle
 - [ ] Runtime-aware UI actions, startup diagnostics, and real-GPU acceptance test

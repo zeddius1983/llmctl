@@ -228,6 +228,8 @@ pub struct App {
     should_quit: bool,
     /// Discovered GGUF models for the llama.cpp runtime.
     scanned_models: Vec<Model>,
+    /// Discovered local Hugging Face models for vLLM.
+    vllm_models: Vec<Model>,
     catalog_prefix: Vec<String>,
     catalog_history: Vec<(Vec<Model>, Option<usize>, Vec<String>)>,
     /// Expanded, absolute model search directories.
@@ -252,6 +254,8 @@ impl App {
         let model_sources = resolve_model_sources(&config.models.paths, &config.models.sources);
         let model_cache = paths.cache_dir.join("models.json");
         let mut scanned_models = discovery::scan_models(&model_sources, &model_cache);
+        let vllm_models =
+            discovery::scan_vllm_models(&model_sources, &paths.cache_dir.join("vllm-models.json"));
         discovery::reconcile(&paths.models_dir, &mut scanned_models);
         let store = ProfileStore::load(paths.state_dir.join("profiles.json"), &scanned_models);
         // Built after discovery's one-shot `Command`s: the supervisor ignores
@@ -279,6 +283,7 @@ impl App {
             log_scroll: 0,
             should_quit: false,
             scanned_models,
+            vllm_models,
             catalog_prefix: Vec::new(),
             catalog_history: Vec::new(),
             model_sources,
@@ -536,7 +541,7 @@ impl App {
     }
 
     fn catalog_route(&self, path: &[String]) -> Option<CatalogRoute> {
-        let mut items = self.catalog_children(&[]);
+        let mut items = Self::catalog_children_from(&self.scanned_models, &[]);
         let mut prefix = Vec::new();
         let mut history = Vec::new();
         for (depth, component) in path.iter().enumerate() {
@@ -549,7 +554,7 @@ impl App {
                 }
                 history.push((items.clone(), Some(selected), prefix.clone()));
                 prefix = node.catalog_path.clone();
-                items = self.catalog_children(&prefix);
+                items = Self::catalog_children_from(&self.scanned_models, &prefix);
             } else if last {
                 return Some(CatalogRoute { items, selected, prefix, history });
             } else {
@@ -1249,9 +1254,17 @@ impl App {
     }
 
     fn catalog_children(&self, prefix: &[String]) -> Vec<Model> {
+        let models = match self.runtimes.selected().map(|runtime| runtime.id) {
+            Some(RuntimeId::Vllm) => &self.vllm_models,
+            _ => &self.scanned_models,
+        };
+        Self::catalog_children_from(models, prefix)
+    }
+
+    fn catalog_children_from(models: &[Model], prefix: &[String]) -> Vec<Model> {
         use std::collections::BTreeMap;
         let mut children: BTreeMap<String, Model> = BTreeMap::new();
-        for model in &self.scanned_models {
+        for model in models {
             if !model.catalog_path.starts_with(prefix) || model.catalog_path.len() <= prefix.len() {
                 continue;
             }
@@ -1284,6 +1297,10 @@ impl App {
     /// Re-scan configured model directories (the `F5` refresh).
     fn refresh_models(&mut self) {
         self.scanned_models = discovery::scan_models(&self.model_sources, &self.model_cache);
+        self.vllm_models = discovery::scan_vllm_models(
+            &self.model_sources,
+            &self.model_cache.with_file_name("vllm-models.json"),
+        );
         discovery::reconcile(&self.models_dir, &mut self.scanned_models);
         self.store.sync_models(&self.scanned_models);
         self.catalog_history.clear();
@@ -1386,22 +1403,14 @@ impl App {
             self.catalog_history.clear();
             self.catalog_prefix.clear();
             let models = match self.runtimes.selected().map(|rt| rt.id) {
-                // HF/safetensors discovery is the next vLLM slice.
-                Some(RuntimeId::Vllm) => Vec::new(),
-                Some(RuntimeId::LlamaCpp) => self.catalog_children(&[]),
+                Some(RuntimeId::Vllm | RuntimeId::LlamaCpp) => self.catalog_children(&[]),
                 None => Vec::new(),
             };
             self.models.replace(models);
         }
         if level < Pane::Profile.index() {
             self.catalog_preview = match self.models.selected() {
-                Some(m) if m.is_catalog_dir() => {
-                    if self.is_vllm_pending() {
-                        Vec::new()
-                    } else {
-                        self.catalog_children(&m.catalog_path)
-                    }
-                }
+                Some(m) if m.is_catalog_dir() => self.catalog_children(&m.catalog_path),
                 _ => Vec::new(),
             };
             let profiles = match (self.runtimes.selected(), self.selected_model()) {

@@ -9,8 +9,9 @@ GGUF models, tune launch options with live validation, start detached servers,
 and watch them from a built-in session manager.
 
 > **Status:** v0.2.0. Targets **llama.cpp + GGUF on Linux**. vLLM support is in
-> development; its configured binary is detected, while model discovery and
-> launching remain unavailable until the integration is complete.
+> development: configured binaries and local Hugging Face models are detected,
+> while profile persistence and launching remain unavailable until the
+> integration is complete.
 
 ## Features
 

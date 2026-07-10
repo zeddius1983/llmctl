@@ -42,7 +42,7 @@ src/
   config/        Config (first-run config.toml generation) + XDG Paths resolution
   domain/        pure types (RuntimeId, Runtime, Model, Profile, OptionItem), helpers
   discovery/     catalog.rs (source parsing + managed tree), gguf.rs (header parser),
-                 models.rs (scan+cache), runtimes.rs (runtime binary discovery)
+                 models.rs (GGUF), hf.rs (local HF/vLLM), runtimes.rs (binaries)
   profiles/      runtime-specific option registries/templates, per-model YAML store, resolution
   session/       command.rs (builder), supervisor.rs (DetachedSupervisor: setsid/signals),
                  record.rs (session-<id>.json), proc.rs (/proc), health.rs (/health), mod.rs (SessionManager)
