@@ -41,6 +41,9 @@ layout = "directory"
 [runtime.llama_cpp]
 binary = "llama-server"
 
+[runtime.vllm]
+binary = "vllm"
+
 [defaults]
 host = "127.0.0.1"
 port = 8000
@@ -90,6 +93,7 @@ pub enum ModelLayout {
 #[serde(default)]
 pub struct RuntimeConfig {
     pub llama_cpp: LlamaCppConfig,
+    pub vllm: VllmConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -102,6 +106,19 @@ pub struct LlamaCppConfig {
 impl Default for LlamaCppConfig {
     fn default() -> Self {
         Self { binary: "llama-server".to_string() }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct VllmConfig {
+    /// vLLM command name or absolute path. Resolved on `$PATH` if not absolute.
+    pub binary: String,
+}
+
+impl Default for VllmConfig {
+    fn default() -> Self {
+        Self { binary: "vllm".to_string() }
     }
 }
 
@@ -212,6 +229,8 @@ mod tests {
         assert_eq!(config.models.sources[1].layout, ModelLayout::HuggingFace);
         assert_eq!(config.models.sources[2].layout, ModelLayout::LmStudio);
         assert_eq!(config.models.sources[3].path, PathBuf::from("~/models"));
+        assert_eq!(config.runtime.llama_cpp.binary, "llama-server");
+        assert_eq!(config.runtime.vllm.binary, "vllm");
 
         std::fs::remove_dir_all(root).unwrap();
     }

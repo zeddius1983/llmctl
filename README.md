@@ -8,8 +8,9 @@ The goal: **never hand-type a complex `llama-server` command again.** Browse you
 GGUF models, tune launch options with live validation, start detached servers,
 and watch them from a built-in session manager.
 
-> **Status:** v0.2.0. Targets **llama.cpp + GGUF on Linux**. Other runtimes
-> (vLLM, Ollama, …) are navigable stubs / future work.
+> **Status:** v0.2.0. Targets **llama.cpp + GGUF on Linux**. vLLM support is in
+> development; its configured binary is detected, while model discovery and
+> launching remain unavailable until the integration is complete.
 
 ## Features
 
@@ -139,6 +140,9 @@ layout = "directory" # auto, directory, flat, lm-studio, or hugging-face
 [runtime.llama_cpp]
 # Binary name (resolved on $PATH) or an absolute path.
 binary = "llama-server"
+
+[runtime.vllm]
+binary = "vllm"
 
 [defaults]
 host = "127.0.0.1"

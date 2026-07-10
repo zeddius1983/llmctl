@@ -14,6 +14,7 @@ Living status of the build. Update this when phases complete or scope shifts
 | 4 | Log search & startup-failure classification | ◻ Post-v0.1.0 |
 | 5 | Search/filter & polish | ◻ Post-v0.1.0 |
 | 6 | Source-aware model catalog | ✅ Done |
+| 7 | vLLM runtime support | ◐ In progress |
 
 **v0.1.0 released** — Phases 0–3 (the MVP), plus extra launch options
 (`--no-mmap`, `--cache-type-k`/`-v`, speculative decoding) and a README, were
@@ -104,6 +105,20 @@ sources while retaining any legacy `config.yaml` as an ignored backup.
 
 ## Next (post-v0.2.0)
 
+### Phase 7 — vLLM runtime support
+- [x] Stable `RuntimeId` dispatch (no display-name comparisons)
+- [x] Configured vLLM binary discovery without executing the slow entrypoint
+- [ ] Explicit/lazy version and option compatibility inspection
+- [x] Runtime-specific option registries and built-in templates
+- [ ] Local Hugging Face/safetensors discovery and metadata parsing
+- [ ] Runtime-namespaced catalog profiles with llama.cpp migration
+- [ ] `vllm serve` command construction and session lifecycle
+- [ ] Runtime-aware UI actions, startup diagnostics, and real-GPU acceptance test
+
+The first vLLM release is local-first: it discovers cached Hugging Face models
+and explicit local directories. Remote Hub IDs/downloads are a follow-up so the
+initial lifecycle remains deterministic and offline-capable.
+
 ### Phase 4 — Log search & startup-failure classification
 - [ ] Log view search / filtering (`L` already tails + scrolls)
 - [ ] Startup-failure classification (port in use, model missing, OOM, GPU/Vulkan/
@@ -121,8 +136,7 @@ sources while retaining any legacy `config.yaml` as an ignored backup.
 
 ## Deferred / out of MVP scope
 
-- Additional runtimes (vLLM, Ollama, LM Studio, SGLang, ExLlamaV2) — currently
-  vLLM is a navigation-only stub.
+- Additional runtimes after vLLM (Ollama, LM Studio, SGLang, ExLlamaV2).
 - macOS / Windows support.
 - Supervisor daemon / auto-restart-on-crash (see ADR-005).
 - Chat mode (server mode only for now).

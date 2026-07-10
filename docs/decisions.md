@@ -219,3 +219,27 @@ descriptors, catalog reconciliation, collision-safe path normalization, legacy
 profile migration, and variable-depth browser state. The catalog contains
 absolute source paths and is therefore local machine state despite residing in
 the XDG configuration directory.
+
+---
+
+## ADR-010: Typed runtimes and local-first vLLM support
+
+**Status:** Accepted
+
+**Context:** The vLLM navigation stub depended on display-name comparisons and
+shared llama.cpp's option-registry assumptions. Real vLLM models are normally
+Hugging Face repositories/directories, and `vllm serve` has a distinct command
+shape and option vocabulary. Supporting remote Hub identifiers immediately
+would also add downloads, authentication, and incomplete-network-state handling.
+
+**Decision:** Give every backend a stable `RuntimeId` and dispatch static option
+registries and built-in templates by that ID. Implement vLLM local-first:
+configured binary discovery plus locally cached Hugging Face/safetensors models,
+followed by runtime-aware catalog persistence, commands, and sessions. Keep the
+synchronous event loop and detached supervisor architecture. Remote Hub model
+IDs/downloads are deferred.
+
+**Consequences:** UI labels can change without breaking dispatch or persistence,
+and llama.cpp/vLLM options cannot bleed into one another. The next slices must
+generalize file-only catalog artifacts and runtime-namespace profile YAML while
+migrating existing llama.cpp profiles without data loss.
