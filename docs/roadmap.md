@@ -13,6 +13,7 @@ Living status of the build. Update this when phases complete or scope shifts
 | 3 | Launch & sessions (MVP milestone) | ✅ Done |
 | 4 | Log search & startup-failure classification | ◻ Post-v0.1.0 |
 | 5 | Search/filter & polish | ◻ Post-v0.1.0 |
+| 6 | Source-aware model catalog | ✅ Done |
 
 **v0.1.0 released** — Phases 0–3 (the MVP), plus extra launch options
 (`--no-mmap`, `--cache-type-k`/`-v`, speculative decoding) and a README, were
@@ -85,6 +86,16 @@ instead of cycling. Bugfix: the base snapshot that seeds a profile instance on
 first edit/favorite/create is now model-aware, so materializing no longer reset
 unedited options (ctx-size silently fell from the ctx/8 default back to the
 global 4096).
+
+### Phase 6 — Source-aware model catalog
+Managed `~/.config/llmctl/models` tree with ownership manifests and model
+symlinks; LM Studio and Hugging Face parsing plus arbitrary configured-source
+fallbacks; variable-depth Miller navigation; per-model YAML profiles with
+legacy JSON migration and write-failure fallback; incremental global model
+search with atomic jump-to-result. Prefix collisions, Hugging Face snapshot
+selection, and catalog/profile write amplification are covered by regression
+tests. First run creates an editable `config.toml` with the four standard model
+sources while retaining any legacy `config.yaml` as an ignored backup.
 
 ## Next (post-v0.1.0)
 

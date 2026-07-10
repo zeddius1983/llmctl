@@ -16,7 +16,8 @@ command again. The MVP targets **llama.cpp + GGUF on Linux**; other runtimes
 
 - **Rust** (edition 2024) — single static binary, fast startup.
 - **ratatui** + **crossterm** — TUI rendering and terminal/input handling.
-- **serde** / **serde_json** / **toml** — config and cache/state persistence.
+- **serde** / **serde_json** / **serde_yaml** / **toml** — config, catalog,
+  cache, and profile persistence.
 - **directories** — XDG base directories.
 - **walkdir** + **regex** — model discovery.
 - **anyhow** / **thiserror** — errors. **tracing** — file-based logging.
@@ -27,7 +28,8 @@ command again. The MVP targets **llama.cpp + GGUF on Linux**; other runtimes
 ## Architecture (summary)
 
 Yazi-style sliding three-column view (Parent | Current | Preview) over the
-hierarchy `root ▸ Runtime ▸ Model ▸ Profile ▸ Options`. Child lists are derived
+hierarchy `root ▸ Runtime ▸ source ▸ provider/repository ▸ Model ▸ Profile ▸ Options`.
+The catalog portion has variable depth. Child lists are derived
 from the parent selection. See [docs/architecture.md](docs/architecture.md) for
 component structure and data flow.
 
@@ -37,10 +39,11 @@ component structure and data flow.
 src/
   main.rs        entry: XDG paths, file tracing, launch TUI
   app/           App state, event loop, navigation, prompts, actions
-  config/        Config (config.toml) + XDG Paths resolution
+  config/        Config (first-run config.toml generation) + XDG Paths resolution
   domain/        pure types (Runtime, Model, Profile, OptionItem), helpers, vLLM stubs
-  discovery/     gguf.rs (header parser), models.rs (scan+cache), runtimes.rs (llama.cpp)
-  profiles/      registry.rs (option specs), templates.rs, store.rs (persistence), mod.rs (resolution)
+  discovery/     catalog.rs (source parsing + managed tree), gguf.rs (header parser),
+                 models.rs (scan+cache), runtimes.rs (llama.cpp)
+  profiles/      registry.rs (option specs), templates.rs, store.rs (per-model YAML), mod.rs (resolution)
   session/       command.rs (builder), supervisor.rs (DetachedSupervisor: setsid/signals),
                  record.rs (session-<id>.json), proc.rs (/proc), health.rs (/health), mod.rs (SessionManager)
   ui/            ratatui rendering (browser columns, Session Manager, log view, footer, prompts, help)
@@ -48,8 +51,9 @@ docs/            requirements, architecture, decisions (ADRs), roadmap
 ```
 
 XDG paths used at runtime:
-`~/.config/llmctl/config.toml`, `~/.local/state/llmctl/` (profiles.json, logs,
-sessions), `~/.cache/llmctl/` (models.json, llama-server.help.txt).
+`~/.config/llmctl/config.toml`, `~/.config/llmctl/models/` (managed model
+catalog + per-model YAML profiles), `~/.local/state/llmctl/` (logs, sessions,
+legacy profile migration), `~/.cache/llmctl/` (models.json, llama-server.help.txt).
 
 ## Key design decisions (see decisions.md for full ADRs)
 
@@ -62,6 +66,7 @@ sessions), `~/.cache/llmctl/` (models.json, llama-server.help.txt).
   `SessionSupervisor` trait — ADR-005 (implemented in Phase 3).
 - Synchronous poll-tick refresh + `libc` for process control, not tokio/nix —
   ADR-007.
+- Source-aware physical model catalog with per-model profiles — ADR-009.
 
 ## Coding standards
 

@@ -12,8 +12,9 @@ use ratatui::widgets::ListState;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::config::{Config, Paths};
+use crate::config::{Config, ModelLayout, ModelSourceConfig, Paths};
 use crate::discovery;
+use crate::discovery::ModelSource;
 use crate::domain::{Model, OptionItem, Profile, Runtime, format_unix_date, human_size, stubs};
 use crate::profiles::{self, ProfileStore, store};
 use crate::session::{self, LaunchRequest, SessionManager};
@@ -59,6 +60,19 @@ pub struct Selector {
     pub filter: String,
     /// Cursor index into [`Self::filtered`].
     pub cursor: usize,
+}
+
+pub struct ModelSearch {
+    pub query: String,
+    pub cursor: usize,
+    result_indices: Vec<usize>,
+}
+
+struct CatalogRoute {
+    items: Vec<Model>,
+    selected: usize,
+    prefix: Vec<String>,
+    history: Vec<(Vec<Model>, Option<usize>, Vec<String>)>,
 }
 
 impl Selector {
@@ -188,12 +202,15 @@ pub struct App {
     pub focus: Pane,
     pub runtimes: PaneList<Runtime>,
     pub models: PaneList<Model>,
+    /// Child nodes of the selected catalog directory (empty for a model leaf).
+    pub catalog_preview: Vec<Model>,
     pub profiles: PaneList<Profile>,
     pub options: PaneList<OptionItem>,
     pub show_help: bool,
     pub prompt: Option<Prompt>,
     /// A modal enum-variant selector (combo box), if open.
     pub selector: Option<Selector>,
+    pub model_search: Option<ModelSearch>,
     /// A read-only modal message overlay, if any.
     pub message: Option<Message>,
     /// Which top-level screen is active.
@@ -211,9 +228,12 @@ pub struct App {
     should_quit: bool,
     /// Discovered GGUF models for the llama.cpp runtime.
     scanned_models: Vec<Model>,
+    catalog_prefix: Vec<String>,
+    catalog_history: Vec<(Vec<Model>, Option<usize>, Vec<String>)>,
     /// Expanded, absolute model search directories.
-    model_paths: Vec<PathBuf>,
+    model_sources: Vec<ModelSource>,
     model_cache: PathBuf,
+    models_dir: PathBuf,
     /// Persisted, model-scoped profile instances.
     store: ProfileStore,
     /// Last time live session status was refreshed.
@@ -227,10 +247,11 @@ impl App {
     pub fn new(config: Config, paths: Paths) -> Self {
         // Discover the real llama.cpp runtime; keep vLLM as a demo stub.
         let llama = discovery::discover_llama_cpp(&config.runtime.llama_cpp, &paths.cache_dir);
-        let model_paths = expand_model_paths(&config.models.paths);
+        let model_sources = resolve_model_sources(&config.models.paths, &config.models.sources);
         let model_cache = paths.cache_dir.join("models.json");
-        let scanned_models = discovery::scan_models(&model_paths, &model_cache);
-        let store = ProfileStore::load(paths.state_dir.join("profiles.json"));
+        let mut scanned_models = discovery::scan_models(&model_sources, &model_cache);
+        discovery::reconcile(&paths.models_dir, &mut scanned_models);
+        let store = ProfileStore::load(paths.state_dir.join("profiles.json"), &scanned_models);
         // Built after discovery's one-shot `Command`s: the supervisor ignores
         // SIGCHLD, which would otherwise prevent reaping those probe processes.
         let sessions = SessionManager::new(paths.sessions_dir.clone(), paths.log_dir.clone());
@@ -240,11 +261,13 @@ impl App {
             focus: Pane::Runtime,
             runtimes: PaneList::new(vec![llama, stubs::vllm_runtime()]),
             models: PaneList::new(Vec::new()),
+            catalog_preview: Vec::new(),
             profiles: PaneList::new(Vec::new()),
             options: PaneList::new(Vec::new()),
             show_help: false,
             prompt: None,
             selector: None,
+            model_search: None,
             message: None,
             screen: Screen::Browser,
             sessions,
@@ -254,8 +277,11 @@ impl App {
             log_scroll: 0,
             should_quit: false,
             scanned_models,
-            model_paths,
+            catalog_prefix: Vec::new(),
+            catalog_history: Vec::new(),
+            model_sources,
             model_cache,
+            models_dir: paths.models_dir,
             store,
             last_tick: Instant::now(),
             pending_chat: None,
@@ -317,6 +343,10 @@ impl App {
             self.selector_key(key);
             return;
         }
+        if self.model_search.is_some() {
+            self.model_search_key(key);
+            return;
+        }
         // Help overlay swallows input apart from its own dismissal keys.
         if self.show_help {
             match key.code {
@@ -338,6 +368,13 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('/') => {
+                self.model_search = Some(ModelSearch {
+                    query: String::new(),
+                    cursor: 0,
+                    result_indices: self.ranked_model_indices(""),
+                })
+            }
             KeyCode::Char('t') => self.open_sessions(),
             KeyCode::Char('y') => self.yank_command(),
             KeyCode::Char('s') => self.start_session(),
@@ -347,7 +384,7 @@ impl App {
             // selected value instead; `l`/Right stay pure navigation.
             KeyCode::Enter if self.focus == Pane::Options => self.open_editor(),
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => self.enter(),
-            KeyCode::Char('h') | KeyCode::Left => self.focus = self.focus.prev(),
+            KeyCode::Char('h') | KeyCode::Left => self.go_back(),
 
             // Move selection within the focused pane.
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
@@ -383,6 +420,140 @@ impl App {
 
             _ => {}
         }
+    }
+
+    fn model_search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.model_search = None,
+            KeyCode::Enter => {
+                let target = self
+                    .model_search
+                    .as_ref()
+                    .and_then(|s| s.result_indices.get(s.cursor))
+                    .and_then(|i| self.scanned_models.get(*i))
+                    .map(|m| m.id.clone());
+                self.model_search = None;
+                if let Some(id) = target {
+                    self.jump_to_model(&id);
+                }
+            }
+            KeyCode::Up => {
+                if let Some(search) = self.model_search.as_mut() {
+                    search.cursor = search.cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(search) = self.model_search.as_mut() {
+                    let max = search.result_indices.len().saturating_sub(1);
+                    search.cursor = (search.cursor + 1).min(max);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(search) = self.model_search.as_mut() {
+                    search.query.pop();
+                    search.cursor = 0;
+                }
+                self.refresh_model_search();
+            }
+            KeyCode::Char(c) => {
+                if let Some(search) = self.model_search.as_mut() {
+                    search.query.push(c);
+                    search.cursor = 0;
+                }
+                self.refresh_model_search();
+            }
+            _ => {}
+        }
+    }
+
+    pub fn search_results(&self) -> Vec<&Model> {
+        let Some(search) = &self.model_search else { return Vec::new() };
+        search.result_indices.iter().filter_map(|i| self.scanned_models.get(*i)).collect()
+    }
+
+    fn refresh_model_search(&mut self) {
+        let Some(query) = self.model_search.as_ref().map(|s| s.query.clone()) else { return };
+        let results = self.ranked_model_indices(&query);
+        if let Some(search) = self.model_search.as_mut() {
+            search.result_indices = results;
+            search.cursor = search.cursor.min(search.result_indices.len().saturating_sub(1));
+        }
+    }
+
+    fn ranked_model_indices(&self, raw_query: &str) -> Vec<usize> {
+        let query = raw_query.to_lowercase();
+        let tokens: Vec<&str> = query.split_whitespace().collect();
+        let mut matches: Vec<(i32, usize)> = self
+            .scanned_models
+            .iter()
+            .enumerate()
+            .filter_map(|(index, m)| {
+                let artifact = m.name.to_lowercase();
+                let path = m.catalog_path.join(" ").to_lowercase();
+                if !tokens.iter().all(|t| artifact.contains(t) || path.contains(t)) {
+                    return None;
+                }
+                let mut score = 0;
+                if artifact == query || artifact.trim_end_matches(".gguf") == query {
+                    score += 1000;
+                } else if artifact.starts_with(&query) {
+                    score += 500;
+                }
+                score += tokens.iter().filter(|t| artifact.contains(**t)).count() as i32 * 100;
+                Some((score, index))
+            })
+            .collect();
+        matches.sort_by(|(sa, a), (sb, b)| {
+            sb.cmp(sa).then_with(|| {
+                self.scanned_models[*a].catalog_path.cmp(&self.scanned_models[*b].catalog_path)
+            })
+        });
+        matches.into_iter().map(|(_, index)| index).collect()
+    }
+
+    fn jump_to_model(&mut self, id: &str) {
+        let Some(path) =
+            self.scanned_models.iter().find(|m| m.id == id).map(|m| m.catalog_path.clone())
+        else {
+            return;
+        };
+        let Some(route) = self.catalog_route(&path) else { return };
+        let Some(runtime) = self.runtimes.items.iter().position(|rt| rt.name == "llama.cpp") else {
+            return;
+        };
+
+        // Commit only after the complete route and compatible runtime exist.
+        self.runtimes.state.select(Some(runtime));
+        self.focus = Pane::Model;
+        self.catalog_prefix = route.prefix;
+        self.catalog_history = route.history;
+        self.models.items = route.items;
+        self.models.state.select(Some(route.selected));
+        self.rebuild_below(Pane::Model);
+    }
+
+    fn catalog_route(&self, path: &[String]) -> Option<CatalogRoute> {
+        let mut items = self.catalog_children(&[]);
+        let mut prefix = Vec::new();
+        let mut history = Vec::new();
+        for (depth, component) in path.iter().enumerate() {
+            let selected = items.iter().position(|m| m.display_label() == component)?;
+            let node = &items[selected];
+            let last = depth + 1 == path.len();
+            if node.is_catalog_dir() {
+                if last {
+                    return None;
+                }
+                history.push((items.clone(), Some(selected), prefix.clone()));
+                prefix = node.catalog_path.clone();
+                items = self.catalog_children(&prefix);
+            } else if last {
+                return Some(CatalogRoute { items, selected, prefix, history });
+            } else {
+                return None;
+            }
+        }
+        None
     }
 
     /// Key handling for the Session Manager screen.
@@ -487,7 +658,7 @@ impl App {
             return Err("vLLM is a navigation-only stub (not launchable)".into());
         }
         let rt = self.runtimes.selected().ok_or("no runtime selected")?;
-        let model = self.models.selected().ok_or("no model selected")?;
+        let model = self.selected_model().ok_or("no model selected")?;
         let profile = self.profiles.selected().ok_or("no profile selected")?;
         let binary = rt
             .binary_path
@@ -820,7 +991,7 @@ impl App {
             return;
         };
         // Use the model-aware kind so ctx-size respects the model's max context.
-        let kind = match self.models.selected() {
+        let kind = match self.selected_model() {
             Some(m) => profiles::effective_kind(spec, m),
             None => spec.kind,
         };
@@ -861,7 +1032,7 @@ impl App {
             self.apply_option_value(key, profiles::registry::DEFAULT.to_string());
             return Ok(());
         }
-        let kind = match self.models.selected() {
+        let kind = match self.selected_model() {
             Some(m) => profiles::effective_kind(spec, m),
             None => spec.kind,
         };
@@ -874,7 +1045,7 @@ impl App {
     /// refresh the Options pane while preserving the cursor position.
     fn apply_option_value(&mut self, key: &str, value: String) {
         let (Some(rt), Some(m), Some(p)) =
-            (self.runtimes.selected(), self.models.selected(), self.profiles.selected())
+            (self.runtimes.selected(), self.selected_model(), self.profiles.selected())
         else {
             return;
         };
@@ -895,7 +1066,7 @@ impl App {
             return;
         }
         let (Some(rt), Some(m), Some(p)) =
-            (self.runtimes.selected(), self.models.selected(), self.profiles.selected())
+            (self.runtimes.selected(), self.selected_model(), self.profiles.selected())
         else {
             return;
         };
@@ -965,7 +1136,7 @@ impl App {
             return;
         }
         let (Some(rt), Some(m), Some(p)) =
-            (self.runtimes.selected(), self.models.selected(), self.profiles.selected())
+            (self.runtimes.selected(), self.selected_model(), self.profiles.selected())
         else {
             return;
         };
@@ -986,7 +1157,7 @@ impl App {
     fn commit_new_profile(&mut self, name: &str) -> Result<(), String> {
         self.validate_new_name(name)?;
         let (runtime, model) = self.current_runtime_model().ok_or("no model selected")?;
-        let m = self.models.selected().ok_or("no model selected")?;
+        let m = self.selected_model().ok_or("no model selected")?;
         // Seed from the Default template's resolved values for this model.
         let default = Profile { name: "Default".into(), builtin: true, favorite: false };
         let values = profiles::resolved_values(&default, m, &self.config.defaults);
@@ -1008,7 +1179,7 @@ impl App {
 
     fn commit_duplicate_profile(&mut self, src: &str, name: &str) -> Result<(), String> {
         self.validate_new_name(name)?;
-        let (Some(rt), Some(m)) = (self.runtimes.selected(), self.models.selected()) else {
+        let (Some(rt), Some(m)) = (self.runtimes.selected(), self.selected_model()) else {
             return Err("no model selected".into());
         };
         let runtime = rt.name.clone();
@@ -1038,7 +1209,7 @@ impl App {
 
     fn current_runtime_model(&self) -> Option<(String, String)> {
         let rt = self.runtimes.selected()?;
-        let m = self.models.selected()?;
+        let m = self.selected_model()?;
         Some((rt.name.clone(), store::model_key(&m.path)))
     }
 
@@ -1059,17 +1230,96 @@ impl App {
         self.runtimes.selected().map(|r| r.name == "vLLM").unwrap_or(true)
     }
 
+    /// The selected catalog leaf. Directory nodes intentionally have no path.
+    pub fn selected_model(&self) -> Option<&Model> {
+        self.models.selected().filter(|m| m.is_model())
+    }
+
+    pub fn catalog_parent(&self) -> Option<(&[Model], Option<usize>)> {
+        self.catalog_history.last().map(|(items, selected, _)| (items.as_slice(), *selected))
+    }
+
+    fn catalog_children(&self, prefix: &[String]) -> Vec<Model> {
+        use std::collections::BTreeMap;
+        let mut children: BTreeMap<String, Model> = BTreeMap::new();
+        for model in &self.scanned_models {
+            if !model.catalog_path.starts_with(prefix) || model.catalog_path.len() <= prefix.len() {
+                continue;
+            }
+            let name = model.catalog_path[prefix.len()].clone();
+            let is_leaf = model.catalog_path.len() == prefix.len() + 1;
+            children.entry(name.clone()).or_insert_with(|| {
+                if is_leaf {
+                    model.clone()
+                } else {
+                    Model {
+                        id: String::new(),
+                        name,
+                        path: PathBuf::new(),
+                        shard_paths: Vec::new(),
+                        catalog_path: model.catalog_path[..=prefix.len()].to_vec(),
+                        catalog_dir: PathBuf::new(),
+                        size_bytes: 0,
+                        quantization: None,
+                        architecture: None,
+                        context_length: None,
+                        modified: None,
+                        has_chat_template: false,
+                    }
+                }
+            });
+        }
+        children.into_values().collect()
+    }
+
     /// Re-scan configured model directories (the `F5` refresh).
     fn refresh_models(&mut self) {
-        self.scanned_models = discovery::scan_models(&self.model_paths, &self.model_cache);
+        self.scanned_models = discovery::scan_models(&self.model_sources, &self.model_cache);
+        discovery::reconcile(&self.models_dir, &mut self.scanned_models);
+        self.store.sync_models(&self.scanned_models);
+        self.catalog_history.clear();
+        self.catalog_prefix.clear();
         // Models or anything downstream may have changed; rebuild from runtime.
         self.rebuild_below(Pane::Runtime);
     }
 
     /// Drill into the preview pane, but only if it actually has items.
     fn enter(&mut self) {
-        if self.focus != Pane::Options && !self.preview_is_empty() {
+        if self.focus == Pane::Model {
+            let Some(selected) = self.models.selected() else { return };
+            if selected.is_catalog_dir() {
+                if self.catalog_preview.is_empty() {
+                    return;
+                }
+                let previous = (
+                    self.models.items.clone(),
+                    self.models.state.selected(),
+                    self.catalog_prefix.clone(),
+                );
+                self.catalog_history.push(previous);
+                self.catalog_prefix = selected.catalog_path.clone();
+                self.models.replace(self.catalog_preview.clone());
+                self.rebuild_below(Pane::Model);
+            } else if !self.profiles.is_empty() {
+                self.focus = Pane::Profile;
+            }
+        } else if self.focus != Pane::Options && !self.preview_is_empty() {
             self.focus = self.focus.next();
+        }
+    }
+
+    fn go_back(&mut self) {
+        if self.focus == Pane::Model {
+            if let Some((items, selected, prefix)) = self.catalog_history.pop() {
+                self.catalog_prefix = prefix;
+                self.models.items = items;
+                self.models.state.select(selected);
+                self.rebuild_below(Pane::Model);
+            } else {
+                self.focus = Pane::Runtime;
+            }
+        } else {
+            self.focus = self.focus.prev();
         }
     }
 
@@ -1077,7 +1327,13 @@ impl App {
     fn preview_is_empty(&self) -> bool {
         match self.focus {
             Pane::Runtime => self.models.is_empty(),
-            Pane::Model => self.profiles.is_empty(),
+            Pane::Model => {
+                if self.selected_model().is_some() {
+                    self.profiles.is_empty()
+                } else {
+                    self.catalog_preview.is_empty()
+                }
+            }
             Pane::Profile => self.options.is_empty(),
             Pane::Options => true,
         }
@@ -1118,16 +1374,28 @@ impl App {
     fn rebuild_below(&mut self, changed: Pane) {
         let level = changed.index();
         if level < Pane::Model.index() {
+            self.catalog_history.clear();
+            self.catalog_prefix.clear();
             let models = match self.runtimes.selected() {
                 // vLLM is a stub; llama.cpp uses the discovered GGUF models.
                 Some(rt) if rt.name == "vLLM" => stubs::vllm_models(),
-                Some(_) => self.scanned_models.clone(),
+                Some(_) => self.catalog_children(&[]),
                 None => Vec::new(),
             };
             self.models.replace(models);
         }
         if level < Pane::Profile.index() {
-            let profiles = match (self.runtimes.selected(), self.models.selected()) {
+            self.catalog_preview = match self.models.selected() {
+                Some(m) if m.is_catalog_dir() => {
+                    if self.is_stub_runtime() {
+                        Vec::new()
+                    } else {
+                        self.catalog_children(&m.catalog_path)
+                    }
+                }
+                _ => Vec::new(),
+            };
+            let profiles = match (self.runtimes.selected(), self.selected_model()) {
                 (Some(rt), Some(m)) if rt.name == "vLLM" => stubs::profiles_for(m),
                 (Some(rt), Some(m)) => profiles::list_profiles(rt, m, &self.store),
                 _ => Vec::new(),
@@ -1135,17 +1403,14 @@ impl App {
             self.profiles.replace(profiles);
         }
         if level < Pane::Options.index() {
-            let options = match (
-                self.runtimes.selected(),
-                self.models.selected(),
-                self.profiles.selected(),
-            ) {
-                (Some(rt), _, Some(p)) if rt.name == "vLLM" => stubs::options_for(p),
-                (Some(rt), Some(m), Some(p)) => {
-                    profiles::resolve_options(rt, m, p, &self.store, &self.config.defaults)
-                }
-                _ => Vec::new(),
-            };
+            let options =
+                match (self.runtimes.selected(), self.selected_model(), self.profiles.selected()) {
+                    (Some(rt), _, Some(p)) if rt.name == "vLLM" => stubs::options_for(p),
+                    (Some(rt), Some(m), Some(p)) => {
+                        profiles::resolve_options(rt, m, p, &self.store, &self.config.defaults)
+                    }
+                    _ => Vec::new(),
+                };
             self.options.replace(options);
         }
     }
@@ -1168,6 +1433,9 @@ impl App {
                 (primary, meta.join(" · "))
             }),
             Pane::Model => self.models.selected().map(|m| {
+                if m.is_catalog_dir() {
+                    return (m.catalog_path.join(" / "), "catalog directory".into());
+                }
                 let primary = m.path.display().to_string();
                 let mut meta = vec![human_size(m.size_bytes)];
                 if let Some(q) = &m.quantization {
@@ -1207,8 +1475,11 @@ impl App {
             crumbs.push(r.name.clone());
         }
         if self.focus >= Pane::Model {
-            if let Some(m) = self.models.selected() {
-                crumbs.push(m.name.clone());
+            crumbs.extend(self.catalog_prefix.iter().cloned());
+            if let Some(m) = self.models.selected()
+                && let Some(name) = m.catalog_path.last()
+            {
+                crumbs.push(name.clone());
             }
         }
         if self.focus >= Pane::Profile {
@@ -1230,52 +1501,73 @@ impl App {
 /// When `config.models.paths` is set we honor it (expanding `~`); otherwise we
 /// fall back to the well-known runtime model locations. We never scan `$HOME`
 /// itself, only specific subdirectories (per the requirements).
-fn expand_model_paths(configured: &[PathBuf]) -> Vec<PathBuf> {
+fn resolve_model_sources(configured: &[PathBuf], named: &[ModelSourceConfig]) -> Vec<ModelSource> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let mut paths: Vec<PathBuf> = if configured.is_empty() {
-        default_model_dirs(home.as_deref())
+    let expand = |p: &PathBuf| match (p.strip_prefix("~"), &home) {
+        (Ok(rest), Some(home)) => home.join(rest),
+        _ => p.clone(),
+    };
+    let mut sources: Vec<ModelSource> = if configured.is_empty() && named.is_empty() {
+        default_model_sources(home.as_deref())
     } else {
         configured
             .iter()
-            .map(|p| match (p.strip_prefix("~"), &home) {
-                (Ok(rest), Some(home)) => home.join(rest),
-                _ => p.clone(),
+            .enumerate()
+            .map(|(i, p)| {
+                let root = expand(p);
+                let name = root
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| format!("local-{}", i + 1));
+                ModelSource { name, root, layout: ModelLayout::Auto }
             })
             .collect()
     };
+    sources.extend(named.iter().map(|s| ModelSource {
+        name: s.name.clone(),
+        root: expand(&s.path),
+        layout: s.layout,
+    }));
 
-    // De-duplicate (e.g. LLAMA_CACHE may equal ~/.cache/llama.cpp).
-    paths.sort();
-    paths.dedup();
-    paths
+    // De-duplicate roots (e.g. LLAMA_CACHE may equal ~/.cache/llama.cpp).
+    sources.sort_by(|a, b| a.root.cmp(&b.root));
+    sources.dedup_by(|a, b| a.root == b.root);
+    sources
 }
 
 /// Well-known directories where local runtimes keep models, including
 /// env-var-configured caches. Only existing dirs matter; the scanner skips the
 /// rest.
-fn default_model_dirs(home: Option<&std::path::Path>) -> Vec<PathBuf> {
+fn default_model_sources(home: Option<&std::path::Path>) -> Vec<ModelSource> {
     use std::env::var_os;
-    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut dirs: Vec<ModelSource> = Vec::new();
+    let source =
+        |name: &str, root: PathBuf, layout| ModelSource { name: name.into(), root, layout };
 
     // llama.cpp download cache (LLAMA_CACHE overrides the default location).
     if let Some(cache) = var_os("LLAMA_CACHE") {
-        dirs.push(PathBuf::from(cache));
+        dirs.push(source("llama-cache", PathBuf::from(cache), ModelLayout::Directory));
     } else if let Some(home) = home {
-        dirs.push(home.join(".cache/llama.cpp"));
+        dirs.push(source("llama-cache", home.join(".cache/llama.cpp"), ModelLayout::Directory));
     }
 
     // HuggingFace hub cache (used by `llama-server -hf` and others).
     if let Some(hf) = var_os("HUGGINGFACE_HUB_CACHE") {
-        dirs.push(PathBuf::from(hf));
+        dirs.push(source("huggingface", PathBuf::from(hf), ModelLayout::HuggingFace));
     } else if let Some(hf) = var_os("HF_HOME") {
-        dirs.push(PathBuf::from(hf).join("hub"));
+        dirs.push(source("huggingface", PathBuf::from(hf).join("hub"), ModelLayout::HuggingFace));
     } else if let Some(home) = home {
-        dirs.push(home.join(".cache/huggingface/hub"));
+        dirs.push(source(
+            "huggingface",
+            home.join(".cache/huggingface/hub"),
+            ModelLayout::HuggingFace,
+        ));
     }
 
     if let Some(home) = home {
-        dirs.push(home.join(".lmstudio/models")); // LM Studio
-        dirs.push(home.join("models")); // generic convention
+        dirs.push(source("lmstudio", home.join(".lmstudio/models"), ModelLayout::LmStudio));
+        dirs.push(source("models", home.join("models"), ModelLayout::Directory));
     }
 
     dirs

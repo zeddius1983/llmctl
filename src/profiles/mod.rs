@@ -200,8 +200,12 @@ mod tests {
 
     fn model() -> Model {
         Model {
+            id: "test-model".into(),
             name: "x.gguf".into(),
             path: "/tmp/x.gguf".into(),
+            shard_paths: vec!["/tmp/x.gguf".into()],
+            catalog_path: vec!["test-model".into()],
+            catalog_dir: "/tmp/test-model".into(),
             size_bytes: 0,
             quantization: None,
             architecture: None,
@@ -216,7 +220,7 @@ mod tests {
     }
 
     fn empty_store() -> ProfileStore {
-        ProfileStore::load("/nonexistent/llmctl-test-store.json".into())
+        ProfileStore::load("/nonexistent/llmctl-test-store.json".into(), &[])
     }
 
     fn value_of(opts: &[OptionItem], key: &str) -> String {

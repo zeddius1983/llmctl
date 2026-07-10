@@ -14,13 +14,16 @@ and watch them from a built-in session manager.
 ## Features
 
 - **Yazi-style navigation** — a sliding three-column view over the hierarchy
-  `Runtime ▸ Model ▸ Profile ▸ Options`, driven entirely from the keyboard
+  `Runtime ▸ source ▸ provider/repository ▸ Model ▸ Profile ▸ Options`, driven entirely from the keyboard
   (`hjkl`, `g`/`G`, drill in / back out).
 - **Model discovery** — recursively scans your configured directories, or (when
   none are configured) well-known locations (llama.cpp cache, HuggingFace hub,
   LM Studio, `~/models`).
   Reads GGUF headers for architecture, context length, quantization, and embedded
   chat template; dedupes multi-shard models and sums their sizes. `F5` to rescan.
+- **Physical model catalog** — mirrors discovery below
+  `~/.config/llmctl/models` using source-aware folders, safe manifests, model
+  symlinks, and per-model YAML profiles. Press `/` for global model search.
 - **Profiles & options** — built-in, read-only templates (Default, Chat, Coding,
   Long Context, Server) that fork into per-model editable instances on first edit.
   Edit options with live validation, cycle enums/flags in place, and adjust
@@ -88,6 +91,7 @@ overlay.
 | `l` / `→` | Drill into selection |
 | `h` / `←` | Back up a level |
 | `g` / `G` | First / last item |
+| `/` | Search all models and jump to a result |
 | **Profiles** | |
 | `a` | Create profile |
 | `r` | Rename (custom profiles only) |
@@ -122,15 +126,15 @@ Any option left at its default value is omitted from the command line.
 
 ## Configuration
 
-llmctl follows the XDG base-directory spec and runs with **zero configuration** —
-a config file is optional. To customize, create
-`~/.config/llmctl/config.toml`:
+llmctl follows the XDG base-directory spec and runs with **zero setup**. On the
+first run it creates `~/.config/llmctl/config.toml` with the llama.cpp cache,
+Hugging Face, LM Studio, and `~/models` sources. Edit that file to add a source:
 
 ```toml
-# Directories scanned recursively for GGUF models. When set, ONLY these are
-# scanned; leave unset to fall back to the well-known locations listed below.
-[models]
-paths = ["/data/models", "~/work/ggufs"]
+[[models.sources]]
+name = "nas"
+path = "/mnt/nas/llms"
+layout = "directory" # auto, directory, flat, lm-studio, or hugging-face
 
 [runtime.llama_cpp]
 # Binary name (resolved on $PATH) or an absolute path.
@@ -146,15 +150,15 @@ port = 8000
 | Path | Purpose |
 |------|---------|
 | `~/.config/llmctl/config.toml` | Configuration |
-| `~/.local/state/llmctl/` | Profile instances, session records, logs |
+| `~/.config/llmctl/config.yaml` | Ignored legacy configuration; archive after migrating anything useful |
+| `~/.config/llmctl/models/` | Managed source tree, symlinks, and YAML profiles |
+| `~/.local/state/llmctl/` | Session records, logs, and profile migration fallback |
 | `~/.cache/llmctl/` | Model & runtime scan cache |
 
-When `[models].paths` is unset, llmctl falls back to scanning the well-known
-locations: `$LLAMA_CACHE` or `~/.cache/llama.cpp`, the HuggingFace hub cache
-(`$HUGGINGFACE_HUB_CACHE` / `$HF_HOME/hub` / `~/.cache/huggingface/hub`),
-`~/.lmstudio/models`, and `~/models`. Setting `paths` replaces this fallback —
-only the directories you list are scanned. Your `$HOME` is never scanned
-wholesale.
+The generated file explicitly lists the standard locations so they are easy to
+inspect and extend. Older `[models].paths` arrays remain supported, but named
+`[[models.sources]]` entries provide stable catalog names and layout control.
+Your `$HOME` is never scanned wholesale.
 
 ## Roadmap
 

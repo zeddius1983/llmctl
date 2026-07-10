@@ -19,7 +19,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
 
-use crate::app::{App, Message, Pane, Prompt, Screen, Selector};
+use crate::app::{App, Message, ModelSearch, Pane, Prompt, Screen, Selector};
 use crate::domain::human_size;
 use crate::session::{Session, SessionStatus, format_uptime};
 
@@ -68,6 +68,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(selector) = &app.selector {
         render_selector(frame, frame.area(), selector);
     }
+    if let Some(search) = &app.model_search {
+        render_model_search(frame, frame.area(), app, search);
+    }
     if let Some(message) = &app.message {
         render_message(frame, frame.area(), message);
     }
@@ -92,6 +95,7 @@ fn draw_browser(frame: &mut Frame, app: &mut App) {
     // Parent column: the level above the current one (root is virtual).
     match app.focus {
         Pane::Runtime => render_root(frame, parent),
+        Pane::Model if app.catalog_parent().is_some() => render_catalog_parent(frame, parent, app),
         other => render_list(frame, parent, app, other.prev(), Role::Parent),
     }
 
@@ -101,6 +105,9 @@ fn draw_browser(frame: &mut Frame, app: &mut App) {
     // Preview column: children of the hovered item, or the leaf detail.
     match app.focus {
         Pane::Runtime => render_list(frame, preview, app, Pane::Model, Role::Preview),
+        Pane::Model if app.selected_model().is_none() => {
+            render_catalog_preview(frame, preview, app)
+        }
         Pane::Model => render_list(frame, preview, app, Pane::Profile, Role::Preview),
         Pane::Profile => render_list(frame, preview, app, Pane::Options, Role::Preview),
         Pane::Options => render_option_detail(frame, preview, app),
@@ -124,9 +131,16 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
             .iter()
             .map(|r| ListItem::new(format!("{icon}  {}", r.name)))
             .collect(),
-        Pane::Model => {
-            app.models.items.iter().map(|m| ListItem::new(format!("{icon}  {}", m.name))).collect()
-        }
+        Pane::Model => app
+            .models
+            .items
+            .iter()
+            .map(|m| {
+                let label = m.display_label();
+                let item_icon = if m.is_catalog_dir() { "" } else { icon };
+                ListItem::new(format!("{item_icon}  {label}"))
+            })
+            .collect(),
         Pane::Profile => app
             .profiles
             .items
@@ -178,6 +192,39 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
 
     let list = List::new(items).block(block).highlight_style(highlight).highlight_symbol(symbol);
     frame.render_stateful_widget(list, area, state);
+}
+
+fn render_catalog_parent(frame: &mut Frame, area: Rect, app: &App) {
+    let Some((models, selected)) = app.catalog_parent() else { return };
+    let items: Vec<ListItem> = models
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let label = m.display_label();
+            let marker = if Some(i) == selected { "▸" } else { " " };
+            ListItem::new(format!("{marker}    {label}"))
+        })
+        .collect();
+    frame.render_widget(
+        List::new(items).block(pane_block("Model", false)).style(Style::default().dim()),
+        area,
+    );
+}
+
+fn render_catalog_preview(frame: &mut Frame, area: Rect, app: &App) {
+    let items: Vec<ListItem> = app
+        .catalog_preview
+        .iter()
+        .map(|m| {
+            let label = m.display_label();
+            let icon = if m.is_catalog_dir() { "" } else { level_icon(Pane::Model) };
+            ListItem::new(format!("{icon}  {label}"))
+        })
+        .collect();
+    frame.render_widget(
+        List::new(items).block(pane_block("Model", false)).style(Style::default().dim()),
+        area,
+    );
 }
 
 /// The virtual root shown left of the Runtime column.
@@ -248,9 +295,13 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
     let mut keys: Vec<(&str, &str)> = vec![("j/k", "move")];
     match app.focus {
-        Pane::Runtime => keys.push(("l", "enter")),
+        Pane::Runtime => {
+            keys.push(("l", "enter"));
+            keys.push(("/", "search models"));
+        }
         Pane::Model => {
             keys.push(("h/l", "back/enter"));
+            keys.push(("/", "search models"));
             keys.push(("F5", "rescan"));
         }
         Pane::Profile => {
@@ -509,6 +560,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         help_row("l / →", "drill into selection"),
         help_row("h / ←", "back up a level"),
         help_row("g / G", "first / last item"),
+        help_row("/", "search models"),
         Line::raw(""),
         Line::from("Profiles".bold()),
         help_row("a", "create profile"),
@@ -549,6 +601,42 @@ fn render_help(frame: &mut Frame, area: Rect) {
         .border_style(Style::default().fg(ACCENT))
         .title(" Help ");
 
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+fn render_model_search(frame: &mut Frame, area: Rect, app: &App, search: &ModelSearch) {
+    let results = app.search_results();
+    let visible = results.len().min(12);
+    let popup = center(area, Constraint::Percentage(72), Constraint::Length(visible as u16 + 4));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" Search models ");
+    let mut lines = vec![Line::from(vec![
+        Span::styled("❯ ", Style::default().fg(ACCENT)),
+        Span::raw(search.query.clone()),
+        Span::styled("▏", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+    ])];
+    if results.is_empty() {
+        lines.push(Line::from("  No matching models".dim()));
+    } else {
+        let start = search.cursor.saturating_sub(visible.saturating_sub(1));
+        for (index, model) in results.iter().enumerate().skip(start).take(visible) {
+            let selected = index == search.cursor;
+            let label = model.display_label();
+            let context =
+                model.catalog_path[..model.catalog_path.len().saturating_sub(1)].join(" / ");
+            let line = format!("{} {}  ·  {}", if selected { "▸" } else { " " }, label, context);
+            lines.push(if selected {
+                Line::from(line).fg(Color::Black).bg(ACCENT).bold()
+            } else {
+                Line::from(line)
+            });
+        }
+    }
+    lines.push(Line::from(" Enter jump  ·  Esc close".dim()));
     frame.render_widget(Clear, popup);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
