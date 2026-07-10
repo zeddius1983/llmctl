@@ -295,9 +295,13 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
     let mut keys: Vec<(&str, &str)> = vec![("j/k", "move")];
     match app.focus {
-        Pane::Runtime => keys.push(("l", "enter")),
+        Pane::Runtime => {
+            keys.push(("l", "enter"));
+            keys.push(("/", "search models"));
+        }
         Pane::Model => {
             keys.push(("h/l", "back/enter"));
+            keys.push(("/", "search models"));
             keys.push(("F5", "rescan"));
         }
         Pane::Profile => {
