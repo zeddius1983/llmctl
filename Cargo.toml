@@ -1,6 +1,6 @@
 [package]
 name = "llmctl"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Keyboard-driven TUI for managing local llama.cpp servers"
 license = "MIT"
