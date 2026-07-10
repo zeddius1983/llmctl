@@ -24,6 +24,11 @@ and 5 are deferred to a future release; the roadmap will be revisited then.
 below), tagged `v0.1.1` on `main`. The release workflow now creates the GitHub
 Release itself on tag push and attaches the prebuilt Linux binaries.
 
+**v0.2.0 — source-aware model catalog** — replaces the flat filename list with
+a physical source/provider/repository/artifact tree, moves profiles beside each
+model as YAML, adds global model search, and generates an explicit standard-source
+configuration on first run. See [release notes](release-notes-v0.2.0.md).
+
 Branching: each remaining phase is built on its own `feature/<task>` branch.
 When a batch is ready to ship, the feature branches merge into a release umbrella
 (e.g. **`feature/v0.1.0`**), which then merges to `main` and is tagged. (Early
@@ -97,7 +102,7 @@ selection, and catalog/profile write amplification are covered by regression
 tests. First run creates an editable `config.toml` with the four standard model
 sources while retaining any legacy `config.yaml` as an ignored backup.
 
-## Next (post-v0.1.0)
+## Next (post-v0.2.0)
 
 ### Phase 4 — Log search & startup-failure classification
 - [ ] Log view search / filtering (`L` already tails + scrolls)
