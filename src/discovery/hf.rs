@@ -125,11 +125,12 @@ fn build_model(
         .and_then(Value::as_str)
         .map(|s| s.to_uppercase())
         .or_else(|| config.get("torch_dtype").and_then(Value::as_str).map(str::to_uppercase));
-    let has_chat_template = std::fs::read(model_dir.join("tokenizer_config.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|value| value.get("chat_template").cloned())
-        .is_some_and(|value| !value.is_null());
+    let has_chat_template = model_dir.join("chat_template.jinja").is_file()
+        || std::fs::read(model_dir.join("tokenizer_config.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|value| value.get("chat_template").cloned())
+            .is_some_and(|value| !value.is_null());
 
     Some(Model {
         id: format!("vllm:{}:{}", source.name, catalog::short_hash(model_dir)),

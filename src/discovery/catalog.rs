@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::config::ModelLayout;
-use crate::domain::Model;
+use crate::domain::{Model, RuntimeId};
 
 /// One root scanned for models and the layout used to interpret relative paths.
 #[derive(Debug, Clone)]
@@ -21,6 +21,8 @@ pub struct ModelSource {
 #[derive(Debug, Serialize, Deserialize)]
 struct Manifest {
     schema: u8,
+    #[serde(default = "llama_runtime")]
+    runtime: String,
     id: String,
     source: String,
     artifact: Artifact,
@@ -30,6 +32,10 @@ struct Manifest {
 
 fn available() -> bool {
     true
+}
+
+fn llama_runtime() -> String {
+    "llama.cpp".into()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -147,6 +153,16 @@ pub fn short_hash(path: &Path) -> String {
 
 /// Materialize the managed catalog without modifying source model files.
 pub fn reconcile(root: &Path, models: &mut [Model]) {
+    reconcile_for(root, RuntimeId::LlamaCpp, models);
+}
+
+/// vLLM uses its own physical namespace so a repository directory can be a
+/// model leaf without colliding with GGUF artifacts nested below that same repo.
+pub fn reconcile_vllm(root: &Path, models: &mut [Model]) {
+    reconcile_for(&root.join("vllm"), RuntimeId::Vllm, models);
+}
+
+fn reconcile_for(root: &Path, runtime: RuntimeId, models: &mut [Model]) {
     let mut live = HashSet::new();
     for model in models.iter_mut() {
         let leaf = model.catalog_path.iter().fold(root.to_path_buf(), |p, c| p.join(c));
@@ -156,10 +172,15 @@ pub fn reconcile(root: &Path, models: &mut [Model]) {
             continue;
         }
         model.catalog_dir = leaf.clone();
-        reconcile_link(&leaf.join("model.gguf"), &model.path);
+        let link_name = match runtime {
+            RuntimeId::LlamaCpp => "model.gguf",
+            RuntimeId::Vllm => "model",
+        };
+        reconcile_link(&leaf.join(link_name), &model.path);
 
         let manifest = Manifest {
-            schema: 1,
+            schema: 2,
+            runtime: runtime_name(runtime).into(),
             id: model.id.clone(),
             source: model.catalog_path.first().cloned().unwrap_or_default(),
             artifact: Artifact {
@@ -176,10 +197,17 @@ pub fn reconcile(root: &Path, models: &mut [Model]) {
             Err(err) => warn!(%err, "failed to serialize model manifest"),
         }
     }
-    mark_stale_entries(root, &live);
+    mark_stale_entries(root, runtime, &live);
 }
 
-fn mark_stale_entries(root: &Path, live: &HashSet<PathBuf>) {
+fn runtime_name(runtime: RuntimeId) -> &'static str {
+    match runtime {
+        RuntimeId::LlamaCpp => "llama.cpp",
+        RuntimeId::Vllm => "vLLM",
+    }
+}
+
+fn mark_stale_entries(root: &Path, runtime: RuntimeId, live: &HashSet<PathBuf>) {
     if !root.exists() {
         return;
     }
@@ -193,6 +221,9 @@ fn mark_stale_entries(root: &Path, live: &HashSet<PathBuf>) {
         }
         let Ok(bytes) = fs::read(entry.path()) else { continue };
         let Ok(mut manifest) = serde_yaml::from_slice::<Manifest>(&bytes) else { continue };
+        if manifest.runtime != runtime_name(runtime) {
+            continue;
+        }
         if manifest.available {
             manifest.available = false;
             if let Ok(yaml) = serde_yaml::to_string(&manifest) {
@@ -311,6 +342,40 @@ mod tests {
         let leaf = catalog.join("local/Test");
         assert_eq!(fs::read_link(leaf.join("model.gguf")).unwrap(), source);
         assert!(leaf.join(".llmctl.yml").is_file());
+        assert!(leaf.join("profiles").is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reconciles_vllm_directory_in_runtime_namespace() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("llmctl-vllm-catalog-{nonce}"));
+        let source = root.join("snapshot");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("config.json"), b"{}").unwrap();
+        let mut models = vec![Model {
+            id: "vllm:test".into(),
+            name: "team/model".into(),
+            path: source.clone(),
+            shard_paths: Vec::new(),
+            catalog_path: vec!["huggingface".into(), "team".into(), "model".into()],
+            catalog_dir: PathBuf::new(),
+            size_bytes: 0,
+            quantization: None,
+            architecture: None,
+            context_length: None,
+            modified: None,
+            has_chat_template: false,
+        }];
+
+        let catalog = root.join("catalog");
+        reconcile_vllm(&catalog, &mut models);
+        let leaf = catalog.join("vllm/huggingface/team/model");
+        assert_eq!(models[0].catalog_dir, leaf);
+        assert_eq!(fs::read_link(leaf.join("model")).unwrap(), source);
+        let manifest: Manifest =
+            serde_yaml::from_slice(&fs::read(leaf.join(".llmctl.yml")).unwrap()).unwrap();
+        assert_eq!(manifest.runtime, "vLLM");
         assert!(leaf.join("profiles").is_dir());
         fs::remove_dir_all(root).unwrap();
     }

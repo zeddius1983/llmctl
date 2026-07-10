@@ -254,10 +254,15 @@ impl App {
         let model_sources = resolve_model_sources(&config.models.paths, &config.models.sources);
         let model_cache = paths.cache_dir.join("models.json");
         let mut scanned_models = discovery::scan_models(&model_sources, &model_cache);
-        let vllm_models =
+        let mut vllm_models =
             discovery::scan_vllm_models(&model_sources, &paths.cache_dir.join("vllm-models.json"));
         discovery::reconcile(&paths.models_dir, &mut scanned_models);
-        let store = ProfileStore::load(paths.state_dir.join("profiles.json"), &scanned_models);
+        discovery::reconcile_vllm(&paths.models_dir, &mut vllm_models);
+        let store = ProfileStore::load(
+            paths.state_dir.join("profiles.json"),
+            &scanned_models,
+            &vllm_models,
+        );
         // Built after discovery's one-shot `Command`s: the supervisor ignores
         // SIGCHLD, which would otherwise prevent reaping those probe processes.
         let sessions = SessionManager::new(paths.sessions_dir.clone(), paths.log_dir.clone());
@@ -909,7 +914,7 @@ impl App {
     /// ([`SELECTOR_THRESHOLD`]) open the filterable selector popup; numeric/
     /// string open a text prompt. Applies only to runtimes with model support.
     fn open_editor(&mut self) {
-        if self.focus != Pane::Options || self.is_vllm_pending() {
+        if self.focus != Pane::Options {
             return;
         }
         let Some(option) = self.options.selected() else {
@@ -958,7 +963,7 @@ impl App {
     /// Unlike `Home`, this restores the *resolved* default — the omit token for
     /// omittable options, but e.g. ctx/8 for ctx-size or the config host/port.
     fn reset_option_default(&mut self) {
-        if self.focus != Pane::Options || self.is_vllm_pending() {
+        if self.focus != Pane::Options {
             return;
         }
         let Some(option) = self.options.selected() else {
@@ -989,7 +994,7 @@ impl App {
             &str,
         ) -> Option<String>,
     ) {
-        if self.focus != Pane::Options || self.is_vllm_pending() {
+        if self.focus != Pane::Options {
             return;
         }
         let Some(option) = self.options.selected() else {
@@ -1074,7 +1079,7 @@ impl App {
 
     /// Toggle the favorite flag on the selected profile (real runtimes only).
     fn toggle_favorite(&mut self) {
-        if self.focus != Pane::Profile || self.is_vllm_pending() {
+        if self.focus != Pane::Profile {
             return;
         }
         let (Some(rt), Some(m), Some(p)) =
@@ -1096,7 +1101,7 @@ impl App {
     // --- profile management (Profile pane) ---------------------------------
 
     fn prompt_new_profile(&mut self) {
-        if self.focus != Pane::Profile || self.is_vllm_pending() {
+        if self.focus != Pane::Profile {
             return;
         }
         self.prompt = Some(Prompt {
@@ -1108,7 +1113,7 @@ impl App {
     }
 
     fn prompt_rename_profile(&mut self) {
-        if self.focus != Pane::Profile || self.is_vllm_pending() {
+        if self.focus != Pane::Profile {
             return;
         }
         let Some(p) = self.profiles.selected() else {
@@ -1127,7 +1132,7 @@ impl App {
     }
 
     fn prompt_duplicate_profile(&mut self) {
-        if self.focus != Pane::Profile || self.is_vllm_pending() {
+        if self.focus != Pane::Profile {
             return;
         }
         let Some(p) = self.profiles.selected() else {
@@ -1144,7 +1149,7 @@ impl App {
 
     /// Delete a custom profile, or reset a built-in to its template defaults.
     fn delete_profile(&mut self) {
-        if self.focus != Pane::Profile || self.is_vllm_pending() {
+        if self.focus != Pane::Profile {
             return;
         }
         let (Some(rt), Some(m), Some(p)) =
@@ -1238,8 +1243,7 @@ impl App {
         }
     }
 
-    /// True while the selected runtime has discovery/profile plumbing but not
-    /// yet a launchable model implementation.
+    /// True while the selected runtime is not yet launchable.
     fn is_vllm_pending(&self) -> bool {
         self.runtimes.selected().map(|r| r.id == RuntimeId::Vllm).unwrap_or(true)
     }
@@ -1302,7 +1306,9 @@ impl App {
             &self.model_cache.with_file_name("vllm-models.json"),
         );
         discovery::reconcile(&self.models_dir, &mut self.scanned_models);
-        self.store.sync_models(&self.scanned_models);
+        discovery::reconcile_vllm(&self.models_dir, &mut self.vllm_models);
+        self.store.sync_models(RuntimeId::LlamaCpp, &self.scanned_models);
+        self.store.sync_models(RuntimeId::Vllm, &self.vllm_models);
         self.catalog_history.clear();
         self.catalog_prefix.clear();
         // Models or anything downstream may have changed; rebuild from runtime.

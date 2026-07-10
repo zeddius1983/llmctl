@@ -10,8 +10,8 @@ and watch them from a built-in session manager.
 
 > **Status:** v0.2.0. Targets **llama.cpp + GGUF on Linux**. vLLM support is in
 > development: configured binaries and local Hugging Face models are detected,
-> while profile persistence and launching remain unavailable until the
-> integration is complete.
+> with runtime-isolated profile persistence; launching remains unavailable
+> until the integration is complete.
 
 ## Features
 
@@ -157,6 +157,7 @@ port = 8000
 | `~/.config/llmctl/config.toml` | Configuration |
 | `~/.config/llmctl/config.yaml` | Ignored legacy configuration; archive after migrating anything useful |
 | `~/.config/llmctl/models/` | Managed source tree, symlinks, and YAML profiles |
+| `~/.config/llmctl/models/vllm/` | Managed vLLM model-directory symlinks and profiles |
 | `~/.local/state/llmctl/` | Session records, logs, and profile migration fallback |
 | `~/.cache/llmctl/` | Model & runtime scan cache |
 

@@ -59,15 +59,15 @@ struct ProfileFile {
 pub struct ProfileStore {
     legacy_path: PathBuf,
     instances: BTreeMap<Key, Instance>,
-    /// Absolute source model key -> managed catalog leaf.
-    model_dirs: BTreeMap<String, PathBuf>,
+    /// (runtime, absolute source model key) -> managed catalog leaf.
+    model_dirs: BTreeMap<(String, String), PathBuf>,
     /// Instances that could not be persisted to their per-model YAML file.
     fallback: BTreeSet<Key>,
 }
 
 impl ProfileStore {
     /// Load per-model YAML profiles and import the legacy flat JSON store.
-    pub fn load(legacy_path: PathBuf, models: &[Model]) -> Self {
+    pub fn load(legacy_path: PathBuf, models: &[Model], vllm_models: &[Model]) -> Self {
         let mut instances = match std::fs::read(&legacy_path) {
             Ok(bytes) => serde_json::from_slice::<StoreFile>(&bytes)
                 .map(|f| {
@@ -89,19 +89,30 @@ impl ProfileStore {
             Err(_) => BTreeMap::new(),
         };
         let mut fallback: BTreeSet<Key> = instances.keys().cloned().collect();
-        let model_dirs: BTreeMap<String, PathBuf> = models
-            .iter()
-            .filter(|m| valid_catalog_dir(&m.catalog_dir))
-            .map(|m| (model_key(&m.path), m.catalog_dir.clone()))
-            .collect();
+        let model_dirs: BTreeMap<(String, String), PathBuf> =
+            [(RuntimeId::LlamaCpp, models), (RuntimeId::Vllm, vllm_models)]
+                .into_iter()
+                .flat_map(|(runtime, models)| {
+                    models.iter().filter(|m| valid_catalog_dir(&m.catalog_dir)).map(move |m| {
+                        (
+                            (runtime_name(runtime).to_string(), model_key(&m.path)),
+                            m.catalog_dir.clone(),
+                        )
+                    })
+                })
+                .collect();
 
         // YAML is authoritative when both formats contain the same profile.
-        for model in models {
-            for loaded in load_model_profiles(model, &mut instances) {
-                fallback.remove(&loaded);
-            }
-            for profile in super::templates::names(RuntimeId::LlamaCpp) {
-                instances.entry(key("llama.cpp", &model_key(&model.path), profile)).or_default();
+        for (runtime, models) in [(RuntimeId::LlamaCpp, models), (RuntimeId::Vllm, vllm_models)] {
+            for model in models {
+                for loaded in load_model_profiles(runtime, model, &mut instances) {
+                    fallback.remove(&loaded);
+                }
+                for profile in super::templates::names(runtime) {
+                    instances
+                        .entry(key(runtime_name(runtime), &model_key(&model.path), profile))
+                        .or_default();
+                }
             }
         }
 
@@ -112,18 +123,21 @@ impl ProfileStore {
     }
 
     /// Register models found by a later F5 scan and load/create their files.
-    pub fn sync_models(&mut self, models: &[Model]) {
+    pub fn sync_models(&mut self, runtime: RuntimeId, models: &[Model]) {
         for model in models {
             if !valid_catalog_dir(&model.catalog_dir) {
                 continue;
             }
-            self.model_dirs.insert(model_key(&model.path), model.catalog_dir.clone());
-            for loaded in load_model_profiles(model, &mut self.instances) {
+            self.model_dirs.insert(
+                (runtime_name(runtime).into(), model_key(&model.path)),
+                model.catalog_dir.clone(),
+            );
+            for loaded in load_model_profiles(runtime, model, &mut self.instances) {
                 self.fallback.remove(&loaded);
             }
-            for profile in super::templates::names(RuntimeId::LlamaCpp) {
+            for profile in super::templates::names(runtime) {
                 self.instances
-                    .entry(key("llama.cpp", &model_key(&model.path), profile))
+                    .entry(key(runtime_name(runtime), &model_key(&model.path), profile))
                     .or_default();
             }
         }
@@ -157,7 +171,7 @@ impl ProfileStore {
     pub fn rename(&mut self, runtime: &str, model: &str, old: &str, new: &str) {
         if let Some(inst) = self.instances.remove(&key(runtime, model, old)) {
             self.fallback.remove(&key(runtime, model, old));
-            self.remove_profile_file(model, old);
+            self.remove_profile_file(runtime, model, old);
             let entry = key(runtime, model, new);
             self.instances.insert(entry.clone(), inst);
             self.persist_one(&entry);
@@ -169,7 +183,7 @@ impl ProfileStore {
     pub fn delete(&mut self, runtime: &str, model: &str, profile: &str) {
         if self.instances.remove(&key(runtime, model, profile)).is_some() {
             self.fallback.remove(&key(runtime, model, profile));
-            self.remove_profile_file(model, profile);
+            self.remove_profile_file(runtime, model, profile);
             self.save_legacy();
         }
     }
@@ -231,7 +245,9 @@ impl ProfileStore {
         let keys: Vec<Key> = self
             .instances
             .keys()
-            .filter(|(_, model, _)| self.model_dirs.contains_key(model))
+            .filter(|(runtime, model, _)| {
+                self.model_dirs.contains_key(&(runtime.clone(), model.clone()))
+            })
             .cloned()
             .collect();
         for entry in keys {
@@ -258,12 +274,12 @@ impl ProfileStore {
     }
 
     fn write_profile(&self, entry: &Key) -> std::io::Result<()> {
-        let (_, model, profile) = entry;
+        let (runtime, model, profile) = entry;
         let inst =
             self.instances.get(entry).ok_or_else(|| std::io::Error::other("missing instance"))?;
         let dir = self
             .model_dirs
-            .get(model)
+            .get(&(runtime.clone(), model.clone()))
             .filter(|dir| valid_catalog_dir(dir))
             .ok_or_else(|| std::io::Error::other("model catalog unavailable"))?;
         let file = ProfileFile {
@@ -317,8 +333,10 @@ impl ProfileStore {
         }
     }
 
-    fn remove_profile_file(&self, model: &str, profile: &str) {
-        let Some(dir) = self.model_dirs.get(model) else { return };
+    fn remove_profile_file(&self, runtime: &str, model: &str, profile: &str) {
+        let Some(dir) = self.model_dirs.get(&(runtime.to_string(), model.to_string())) else {
+            return;
+        };
         let path = dir.join("profiles").join(profile_filename(profile));
         if let Err(err) = std::fs::remove_file(&path)
             && err.kind() != std::io::ErrorKind::NotFound
@@ -340,7 +358,11 @@ impl ProfileStore {
     }
 }
 
-fn load_model_profiles(model: &Model, instances: &mut BTreeMap<Key, Instance>) -> Vec<Key> {
+fn load_model_profiles(
+    runtime: RuntimeId,
+    model: &Model,
+    instances: &mut BTreeMap<Key, Instance>,
+) -> Vec<Key> {
     let mut loaded = Vec::new();
     if !valid_catalog_dir(&model.catalog_dir) {
         return loaded;
@@ -357,7 +379,7 @@ fn load_model_profiles(model: &Model, instances: &mut BTreeMap<Key, Instance>) -
             .and_then(|bytes| serde_yaml::from_slice::<ProfileFile>(&bytes).ok())
         {
             Some(file) if file.schema == 1 => {
-                let entry = key("llama.cpp", &model_key(&model.path), &file.name);
+                let entry = key(runtime_name(runtime), &model_key(&model.path), &file.name);
                 instances.insert(
                     entry.clone(),
                     Instance { values: file.values, favorite: file.favorite, custom: file.custom },
@@ -400,6 +422,13 @@ fn write_atomic_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 fn key(runtime: &str, model: &str, profile: &str) -> Key {
     (runtime.to_string(), model.to_string(), profile.to_string())
+}
+
+fn runtime_name(runtime: RuntimeId) -> &'static str {
+    match runtime {
+        RuntimeId::LlamaCpp => "llama.cpp",
+        RuntimeId::Vllm => "vLLM",
+    }
 }
 
 /// Convenience for callers that have a model path.
@@ -445,7 +474,7 @@ mod tests {
             modified: None,
             has_chat_template: false,
         };
-        let store = ProfileStore::load(legacy.clone(), &[model]);
+        let store = ProfileStore::load(legacy.clone(), &[model], &[]);
         assert_eq!(
             store.get("llama.cpp", &model_key(&root.join("source.gguf")), "Chat").unwrap().values["ctx-size"],
             "8192"
@@ -477,7 +506,7 @@ mod tests {
             modified: None,
             has_chat_template: false,
         };
-        let mut store = ProfileStore::load(legacy.clone(), &[model]);
+        let mut store = ProfileStore::load(legacy.clone(), &[model], &[]);
         store.set_value(
             "llama.cpp",
             &model_key(&model_path),
@@ -489,6 +518,49 @@ mod tests {
         let saved: StoreFile = serde_json::from_slice(&std::fs::read(&legacy).unwrap()).unwrap();
         assert_eq!(saved.instances.len(), 1);
         assert_eq!(saved.instances[0].values["ctx-size"], "8192");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn vllm_profiles_persist_in_their_catalog_without_crossing_runtimes() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("llmctl-vllm-profiles-{nonce}"));
+        let catalog = root.join("catalog/vllm/huggingface/team/model");
+        std::fs::create_dir_all(catalog.join("profiles")).unwrap();
+        let model_path = root.join("snapshot");
+        std::fs::create_dir_all(&model_path).unwrap();
+        let model = Model {
+            id: "vllm:test".into(),
+            name: "team/model".into(),
+            path: model_path.clone(),
+            shard_paths: Vec::new(),
+            catalog_path: vec!["huggingface".into(), "team".into(), "model".into()],
+            catalog_dir: catalog.clone(),
+            size_bytes: 0,
+            quantization: None,
+            architecture: None,
+            context_length: None,
+            modified: None,
+            has_chat_template: true,
+        };
+        let legacy = root.join("profiles.json");
+        let mut store = ProfileStore::load(legacy.clone(), &[], &[model.clone()]);
+        store.set_value(
+            "vLLM",
+            &model_key(&model_path),
+            "Default",
+            "tensor-parallel-size",
+            "2".into(),
+            &BTreeMap::new(),
+        );
+        assert!(catalog.join("profiles/Default.yml").is_file());
+        assert!(store.get("llama.cpp", &model_key(&model_path), "Default").is_none());
+
+        let reloaded = ProfileStore::load(legacy, &[], &[model]);
+        assert_eq!(
+            reloaded.get("vLLM", &model_key(&model_path), "Default").unwrap().values["tensor-parallel-size"],
+            "2"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

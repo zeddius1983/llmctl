@@ -111,7 +111,7 @@ sources while retaining any legacy `config.yaml` as an ignored backup.
 - [ ] Explicit/lazy version and option compatibility inspection
 - [x] Runtime-specific option registries and built-in templates
 - [x] Local Hugging Face/safetensors discovery, metadata parsing, and navigation
-- [ ] Runtime-namespaced catalog profiles with llama.cpp migration
+- [x] Runtime-namespaced managed catalog and profile persistence
 - [ ] `vllm serve` command construction and session lifecycle
 - [ ] Runtime-aware UI actions, startup diagnostics, and real-GPU acceptance test
 

@@ -238,7 +238,7 @@ mod tests {
     }
 
     fn empty_store() -> ProfileStore {
-        ProfileStore::load("/nonexistent/llmctl-test-store.json".into(), &[])
+        ProfileStore::load("/nonexistent/llmctl-test-store.json".into(), &[], &[])
     }
 
     fn value_of(opts: &[OptionItem], key: &str) -> String {

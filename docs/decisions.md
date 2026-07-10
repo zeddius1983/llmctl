@@ -243,3 +243,9 @@ IDs/downloads are deferred.
 and llama.cpp/vLLM options cannot bleed into one another. The next slices must
 generalize file-only catalog artifacts and runtime-namespace profile YAML while
 migrating existing llama.cpp profiles without data loss.
+
+**Implementation note:** Existing llama.cpp leaves retain their v0.2 paths.
+vLLM leaves live below `models/vllm/`, use a `model` directory symlink, and
+carry runtime-tagged manifests. This avoids a repository-as-leaf collision with
+GGUF artifacts nested under the same Hugging Face repository while requiring no
+destructive migration of existing llama.cpp profiles.

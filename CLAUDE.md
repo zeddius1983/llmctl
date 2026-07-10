@@ -52,7 +52,8 @@ docs/            requirements, architecture, decisions (ADRs), roadmap
 
 XDG paths used at runtime:
 `~/.config/llmctl/config.toml`, `~/.config/llmctl/models/` (managed model
-catalog + per-model YAML profiles), `~/.local/state/llmctl/` (logs, sessions,
+catalog + per-model YAML profiles; vLLM is namespaced below `models/vllm/`),
+`~/.local/state/llmctl/` (logs, sessions,
 legacy profile migration), `~/.cache/llmctl/` (model cache and runtime help snapshots).
 
 ## Key design decisions (see decisions.md for full ADRs)
@@ -95,8 +96,8 @@ legacy profile migration), `~/.cache/llmctl/` (model cache and runtime help snap
   **`feature/v0.1.0`** (the release umbrella), which is then merged to `main`.
   (The early `phase-*` and `docs` branches predate this policy and are
   grandfathered.)
-- Commit only when asked. Commit messages end with:
-  `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
+- Commit only when asked. Do not add co-author trailers unless the user
+  explicitly requests one.
 - Don't commit the legacy Go `llmctl` binary or `/target` (see `.gitignore`).
 
 ## Context compaction companion
