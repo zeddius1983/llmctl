@@ -260,7 +260,10 @@ impl SessionManager {
 
             let rss = proc::rss_bytes(pid);
             let sample = proc::cpu_sample(pid);
-            let health = health::probe(&host, port);
+            // Readiness is a one-way transition. Once Running, process liveness
+            // is authoritative; probing forever only floods server access logs
+            // (notably vLLM's INFO log) without changing the derived status.
+            let health = if was_running { Health::Ready } else { health::probe(&host, port) };
 
             let s = &mut self.sessions[idx];
             s.rss_bytes = rss;
@@ -270,11 +273,9 @@ impl SessionManager {
                 }
                 s.last_cpu = Some(now);
             }
-            // Ready promotes to Running; otherwise keep Running if we were already
-            // there (tolerate transient probe failures), else Starting.
+            // Ready promotes to Running; otherwise the model is still Starting.
             s.status = match health {
                 Health::Ready => SessionStatus::Running,
-                _ if was_running => SessionStatus::Running,
                 _ => SessionStatus::Starting,
             };
         }

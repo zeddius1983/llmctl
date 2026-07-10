@@ -153,7 +153,9 @@ can implement the same trait. See ADR-005 and ADR-007.
 vLLM uses the same detached lifecycle, `/health` readiness probe, OpenAI `/v1`
 endpoint, logs, and restart/stop actions. Process rediscovery matches executable
 argv basename + exact model path + port rather than Linux `comm`, because Python
-and container wrappers commonly expose a different process name.
+and container wrappers commonly expose a different process name. Health is
+probed only until the one-way `Starting` → `Running` transition, avoiding
+per-second access-log noise after readiness.
 
 ## Testing strategy
 
