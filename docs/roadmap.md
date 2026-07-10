@@ -66,6 +66,22 @@ off, for ROCm/AMD), KV `--cache-type-k`/`--cache-type-v` (enum with an in-band
 `--spec-draft-n-max`, `--spec-draft-n-min`, available for all models). Added a
 top-level `README.md`.
 
+### v0.1.1 — option defaults & template controls
+The `default` omit sentinel extended to `ctx-size` and all sampling params
+(`temperature`, `top-p`, `top-k`, `min-p`, `repeat-penalty`) — at `default` the
+flag is dropped and llama.cpp's own default applies; new profiles start sampling
+params there. `ctx-size` still starts at the ctx/8 heuristic (its `default` =
+the model's full trained context); `host`/`port` stay always-emitted (llmctl
+needs the concrete endpoint). New options: `reasoning-effort` (delivered as
+`--chat-template-kwargs '{"reasoning_effort":…}'`), `chat-template` (enum of the
+54 built-in template names), `jinja` (bare `--no-jinja` when off). Editing: `d`
+resets an option to its resolved default; `Home`/`End` are pure min/max; `Enter`
+edits in Options; enums with >8 variants open a filterable selector popup
+instead of cycling. Bugfix: the base snapshot that seeds a profile instance on
+first edit/favorite/create is now model-aware, so materializing no longer reset
+unedited options (ctx-size silently fell from the ctx/8 default back to the
+global 4096).
+
 ## Next (post-v0.1.0)
 
 ### Phase 4 — Log search & startup-failure classification
