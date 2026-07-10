@@ -19,6 +19,10 @@ Living status of the build. Update this when phases complete or scope shifts
 merged via the `feature/v0.1.0` umbrella and tagged `v0.1.0` on `main`. Phases 4
 and 5 are deferred to a future release; the roadmap will be revisited then.
 
+**v0.1.1 released** — option defaults & template controls (see the Done section
+below), tagged `v0.1.1` on `main`. The release workflow now creates the GitHub
+Release itself on tag push and attaches the prebuilt Linux binaries.
+
 Branching: each remaining phase is built on its own `feature/<task>` branch.
 When a batch is ready to ship, the feature branches merge into a release umbrella
 (e.g. **`feature/v0.1.0`**), which then merges to `main` and is tagged. (Early
