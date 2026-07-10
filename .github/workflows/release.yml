@@ -1,8 +1,9 @@
 name: Release
 
-# Build prebuilt Linux binaries and attach them to the GitHub Release.
-# Fires when a `v*` tag is pushed; can also be run manually from the Actions tab
-# against an existing tag (use the ref selector) to (re)produce its artifacts.
+# Create the GitHub Release for a pushed `v*` tag, then build prebuilt Linux
+# binaries and attach them to it. Can also be run manually from the Actions tab
+# against an existing tag (use the ref selector) to (re)produce its artifacts —
+# note this recreates the release, so re-apply any hand-edited notes after.
 on:
   push:
     tags:
@@ -10,11 +11,21 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # required to upload assets to the release
+  contents: write # required to create the release and upload assets
 
 jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          title: llmctl $tag
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   upload-assets:
     name: ${{ matrix.target }}
+    needs: create-release
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
