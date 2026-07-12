@@ -105,6 +105,7 @@ overlay.
 | **Launch & sessions** | |
 | `s` | Start server |
 | `C` | Chat in terminal (`llama-cli`) |
+| `b` | Benchmark selected model with its profile device and GPU layers (when available) |
 | `y` | Yank launch command |
 | `t` | Session manager |
 | `x` / `K` | Stop / kill |
@@ -118,7 +119,9 @@ overlay.
 ### Launch options
 
 The MVP exposes a curated set of `llama-server` flags, including context size,
-GPU layers, sampling (`temperature`, `top-p`, `top-k`, `min-p`, `repeat-penalty`),
+GPU layers, device selection (`--device`, with a selector populated by
+`llama-server --list-devices`), sampling (`temperature`, `top-p`, `top-k`,
+`min-p`, `repeat-penalty`),
 threads, batch size, flash attention, reasoning, KV cache types (`--cache-type-k`
 / `--cache-type-v`), `--no-mmap` (handy for ROCm/AMD GPUs), host/port, and
 speculative decoding (`--spec-type`, `--spec-draft-n-max`, `--spec-draft-n-min`).

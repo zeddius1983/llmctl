@@ -144,6 +144,20 @@ mod tests {
     }
 
     #[test]
+    fn selected_device_is_emitted_and_default_is_omitted() {
+        let mut opts = sample_options();
+        opts.push(opt("device", "ROCm0", "--device"));
+        let cmd = Command::build("llama-server", "/m/x.gguf", &opts);
+        let i = cmd.argv.iter().position(|a| a == "--device").unwrap();
+        assert_eq!(cmd.argv[i + 1], "ROCm0");
+
+        opts.pop();
+        opts.push(opt("device", registry::DEFAULT, "--device"));
+        let cmd = Command::build("llama-server", "/m/x.gguf", &opts);
+        assert!(!cmd.argv.iter().any(|a| a == "--device"));
+    }
+
+    #[test]
     fn omitted_values_are_skipped() {
         let mut opts = sample_options();
         opts[3] = opt("flash-attn", "auto", "--flash-attn"); // enum's omit token

@@ -55,7 +55,7 @@ pub struct Selector {
     pub key: String,
     pub title: String,
     /// All enum variants, in registry order.
-    pub variants: Vec<&'static str>,
+    pub variants: Vec<String>,
     /// Case-insensitive substring filter typed so far.
     pub filter: String,
     /// Cursor index into [`Self::filtered`].
@@ -77,13 +77,17 @@ struct CatalogRoute {
 
 impl Selector {
     /// Variants matching the current filter (case-insensitive substring).
-    pub fn filtered(&self) -> Vec<&'static str> {
+    pub fn filtered(&self) -> Vec<&str> {
         let needle = self.filter.to_lowercase();
-        self.variants.iter().filter(|v| v.to_lowercase().contains(&needle)).copied().collect()
+        self.variants
+            .iter()
+            .filter(|v| v.to_lowercase().contains(&needle))
+            .map(String::as_str)
+            .collect()
     }
 
     /// The variant under the cursor, if any survives the filter.
-    pub fn selected(&self) -> Option<&'static str> {
+    pub fn selected(&self) -> Option<&str> {
         self.filtered().get(self.cursor).copied()
     }
 }
@@ -241,6 +245,8 @@ pub struct App {
     /// A foreground interactive chat (`llama-cli`) to run on the next loop turn,
     /// suspending the TUI while it owns the terminal.
     pending_chat: Option<Vec<String>>,
+    /// A foreground `llama-bench` invocation for the selected model.
+    pending_benchmark: Option<Vec<String>>,
 }
 
 impl App {
@@ -285,6 +291,7 @@ impl App {
             store,
             last_tick: Instant::now(),
             pending_chat: None,
+            pending_benchmark: None,
         };
         app.sync_session_selection();
         // Derive the whole chain from the initially-selected runtime.
@@ -310,7 +317,10 @@ impl App {
             }
             // A chat request hands the terminal to llama-cli, then we re-enter.
             if let Some(argv) = self.pending_chat.take() {
-                run_chat(terminal, &argv)?;
+                run_foreground(terminal, &argv, "chat")?;
+            }
+            if let Some(argv) = self.pending_benchmark.take() {
+                run_foreground(terminal, &argv, "benchmark")?;
             }
         }
         Ok(())
@@ -379,6 +389,7 @@ impl App {
             KeyCode::Char('y') => self.yank_command(),
             KeyCode::Char('s') => self.start_session(),
             KeyCode::Char('C') => self.start_chat(),
+            KeyCode::Char('b') => self.start_benchmark(),
 
             // Move focus across panes. In Options (the leaf) Enter edits the
             // selected value instead; `l`/Right stay pure navigation.
@@ -767,6 +778,18 @@ impl App {
         self.pending_chat = Some(argv);
     }
 
+    /// Run `llama-bench` for the selected model with the benchmark's defaults.
+    fn start_benchmark(&mut self) {
+        let Some(model) = self.selected_model() else {
+            return;
+        };
+        let Some(bench) = self.runtimes.selected().and_then(|runtime| runtime.bench_path.as_ref())
+        else {
+            return;
+        };
+        self.pending_benchmark = Some(benchmark_argv(bench, &model.path, &self.options.items));
+    }
+
     /// Apply a fallible supervisor action to the selected session.
     fn session_action(&mut self, f: impl Fn(&mut SessionManager, usize) -> Result<()>, verb: &str) {
         let Some(i) = self.session_sel.selected() else {
@@ -867,8 +890,8 @@ impl App {
             KeyCode::Esc => self.selector = None,
             KeyCode::Enter => {
                 if let Some(sel) = self.selector.take() {
-                    if let Some(value) = sel.selected() {
-                        self.apply_option_value(&sel.key, value.to_string());
+                    if let Some(value) = sel.selected().map(str::to_string) {
+                        self.apply_option_value(&sel.key, value);
                     }
                 }
             }
@@ -910,6 +933,21 @@ impl App {
         let key = option.key.clone();
         let current = option.value.clone();
 
+        if key == "device" {
+            let mut variants = vec![profiles::registry::DEFAULT.to_string()];
+            if let Some(runtime) = self.runtimes.selected() {
+                variants.extend(runtime.devices.iter().cloned());
+            }
+            self.selector = Some(Selector {
+                title: "Select device".into(),
+                key,
+                cursor: variants.iter().position(|v| *v == current).unwrap_or(0),
+                variants,
+                filter: String::new(),
+            });
+            return;
+        }
+
         if let Some(spec) = profiles::registry::spec(&key) {
             use profiles::registry::OptionKind;
             if let OptionKind::Enum(variants) = spec.kind {
@@ -917,7 +955,7 @@ impl App {
                     self.selector = Some(Selector {
                         title: format!("Select {key}"),
                         key,
-                        variants: variants.to_vec(),
+                        variants: variants.iter().map(|v| (*v).to_string()).collect(),
                         filter: String::new(),
                         // Start on the current value.
                         cursor: variants.iter().position(|v| *v == current).unwrap_or(0),
@@ -962,6 +1000,18 @@ impl App {
 
     /// Increment/decrement the selected option in place (auto-saves).
     fn adjust_option(&mut self, dir: i32) {
+        if let Some(option) = self.options.selected() {
+            if option.key == "device" {
+                let next = self
+                    .runtimes
+                    .selected()
+                    .map(|runtime| cycle_device(&runtime.devices, &option.value, dir));
+                if let Some(next) = next {
+                    self.apply_option_value("device", next);
+                }
+                return;
+            }
+        }
         self.transform_option(|spec, kind, current| spec.bump(kind, current, dir));
     }
 
@@ -1233,6 +1283,12 @@ impl App {
     /// The selected catalog leaf. Directory nodes intentionally have no path.
     pub fn selected_model(&self) -> Option<&Model> {
         self.models.selected().filter(|m| m.is_model())
+    }
+
+    /// Whether the selected runtime exposes `llama-bench` for this model.
+    pub fn benchmark_available(&self) -> bool {
+        self.selected_model().is_some()
+            && self.runtimes.selected().and_then(|runtime| runtime.bench_path.as_ref()).is_some()
     }
 
     pub fn catalog_parent(&self) -> Option<(&[Model], Option<usize>)> {
@@ -1590,10 +1646,29 @@ fn cli_binary(server_binary: &str) -> Option<PathBuf> {
     cli.exists().then_some(cli)
 }
 
-/// Hand the terminal to a foreground process (interactive chat), then re-enter
-/// the TUI. The detached-session supervisor sets `SIGCHLD` to `SIG_IGN`, which
-/// would make `wait()` fail, so default disposition is restored while it runs.
-fn run_chat(terminal: &mut DefaultTerminal, argv: &[String]) -> Result<()> {
+fn benchmark_argv(
+    bench: &std::path::Path,
+    model: &std::path::Path,
+    options: &[OptionItem],
+) -> Vec<String> {
+    let mut argv = vec![bench.display().to_string(), "-m".into(), model.display().to_string()];
+    for (key, flag) in [("device", "--device"), ("gpu-layers", "-ngl")] {
+        if let Some(value) = options
+            .iter()
+            .find(|option| option.key == key && option.value != profiles::registry::DEFAULT)
+            .map(|option| option.value.clone())
+        {
+            argv.push(flag.into());
+            argv.push(value);
+        }
+    }
+    argv
+}
+
+/// Hand the terminal to a foreground tool, then re-enter the TUI. The detached
+/// session supervisor sets `SIGCHLD` to `SIG_IGN`, which would make `wait()`
+/// fail, so default disposition is restored while the tool runs.
+fn run_foreground(terminal: &mut DefaultTerminal, argv: &[String], label: &str) -> Result<()> {
     use std::process::Command as StdCommand;
     let Some((prog, args)) = argv.split_first() else {
         return Ok(());
@@ -1606,9 +1681,9 @@ fn run_chat(terminal: &mut DefaultTerminal, argv: &[String]) -> Result<()> {
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
 
     if let Err(e) = &status {
-        eprintln!("\n[llmctl] failed to start chat: {e}");
+        eprintln!("\n[llmctl] failed to start {label}: {e}");
     }
-    eprintln!("\n[llmctl] chat ended — press Enter to return to llmctl.");
+    eprintln!("\n[llmctl] {label} ended — press Enter to return to llmctl.");
     let _ = std::io::stdin().read_line(&mut String::new());
 
     *terminal = ratatui::init();
@@ -1646,6 +1721,17 @@ fn read_log_tail(path: &std::path::Path, max_lines: usize) -> Vec<String> {
     lines
 }
 
+/// Cycle through automatic device selection and the devices discovered from
+/// `llama-server --list-devices`, wrapping in either direction.
+fn cycle_device(devices: &[String], current: &str, dir: i32) -> String {
+    let variants = std::iter::once(profiles::registry::DEFAULT)
+        .chain(devices.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    let current = variants.iter().position(|value| *value == current).unwrap_or(0) as i32;
+    let next = (current + dir.signum()).rem_euclid(variants.len() as i32) as usize;
+    variants[next].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1654,7 +1740,10 @@ mod tests {
         Selector {
             key: "chat-template".into(),
             title: "Select chat-template".into(),
-            variants: vec!["default", "chatml", "llama2", "llama3", "mistral-v1", "zephyr"],
+            variants: ["default", "chatml", "llama2", "llama3", "mistral-v1", "zephyr"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             filter: String::new(),
             cursor: 0,
         }
@@ -1697,5 +1786,72 @@ mod tests {
             panic!("flash-attn should be an enum");
         };
         assert!(variants.len() <= SELECTOR_THRESHOLD);
+    }
+
+    #[test]
+    fn device_hotkeys_cycle_and_wrap_in_both_directions() {
+        let devices = vec!["ROCm0".into(), "Vulkan0".into()];
+        assert_eq!(cycle_device(&devices, "default", 1), "ROCm0");
+        assert_eq!(cycle_device(&devices, "ROCm0", 1), "Vulkan0");
+        assert_eq!(cycle_device(&devices, "Vulkan0", 1), "default");
+        assert_eq!(cycle_device(&devices, "default", -1), "Vulkan0");
+        assert_eq!(cycle_device(&devices, "ROCm0", -1), "default");
+    }
+
+    #[test]
+    fn device_hotkeys_stay_at_default_when_no_devices_are_discovered() {
+        assert_eq!(cycle_device(&[], "default", 1), "default");
+        assert_eq!(cycle_device(&[], "stale-device", -1), "default");
+    }
+
+    #[test]
+    fn benchmark_omits_default_device_and_gpu_layers() {
+        let defaults = vec![
+            OptionItem {
+                key: "device".into(),
+                value: profiles::registry::DEFAULT.into(),
+                default: String::new(),
+                range: None,
+                cli: "--device".into(),
+                description: String::new(),
+            },
+            OptionItem {
+                key: "gpu-layers".into(),
+                value: profiles::registry::DEFAULT.into(),
+                default: String::new(),
+                range: None,
+                cli: "-ngl".into(),
+                description: String::new(),
+            },
+        ];
+        assert_eq!(
+            benchmark_argv(
+                "/opt/llama/llama-bench".as_ref(),
+                "/models/qwen.gguf".as_ref(),
+                &defaults
+            ),
+            vec!["/opt/llama/llama-bench", "-m", "/models/qwen.gguf"]
+        );
+    }
+
+    #[test]
+    fn benchmark_applies_profile_device_and_gpu_layers() {
+        let option = |key: &str, value: &str| OptionItem {
+            key: key.into(),
+            value: value.into(),
+            default: String::new(),
+            range: None,
+            cli: String::new(),
+            description: String::new(),
+        };
+        let argv = benchmark_argv(
+            "llama-bench".as_ref(),
+            "model.gguf".as_ref(),
+            &[option("device", "Vulkan0"), option("gpu-layers", "99")],
+        );
+        assert_eq!(
+            argv,
+            vec!["llama-bench", "-m", "model.gguf", "--device", "Vulkan0", "-ngl", "99"]
+        );
     }
 }

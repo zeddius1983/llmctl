@@ -194,7 +194,9 @@ mod tests {
             description: String::new(),
             version: None,
             binary_path: None,
+            bench_path: None,
             formats: vec![],
+            devices: vec![],
         }
     }
 

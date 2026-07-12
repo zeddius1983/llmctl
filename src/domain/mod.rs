@@ -15,7 +15,10 @@ pub struct Runtime {
     pub description: String,
     pub version: Option<String>,
     pub binary_path: Option<PathBuf>,
+    pub bench_path: Option<PathBuf>,
     pub formats: Vec<String>,
+    /// Device identifiers reported by the runtime (for example ROCm0 or Vulkan0).
+    pub devices: Vec<String>,
 }
 
 /// A discovered GGUF model. Serializable so the scanner can cache results.
@@ -135,7 +138,9 @@ pub mod stubs {
             description: "High-throughput serving with PagedAttention".into(),
             version: None,
             binary_path: None,
+            bench_path: None,
             formats: vec!["Safetensors".into(), "HF".into()],
+            devices: vec![],
         }
     }
 
