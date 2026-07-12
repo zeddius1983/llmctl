@@ -303,6 +303,9 @@ fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
             keys.push(("h/l", "back/enter"));
             keys.push(("/", "search models"));
             keys.push(("F5", "rescan"));
+            if app.benchmark_available() {
+                keys.push(("b/B", "benchmark"));
+            }
         }
         Pane::Profile => {
             // Built-ins are read-only templates: no rename, and `d` resets
@@ -318,6 +321,9 @@ fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
             keys.push(("f", "fav"));
             keys.push(("s", "start"));
             keys.push(("C", "chat"));
+            if app.benchmark_available() {
+                keys.push(("b/B", "benchmark"));
+            }
             keys.push(("y", "yank"));
         }
         Pane::Options => {
@@ -328,6 +334,9 @@ fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
             keys.push(("Home/End", "min/max"));
             keys.push(("s", "start"));
             keys.push(("C", "chat"));
+            if app.benchmark_available() {
+                keys.push(("b/B", "benchmark"));
+            }
             keys.push(("y", "yank"));
         }
     }
@@ -579,6 +588,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("Launch & sessions".bold()),
         help_row("s", "start server"),
         help_row("C", "chat in terminal (llama-cli)"),
+        help_row("b / B", "benchmark selected model (llama-bench)"),
         help_row("y", "yank command"),
         help_row("t", "session manager"),
         help_row("x / K", "stop / kill"),

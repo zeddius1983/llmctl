@@ -105,6 +105,7 @@ overlay.
 | **Launch & sessions** | |
 | `s` | Start server |
 | `C` | Chat in terminal (`llama-cli`) |
+| `b` / `B` | Benchmark selected model with `llama-bench` defaults (when available) |
 | `y` | Yank launch command |
 | `t` | Session manager |
 | `x` / `K` | Stop / kill |

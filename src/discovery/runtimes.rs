@@ -12,6 +12,7 @@ use crate::domain::Runtime;
 /// Discover the llama.cpp runtime from configuration.
 pub fn discover_llama_cpp(cfg: &LlamaCppConfig, cache_dir: &Path) -> Runtime {
     let binary_path = resolve_binary(&cfg.binary);
+    let bench_path = binary_path.as_deref().and_then(resolve_bench);
     let version = binary_path.as_deref().and_then(query_version);
     let devices = binary_path.as_deref().map(query_devices).unwrap_or_default();
 
@@ -28,6 +29,7 @@ pub fn discover_llama_cpp(cfg: &LlamaCppConfig, cache_dir: &Path) -> Runtime {
         description: "GGUF inference via llama-server".into(),
         version,
         binary_path,
+        bench_path,
         formats: vec!["GGUF".into()],
         devices,
     }
@@ -42,6 +44,13 @@ fn resolve_binary(binary: &str) -> Option<PathBuf> {
     }
     let path_var = std::env::var_os("PATH")?;
     std::env::split_paths(&path_var).map(|dir| dir.join(binary)).find(|p| p.is_file())
+}
+
+/// Prefer `llama-bench` beside `llama-server`, then fall back to PATH for
+/// installations that package the tools separately.
+fn resolve_bench(server: &Path) -> Option<PathBuf> {
+    let sibling = server.with_file_name("llama-bench");
+    sibling.is_file().then_some(sibling).or_else(|| resolve_binary("llama-bench"))
 }
 
 /// Run `--version` and return a short version string. llama.cpp prints version

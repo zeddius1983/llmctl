@@ -245,6 +245,8 @@ pub struct App {
     /// A foreground interactive chat (`llama-cli`) to run on the next loop turn,
     /// suspending the TUI while it owns the terminal.
     pending_chat: Option<Vec<String>>,
+    /// A foreground `llama-bench` invocation for the selected model.
+    pending_benchmark: Option<Vec<String>>,
 }
 
 impl App {
@@ -289,6 +291,7 @@ impl App {
             store,
             last_tick: Instant::now(),
             pending_chat: None,
+            pending_benchmark: None,
         };
         app.sync_session_selection();
         // Derive the whole chain from the initially-selected runtime.
@@ -314,7 +317,10 @@ impl App {
             }
             // A chat request hands the terminal to llama-cli, then we re-enter.
             if let Some(argv) = self.pending_chat.take() {
-                run_chat(terminal, &argv)?;
+                run_foreground(terminal, &argv, "chat")?;
+            }
+            if let Some(argv) = self.pending_benchmark.take() {
+                run_foreground(terminal, &argv, "benchmark")?;
             }
         }
         Ok(())
@@ -383,6 +389,7 @@ impl App {
             KeyCode::Char('y') => self.yank_command(),
             KeyCode::Char('s') => self.start_session(),
             KeyCode::Char('C') => self.start_chat(),
+            KeyCode::Char('b') | KeyCode::Char('B') => self.start_benchmark(),
 
             // Move focus across panes. In Options (the leaf) Enter edits the
             // selected value instead; `l`/Right stay pure navigation.
@@ -769,6 +776,18 @@ impl App {
         let mut argv = cmd.argv;
         argv.push("-cnv".into()); // conversation/chat mode
         self.pending_chat = Some(argv);
+    }
+
+    /// Run `llama-bench` for the selected model with the benchmark's defaults.
+    fn start_benchmark(&mut self) {
+        let Some(model) = self.selected_model() else {
+            return;
+        };
+        let Some(bench) = self.runtimes.selected().and_then(|runtime| runtime.bench_path.as_ref())
+        else {
+            return;
+        };
+        self.pending_benchmark = Some(benchmark_argv(bench, &model.path));
     }
 
     /// Apply a fallible supervisor action to the selected session.
@@ -1266,6 +1285,12 @@ impl App {
         self.models.selected().filter(|m| m.is_model())
     }
 
+    /// Whether the selected runtime exposes `llama-bench` for this model.
+    pub fn benchmark_available(&self) -> bool {
+        self.selected_model().is_some()
+            && self.runtimes.selected().and_then(|runtime| runtime.bench_path.as_ref()).is_some()
+    }
+
     pub fn catalog_parent(&self) -> Option<(&[Model], Option<usize>)> {
         self.catalog_history.last().map(|(items, selected, _)| (items.as_slice(), *selected))
     }
@@ -1621,10 +1646,14 @@ fn cli_binary(server_binary: &str) -> Option<PathBuf> {
     cli.exists().then_some(cli)
 }
 
-/// Hand the terminal to a foreground process (interactive chat), then re-enter
-/// the TUI. The detached-session supervisor sets `SIGCHLD` to `SIG_IGN`, which
-/// would make `wait()` fail, so default disposition is restored while it runs.
-fn run_chat(terminal: &mut DefaultTerminal, argv: &[String]) -> Result<()> {
+fn benchmark_argv(bench: &std::path::Path, model: &std::path::Path) -> Vec<String> {
+    vec![bench.display().to_string(), "-m".into(), model.display().to_string()]
+}
+
+/// Hand the terminal to a foreground tool, then re-enter the TUI. The detached
+/// session supervisor sets `SIGCHLD` to `SIG_IGN`, which would make `wait()`
+/// fail, so default disposition is restored while the tool runs.
+fn run_foreground(terminal: &mut DefaultTerminal, argv: &[String], label: &str) -> Result<()> {
     use std::process::Command as StdCommand;
     let Some((prog, args)) = argv.split_first() else {
         return Ok(());
@@ -1637,9 +1666,9 @@ fn run_chat(terminal: &mut DefaultTerminal, argv: &[String]) -> Result<()> {
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
 
     if let Err(e) = &status {
-        eprintln!("\n[llmctl] failed to start chat: {e}");
+        eprintln!("\n[llmctl] failed to start {label}: {e}");
     }
-    eprintln!("\n[llmctl] chat ended — press Enter to return to llmctl.");
+    eprintln!("\n[llmctl] {label} ended — press Enter to return to llmctl.");
     let _ = std::io::stdin().read_line(&mut String::new());
 
     *terminal = ratatui::init();
@@ -1758,5 +1787,13 @@ mod tests {
     fn device_hotkeys_stay_at_default_when_no_devices_are_discovered() {
         assert_eq!(cycle_device(&[], "default", 1), "default");
         assert_eq!(cycle_device(&[], "stale-device", -1), "default");
+    }
+
+    #[test]
+    fn benchmark_uses_only_model_and_tool_defaults() {
+        assert_eq!(
+            benchmark_argv("/opt/llama/llama-bench".as_ref(), "/models/qwen.gguf".as_ref()),
+            vec!["/opt/llama/llama-bench", "-m", "/models/qwen.gguf"]
+        );
     }
 }
