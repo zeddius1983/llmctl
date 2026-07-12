@@ -29,6 +29,11 @@ a physical source/provider/repository/artifact tree, moves profiles beside each
 model as YAML, adds global model search, and generates an explicit standard-source
 configuration on first run. See [release notes](release-notes-v0.2.0.md).
 
+**v0.2.1 — device selection and benchmarking** — adds profile-level llama.cpp
+device selection populated by `llama-server --list-devices`, plus optional
+`llama-bench` discovery and the `b` benchmark shortcut. See
+[release notes](release-notes-v0.2.1.md).
+
 Branching: each remaining phase is built on its own `feature/<task>` branch.
 When a batch is ready to ship, the feature branches merge into a release umbrella
 (e.g. **`feature/v0.1.0`**), which then merges to `main` and is tagged. (Early
@@ -102,7 +107,14 @@ selection, and catalog/profile write amplification are covered by regression
 tests. First run creates an editable `config.toml` with the four standard model
 sources while retaining any legacy `config.yaml` as an ignored backup.
 
-## Next (post-v0.2.0)
+### v0.2.1 — device selection and benchmarking
+Profile-level `device` selection discovers accelerator identifiers such as
+`ROCm0` and `Vulkan0`, persists the choice, emits `llama-server --device`, and
+supports selector or inline hotkey cycling. When `llama-bench` is installed,
+`b` benchmarks the selected model in the foreground and forwards concrete
+profile device and GPU-layer settings.
+
+## Next (post-v0.2.1)
 
 ### Phase 4 — Log search & startup-failure classification
 - [ ] Log view search / filtering (`L` already tails + scrolls)
