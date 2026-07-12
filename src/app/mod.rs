@@ -389,7 +389,7 @@ impl App {
             KeyCode::Char('y') => self.yank_command(),
             KeyCode::Char('s') => self.start_session(),
             KeyCode::Char('C') => self.start_chat(),
-            KeyCode::Char('b') | KeyCode::Char('B') => self.start_benchmark(),
+            KeyCode::Char('b') => self.start_benchmark(),
 
             // Move focus across panes. In Options (the leaf) Enter edits the
             // selected value instead; `l`/Right stay pure navigation.
@@ -787,7 +787,7 @@ impl App {
         else {
             return;
         };
-        self.pending_benchmark = Some(benchmark_argv(bench, &model.path));
+        self.pending_benchmark = Some(benchmark_argv(bench, &model.path, &self.options.items));
     }
 
     /// Apply a fallible supervisor action to the selected session.
@@ -1646,8 +1646,23 @@ fn cli_binary(server_binary: &str) -> Option<PathBuf> {
     cli.exists().then_some(cli)
 }
 
-fn benchmark_argv(bench: &std::path::Path, model: &std::path::Path) -> Vec<String> {
-    vec![bench.display().to_string(), "-m".into(), model.display().to_string()]
+fn benchmark_argv(
+    bench: &std::path::Path,
+    model: &std::path::Path,
+    options: &[OptionItem],
+) -> Vec<String> {
+    let mut argv = vec![bench.display().to_string(), "-m".into(), model.display().to_string()];
+    for (key, flag) in [("device", "--device"), ("gpu-layers", "-ngl")] {
+        if let Some(value) = options
+            .iter()
+            .find(|option| option.key == key && option.value != profiles::registry::DEFAULT)
+            .map(|option| option.value.clone())
+        {
+            argv.push(flag.into());
+            argv.push(value);
+        }
+    }
+    argv
 }
 
 /// Hand the terminal to a foreground tool, then re-enter the TUI. The detached
@@ -1790,10 +1805,53 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_uses_only_model_and_tool_defaults() {
+    fn benchmark_omits_default_device_and_gpu_layers() {
+        let defaults = vec![
+            OptionItem {
+                key: "device".into(),
+                value: profiles::registry::DEFAULT.into(),
+                default: String::new(),
+                range: None,
+                cli: "--device".into(),
+                description: String::new(),
+            },
+            OptionItem {
+                key: "gpu-layers".into(),
+                value: profiles::registry::DEFAULT.into(),
+                default: String::new(),
+                range: None,
+                cli: "-ngl".into(),
+                description: String::new(),
+            },
+        ];
         assert_eq!(
-            benchmark_argv("/opt/llama/llama-bench".as_ref(), "/models/qwen.gguf".as_ref()),
+            benchmark_argv(
+                "/opt/llama/llama-bench".as_ref(),
+                "/models/qwen.gguf".as_ref(),
+                &defaults
+            ),
             vec!["/opt/llama/llama-bench", "-m", "/models/qwen.gguf"]
+        );
+    }
+
+    #[test]
+    fn benchmark_applies_profile_device_and_gpu_layers() {
+        let option = |key: &str, value: &str| OptionItem {
+            key: key.into(),
+            value: value.into(),
+            default: String::new(),
+            range: None,
+            cli: String::new(),
+            description: String::new(),
+        };
+        let argv = benchmark_argv(
+            "llama-bench".as_ref(),
+            "model.gguf".as_ref(),
+            &[option("device", "Vulkan0"), option("gpu-layers", "99")],
+        );
+        assert_eq!(
+            argv,
+            vec!["llama-bench", "-m", "model.gguf", "--device", "Vulkan0", "-ngl", "99"]
         );
     }
 }

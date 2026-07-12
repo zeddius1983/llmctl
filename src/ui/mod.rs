@@ -304,7 +304,7 @@ fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
             keys.push(("/", "search models"));
             keys.push(("F5", "rescan"));
             if app.benchmark_available() {
-                keys.push(("b/B", "benchmark"));
+                keys.push(("b", "benchmark"));
             }
         }
         Pane::Profile => {
@@ -322,7 +322,7 @@ fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
             keys.push(("s", "start"));
             keys.push(("C", "chat"));
             if app.benchmark_available() {
-                keys.push(("b/B", "benchmark"));
+                keys.push(("b", "benchmark"));
             }
             keys.push(("y", "yank"));
         }
@@ -335,7 +335,7 @@ fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
             keys.push(("s", "start"));
             keys.push(("C", "chat"));
             if app.benchmark_available() {
-                keys.push(("b/B", "benchmark"));
+                keys.push(("b", "benchmark"));
             }
             keys.push(("y", "yank"));
         }
@@ -588,7 +588,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("Launch & sessions".bold()),
         help_row("s", "start server"),
         help_row("C", "chat in terminal (llama-cli)"),
-        help_row("b / B", "benchmark selected model (llama-bench)"),
+        help_row("b", "benchmark selected model (llama-bench)"),
         help_row("y", "yank command"),
         help_row("t", "session manager"),
         help_row("x / K", "stop / kill"),
