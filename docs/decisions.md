@@ -219,3 +219,48 @@ descriptors, catalog reconciliation, collision-safe path normalization, legacy
 profile migration, and variable-depth browser state. The catalog contains
 absolute source paths and is therefore local machine state despite residing in
 the XDG configuration directory.
+
+---
+
+## ADR-010: Hugging Face as a lazy virtual catalog; llama.cpp owns downloads
+
+**Status:** Accepted
+
+**Context:** Online GGUF models should participate in the existing Yazi-style
+hierarchy and profile workflow. A separate screen would split that experience,
+while an llmctl downloader would duplicate revisioned cache, shard, resume,
+authentication, and projector behavior already handled by llama.cpp.
+
+**Decision:** Add `online ▸ huggingface` as a virtual source below llama.cpp.
+Selecting it fetches 20 trending compatible repositories; selecting a
+repository lazily fetches GGUF files and metadata. Background threads perform
+blocking HTTPS and return results to the synchronous event loop. Metadata,
+stable remote identity, and profiles live under the managed catalog. Launch
+uses `--hf-repo` plus `--hf-file`, inheriting `HF_TOKEN` only from the
+environment. Once cached, the same leaf links to the downloaded file and
+launches by local path. `F5` refreshes the current online scope.
+
+**Consequences:** Online models reuse Model → Profile → Options and llama.cpp's
+cache behavior. The domain model carries explicit remote identity because an
+empty local path no longer necessarily means a directory. Online `/` searches
+the Hub after a short debounce, keeps results transient, and promotes only the
+repository selected with Enter into the cached catalog. Local `/` searches
+recurse only below the current catalog directory, so remote and unrelated local
+sources never leak into the results. Richer filters, structured progress, and
+download-only remain follow-ups.
+
+Repository IDs are presented as flat `provider/repository` rows, with likes and
+download counts visible on each row. Online search is Hub-wide from the
+repository list and artifact-local after entering a repository.
+
+Compatibility filtering uses the Hub's `gguf` and `llama.cpp` facets without a
+pipeline constraint. A `text-generation` constraint incorrectly excludes
+llama.cpp-compatible multimodal repositories classified as `image-text-to-text`
+or `any-to-any` (for example, current Gemma 4 GGUF releases).
+
+The online repository pane exposes three views: Trending (`trendingScore`),
+Popular (`likes`), and Downloads (`downloads`), cycled with `o`. The GGUF pane
+uses `author/model · architecture · ctx maximum` as its contextual title.
+Switching views or pressing online `F5` cancels the logical generation, removes
+generated online metadata and symlinks, and fetches a clean first page. Profile
+YAML and actual Hugging Face cache files are user/model data and remain intact.

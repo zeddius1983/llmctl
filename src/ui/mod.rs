@@ -119,7 +119,8 @@ fn draw_browser(frame: &mut Frame, app: &mut App) {
 /// Render one level's list into a column, styled for its role.
 fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: Role) {
     let focused = role == Role::Current;
-    let block = pane_block(level.title(), focused);
+    let title = if level == Pane::Model { app.model_pane_title() } else { level.title().into() };
+    let block = pane_block(&title, focused);
 
     // Build owned items first so the immutable borrow ends before we take the
     // mutable state borrow below.
@@ -137,6 +138,27 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
             .iter()
             .map(|m| {
                 let label = m.display_label();
+                if let Some(remote) = &m.remote
+                    && remote.file.is_none()
+                {
+                    return ListItem::new(Line::from(vec![
+                        Span::raw(format!("  {label}  ")),
+                        Span::styled(
+                            format!(
+                                "♥{} ⇩{}",
+                                compact_count(remote.likes),
+                                compact_count(remote.downloads)
+                            ),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                }
+                if let Some((metadata, filename)) = model_artifact_columns(m) {
+                    return ListItem::new(Line::from(vec![
+                        Span::styled(metadata, Style::default().fg(Color::DarkGray)),
+                        Span::raw(filename),
+                    ]));
+                }
                 let item_icon = if m.is_catalog_dir() { "" } else { icon };
                 ListItem::new(format!("{item_icon}  {label}"))
             })
@@ -206,7 +228,9 @@ fn render_catalog_parent(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
     frame.render_widget(
-        List::new(items).block(pane_block("Model", false)).style(Style::default().dim()),
+        List::new(items)
+            .block(pane_block(&app.catalog_parent_title(), false))
+            .style(Style::default().dim()),
         area,
     );
 }
@@ -217,12 +241,20 @@ fn render_catalog_preview(frame: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|m| {
             let label = m.display_label();
+            if let Some((metadata, filename)) = model_artifact_columns(m) {
+                return ListItem::new(Line::from(vec![
+                    Span::styled(metadata, Style::default().fg(Color::DarkGray)),
+                    Span::raw(filename),
+                ]));
+            }
             let icon = if m.is_catalog_dir() { "" } else { level_icon(Pane::Model) };
             ListItem::new(format!("{icon}  {label}"))
         })
         .collect();
     frame.render_widget(
-        List::new(items).block(pane_block("Model", false)).style(Style::default().dim()),
+        List::new(items)
+            .block(pane_block(&app.catalog_preview_title(), false))
+            .style(Style::default().dim()),
         area,
     );
 }
@@ -303,6 +335,9 @@ fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
             keys.push(("h/l", "back/enter"));
             keys.push(("/", "search models"));
             keys.push(("F5", "rescan"));
+            if app.online_view_active() {
+                keys.push(("o", "trending/popular/downloads"));
+            }
             if app.benchmark_available() {
                 keys.push(("b", "benchmark"));
             }
@@ -357,6 +392,38 @@ fn truncate_left(s: &str, max: usize) -> String {
     }
     let tail: String = s.chars().skip(count - (max - 1)).collect();
     format!("…{tail}")
+}
+
+fn compact_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}m", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn model_artifact_columns(model: &crate::domain::Model) -> Option<(String, String)> {
+    if !model.is_model() {
+        return None;
+    }
+    let quantization = model.quantization.as_deref().unwrap_or("-");
+    Some((
+        format!("{quantization:<12}{:>7}  ", download_size(model.size_bytes)),
+        model.display_label().into(),
+    ))
+}
+
+fn download_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1_000.0 && unit < UNITS.len() - 1 {
+        size /= 1_000.0;
+        unit += 1;
+    }
+    if unit == 0 { format!("{bytes} B") } else { format!("{size:.1} {}", UNITS[unit]) }
 }
 
 // --- Session Manager screen ------------------------------------------------
@@ -570,6 +637,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         help_row("h / ←", "back up a level"),
         help_row("g / G", "first / last item"),
         help_row("/", "search models"),
+        help_row("o", "cycle online view"),
         Line::raw(""),
         Line::from("Profiles".bold()),
         help_row("a", "create profile"),
@@ -623,7 +691,16 @@ fn render_model_search(frame: &mut Frame, area: Rect, app: &App, search: &ModelS
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ACCENT))
-        .title(" Search models ");
+        .title(if search.online {
+            let suffix = search.scope.get(2..).unwrap_or_default().join(" / ");
+            if suffix.is_empty() {
+                " Search Hugging Face ".to_string()
+            } else {
+                format!(" Search Hugging Face / {suffix} ")
+            }
+        } else {
+            format!(" Search {} ", search.scope.last().map(String::as_str).unwrap_or("models"))
+        });
     let mut lines = vec![Line::from(vec![
         Span::styled("❯ ", Style::default().fg(ACCENT)),
         Span::raw(search.query.clone()),
@@ -763,4 +840,45 @@ fn center(area: Rect, horizontal: Constraint, vertical: Constraint) -> Rect {
     let [h] = Layout::horizontal([horizontal]).flex(Flex::Center).areas(area);
     let [v] = Layout::vertical([vertical]).flex(Flex::Center).areas(h);
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compact_count, model_artifact_columns};
+
+    #[test]
+    fn counts_use_compact_repository_badges() {
+        assert_eq!(compact_count(999), "999");
+        assert_eq!(compact_count(1_200), "1.2k");
+        assert_eq!(compact_count(445_400), "445.4k");
+        assert_eq!(compact_count(1_250_000), "1.2m");
+    }
+
+    #[test]
+    fn artifact_columns_show_quant_size_and_filename() {
+        let mut model = crate::domain::stubs::vllm_models().remove(0);
+        model.name = "Qwen-AgentWorld-35B-A3B-UD-Q4_K_M.gguf".into();
+        model.catalog_path = vec![model.name.clone()];
+        model.size_bytes = 20_600_000_000;
+        model.quantization = Some("Q4_K_M".into());
+        model.remote = Some(crate::domain::RemoteModel {
+            repo: "owner/repo".into(),
+            revision: None,
+            file: Some(model.name.clone()),
+            downloads: 0,
+            likes: 0,
+            gated: false,
+        });
+
+        assert_eq!(
+            model_artifact_columns(&model).unwrap(),
+            ("Q4_K_M      20.6 GB  ".into(), "Qwen-AgentWorld-35B-A3B-UD-Q4_K_M.gguf".into())
+        );
+
+        model.remote = None;
+        assert_eq!(
+            model_artifact_columns(&model).unwrap(),
+            ("Q4_K_M      20.6 GB  ".into(), "Qwen-AgentWorld-35B-A3B-UD-Q4_K_M.gguf".into())
+        );
+    }
 }

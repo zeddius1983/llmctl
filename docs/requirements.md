@@ -33,8 +33,37 @@ Users should be able to:
 6. Inspect logs.
 7. Reuse previous configurations.
 8. Restart or stop servers.
+9. Browse compatible Hugging Face GGUF repositories as an online catalog and
+   launch selected artifacts through llama.cpp's native downloader.
 
 Everything should be available from a single terminal application.
+
+## Online model catalog
+
+The llama.cpp hierarchy contains the virtual source `online ▸ huggingface`.
+Selecting it loads 20 trending models filtered for GGUF and llama.cpp
+compatibility, including text-only and multimodal pipelines. Repository
+contents are fetched lazily, cached into the managed catalog, and use the same
+Model → Profile → Options workflow as local models. Authentication is inherited
+from `HF_TOKEN` and is never persisted by llmctl. `/` searches the Hub
+server-side when invoked from the online hierarchy. Search results are
+transient; only the repository selected with Enter is added to the persistent
+online catalogue.
+
+The online repository pane title reflects its active view: `Trending`,
+`Popular`, or `Downloads`. A repository's GGUF pane title shows its Hub ID,
+architecture, and maximum context length. `o` cycles through Hub trending
+score, likes, and download count. Changing view or pressing `F5` anywhere in
+the online hierarchy resets all generated online catalog metadata and fetches a
+clean first page. User profiles and the standard Hugging Face model cache are
+never deleted by this reset.
+
+For local catalog directories, `/` searches recursively only below the current
+directory. Local searches exclude the virtual online catalog; selecting or
+entering `online ▸ huggingface` switches `/` to an isolated Hub-wide search.
+Online repositories are displayed as flat `provider/repository` rows, followed
+by their GGUF artifacts when entered. Inside a repository, search is limited to
+its fetched artifacts.
 
 ---
 
@@ -782,4 +811,3 @@ The MVP is successful when a user can:
 9. Restart or stop servers.
 
 without manually writing or remembering llama.cpp commands.
-

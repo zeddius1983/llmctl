@@ -23,7 +23,12 @@ and watch them from a built-in session manager.
   chat template; dedupes multi-shard models and sums their sizes. `F5` to rescan.
 - **Physical model catalog** — mirrors discovery below
   `~/.config/llmctl/models` using source-aware folders, safe manifests, model
-  symlinks, and per-model YAML profiles. Press `/` for global model search.
+  symlinks, and per-model YAML profiles. Press `/` to search recursively from
+  the current local catalog directory.
+- **Online Hugging Face catalog** — browse `online ▸ huggingface` like a local
+  directory. It lazily caches trending llama.cpp-compatible GGUF repositories
+  and their artifacts; starting a remote model lets llama.cpp download it into
+  the standard Hugging Face cache.
 - **Profiles & options** — built-in, read-only templates (Default, Chat, Coding,
   Long Context, Server) that fork into per-model editable instances on first edit.
   Edit options with live validation, cycle enums/flags in place, and adjust
@@ -91,7 +96,8 @@ overlay.
 | `l` / `→` | Drill into selection |
 | `h` / `←` | Back up a level |
 | `g` / `G` | First / last item |
-| `/` | Search all models and jump to a result |
+| `/` | Search recursively in the current catalog directory |
+| `o` | Cycle online view: Trending / Popular / Downloads |
 | **Profiles** | |
 | `a` | Create profile |
 | `r` | Rename (custom profiles only) |
@@ -162,6 +168,29 @@ The generated file explicitly lists the standard locations so they are easy to
 inspect and extend. Older `[models].paths` arrays remain supported, but named
 `[[models.sources]]` entries provide stable catalog names and layout control.
 Your `$HOME` is never scanned wholesale.
+
+### Online models
+
+Under the llama.cpp runtime, enter `online`, then `huggingface`. Selecting the
+source fetches 20 trending llama.cpp-compatible GGUF repositories. Repositories
+appear as flat `provider/repository` rows with likes and download counts;
+entering one fetches its GGUF variants. Choose an artifact, configure a normal
+profile, and press `s`. llmctl launches llama.cpp with `--hf-repo` and
+`--hf-file`, then links the downloaded file from the standard Hugging Face
+cache into the managed catalog.
+
+The online repository pane is titled `Trending`, `Popular`, or `Downloads`.
+Inside a repository, the GGUF pane title shows `author/model · architecture ·
+ctx maximum`. Press `o` to cycle between Hub trending score, most likes, and
+most downloads. A view change or online `F5` discards generated online layout
+metadata and fetches a clean first page for the active view; profile YAML and
+downloaded model data are preserved. `/` performs debounced server-side search
+across Hugging Face.
+Hub search results remain transient until Enter saves the selected repository;
+closing the search does not expand the local catalogue. Inside a repository it
+searches only fetched GGUF artifacts. Online results never mix into local
+folder searches. Set `HF_TOKEN` in the environment for gated/private models;
+llmctl never persists the token.
 
 ## Roadmap
 

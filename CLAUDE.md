@@ -20,6 +20,7 @@ command again. The MVP targets **llama.cpp + GGUF on Linux**; other runtimes
   cache, and profile persistence.
 - **directories** — XDG base directories.
 - **walkdir** + **regex** — model discovery.
+- **ureq** — blocking HTTPS used from background workers for Hugging Face browsing.
 - **anyhow** / **thiserror** — errors. **tracing** — file-based logging.
 - **libc** — `setsid`/signals for detached sessions, `/proc` sampling, `sysconf`.
   No async runtime: a poll-based tick (`crossterm::event::poll`) drives live
@@ -42,7 +43,8 @@ src/
   config/        Config (first-run config.toml generation) + XDG Paths resolution
   domain/        pure types (Runtime, Model, Profile, OptionItem), helpers, vLLM stubs
   discovery/     catalog.rs (source parsing + managed tree), gguf.rs (header parser),
-                 models.rs (scan+cache), runtimes.rs (llama.cpp)
+                 models.rs (scan+cache), online.rs (lazy Hugging Face catalog),
+                 runtimes.rs (llama.cpp)
   profiles/      registry.rs (option specs), templates.rs, store.rs (per-model YAML), mod.rs (resolution)
   session/       command.rs (builder), supervisor.rs (DetachedSupervisor: setsid/signals),
                  record.rs (session-<id>.json), proc.rs (/proc), health.rs (/health), mod.rs (SessionManager)
@@ -67,6 +69,7 @@ legacy profile migration), `~/.cache/llmctl/` (models.json, llama-server.help.tx
 - Synchronous poll-tick refresh + `libc` for process control, not tokio/nix —
   ADR-007.
 - Source-aware physical model catalog with per-model profiles — ADR-009.
+- Lazy `online ▸ huggingface` catalog, with llama.cpp-owned downloads — ADR-010.
 
 ## Coding standards
 

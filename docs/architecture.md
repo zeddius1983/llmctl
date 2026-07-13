@@ -48,6 +48,17 @@ state.
     (first shard only, suffix stripped, sizes summed); projector (`mmproj`)
     filtering; filename-first quant detection; cache to `models.json` keyed by
     size+mtime; `F5` rescan.
+  - `online.rs` — lazy `online ▸ huggingface` virtual source. Background HTTPS
+    requests fetch trending repositories and repository GGUF details; cached
+    metadata is exposed as flat `provider/repository` rows followed by GGUF
+    artifacts, and profile leaves are materialized below the managed catalog.
+    Downloaded files are detected in the standard Hugging Face cache. Online
+    search is Hub-wide and transient from the repository list, persisting only
+    the result selected with Enter; it is artifact-local after a repository is
+    entered. View state maps Trending/Popular/Downloads to
+    `trendingScore`/`likes`/`downloads`; switching view or online `F5`
+    invalidates in-flight responses and rebuilds generated online metadata
+    while preserving profiles and downloaded files.
   - `runtimes.rs` — locate `llama-server` (explicit path or `$PATH`), capture
     `--version`, cache `--help`.
 - **`profiles/`**
@@ -61,7 +72,8 @@ state.
     `current_values`, `effective_kind` (model-aware ctx-size bound).
 - **`session/`**
   - `command.rs` — pure launch-command builder (argv + shell-quoted display;
-    bool flags emitted only when on, model via `-m`).
+    bool flags emitted only when on, local model via `-m`, remote model via
+    `--hf-repo` and `--hf-file`).
   - `supervisor.rs` — `SessionSupervisor` trait + `DetachedSupervisor` (`setsid`
     pre-exec, stdio→log file, `SIGCHLD` auto-reap, `kill(-pgid, …)`); plus the
     OSC 52 base64 helper used for clipboard yank.

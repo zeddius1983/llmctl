@@ -10,13 +10,14 @@ use ratatui::DefaultTerminal;
 use ratatui::widgets::ListState;
 
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, ModelLayout, ModelSourceConfig, Paths};
 use crate::discovery;
 use crate::discovery::ModelSource;
 use crate::domain::{Model, OptionItem, Profile, Runtime, format_unix_date, human_size, stubs};
-use crate::profiles::{self, ProfileStore, store};
+use crate::profiles::{self, ProfileStore};
 use crate::session::{self, LaunchRequest, SessionManager};
 use crate::ui;
 
@@ -66,6 +67,8 @@ pub struct ModelSearch {
     pub query: String,
     pub cursor: usize,
     result_indices: Vec<usize>,
+    pub online: bool,
+    pub scope: Vec<String>,
 }
 
 struct CatalogRoute {
@@ -247,21 +250,37 @@ pub struct App {
     pending_chat: Option<Vec<String>>,
     /// A foreground `llama-bench` invocation for the selected model.
     pending_benchmark: Option<Vec<String>>,
+    online_tx: Sender<discovery::online::Response>,
+    online_rx: Receiver<discovery::online::Response>,
+    online_pending: Option<discovery::online::Request>,
+    llama_hf_supported: bool,
+    online_search_due: Option<(Instant, String)>,
+    online_sort: discovery::online::Sort,
+    online_epoch: u64,
+    online_reload_deferred: bool,
+    online_restore_models: bool,
+    online_search_results: Vec<String>,
 }
 
 impl App {
     pub fn new(config: Config, paths: Paths) -> Self {
         // Discover the real llama.cpp runtime; keep vLLM as a demo stub.
         let llama = discovery::discover_llama_cpp(&config.runtime.llama_cpp, &paths.cache_dir);
+        let llama_hf_supported =
+            std::fs::read_to_string(paths.cache_dir.join("llama-server.help.txt"))
+                .is_ok_and(|help| help.contains("--hf-repo") && help.contains("--hf-file"));
         let model_sources = resolve_model_sources(&config.models.paths, &config.models.sources);
         let model_cache = paths.cache_dir.join("models.json");
         let mut scanned_models = discovery::scan_models(&model_sources, &model_cache);
         discovery::reconcile(&paths.models_dir, &mut scanned_models);
+        let online_sort = discovery::online::cached_sort(&paths.models_dir);
+        scanned_models.extend(discovery::online::load_cached(&paths.models_dir));
         let store = ProfileStore::load(paths.state_dir.join("profiles.json"), &scanned_models);
         // Built after discovery's one-shot `Command`s: the supervisor ignores
         // SIGCHLD, which would otherwise prevent reaping those probe processes.
         let sessions = SessionManager::new(paths.sessions_dir.clone(), paths.log_dir.clone());
 
+        let (online_tx, online_rx) = mpsc::channel();
         let mut app = Self {
             config,
             focus: Pane::Runtime,
@@ -292,6 +311,16 @@ impl App {
             last_tick: Instant::now(),
             pending_chat: None,
             pending_benchmark: None,
+            online_tx,
+            online_rx,
+            online_pending: None,
+            llama_hf_supported,
+            online_search_due: None,
+            online_sort,
+            online_epoch: 0,
+            online_reload_deferred: false,
+            online_restore_models: false,
+            online_search_results: Vec::new(),
         };
         app.sync_session_selection();
         // Derive the whole chain from the initially-selected runtime.
@@ -304,6 +333,8 @@ impl App {
     /// blocking on input (no async runtime needed — see ADR-007).
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.should_quit {
+            self.poll_online();
+            self.poll_online_search();
             if self.last_tick.elapsed() >= Duration::from_secs(1) {
                 self.tick();
             }
@@ -331,10 +362,292 @@ impl App {
     fn tick(&mut self) {
         self.sessions.refresh();
         self.sync_session_selection();
+        self.reconcile_downloaded_online_models();
         if self.screen == Screen::Logs {
             self.reload_logs();
         }
         self.last_tick = Instant::now();
+    }
+
+    fn reconcile_downloaded_online_models(&mut self) {
+        let has_remote_session =
+            self.sessions.sessions.iter().any(|session| {
+                session.record.command.iter().any(|argument| argument == "--hf-repo")
+            });
+        let has_uncached_remote = self.scanned_models.iter().any(|model| {
+            model.remote.as_ref().and_then(|remote| remote.file.as_ref()).is_some()
+                && model.path.as_os_str().is_empty()
+        });
+        if !has_remote_session || !has_uncached_remote {
+            return;
+        }
+        let models = discovery::online::load_cached(&self.models_dir);
+        let newly_cached = models.iter().any(|fresh| {
+            !fresh.path.as_os_str().is_empty()
+                && self
+                    .scanned_models
+                    .iter()
+                    .find(|old| old.id == fresh.id)
+                    .is_some_and(|old| old.path.as_os_str().is_empty())
+        });
+        if newly_cached {
+            self.scanned_models
+                .retain(|model| !discovery::online::is_online_path(&model.catalog_path));
+            self.scanned_models.extend(models);
+            self.store.sync_models(&self.scanned_models);
+            self.rebuild_below(Pane::Model);
+        }
+    }
+
+    fn poll_online(&mut self) {
+        while let Ok(response) = self.online_rx.try_recv() {
+            if response.epoch != self.online_epoch {
+                if self.online_reload_deferred {
+                    self.online_pending = None;
+                    self.online_reload_deferred = false;
+                    self.perform_online_reload();
+                }
+                continue;
+            }
+            if self.online_pending.as_ref() == Some(&response.request) {
+                self.online_pending = None;
+            }
+            let search_query = match &response.request {
+                discovery::online::Request::Search { query, .. } => Some(query.clone()),
+                _ => None,
+            };
+            match response.result {
+                Ok(models) if search_query.is_some() => {
+                    let query = search_query.as_deref().unwrap_or_default();
+                    let current = self
+                        .model_search
+                        .as_ref()
+                        .is_some_and(|search| search.online && search.query == query);
+                    if current {
+                        self.replace_online_search_results(models);
+                        self.refresh_model_search();
+                    }
+                }
+                Ok(models) => {
+                    self.scanned_models
+                        .retain(|model| !discovery::online::is_online_path(&model.catalog_path));
+                    self.scanned_models.extend(models);
+                    self.store.sync_models(&self.scanned_models);
+                    if self.online_restore_models {
+                        self.show_online_models_root();
+                        self.online_restore_models = false;
+                    } else {
+                        self.rebuild_below(Pane::Model);
+                    }
+                    self.refresh_model_search();
+                }
+                Err(error) => {
+                    self.online_restore_models = false;
+                    self.message = Some(Message {
+                        title: "Hugging Face unavailable".into(),
+                        lines: vec![error, "Cached entries remain available.".into()],
+                    });
+                }
+            }
+            if self.focus == Pane::Model {
+                self.maybe_fetch_online(false);
+            }
+        }
+    }
+
+    fn clear_online_search_results(&mut self) {
+        if self.online_search_results.is_empty() {
+            return;
+        }
+        self.scanned_models
+            .retain(|model| !self.online_search_results.iter().any(|id| id == &model.id));
+        self.online_search_results.clear();
+    }
+
+    fn replace_online_search_results(&mut self, models: Vec<Model>) {
+        self.clear_online_search_results();
+        for model in models {
+            if self.scanned_models.iter().any(|cached| cached.id == model.id) {
+                continue;
+            }
+            self.online_search_results.push(model.id.clone());
+            self.scanned_models.push(model);
+        }
+    }
+
+    fn save_online_search_selection(&mut self, model: &Model) -> std::result::Result<(), String> {
+        discovery::online::save_selected_repository(&self.models_dir, model, self.online_sort)
+            .map_err(|error| error.to_string())?;
+        self.clear_online_search_results();
+        self.scanned_models
+            .retain(|cached| !discovery::online::is_online_path(&cached.catalog_path));
+        self.scanned_models.extend(discovery::online::load_cached(&self.models_dir));
+        self.store.sync_models(&self.scanned_models);
+        Ok(())
+    }
+
+    fn fetch_online(&mut self, request: discovery::online::Request) {
+        if self.online_pending.is_some() {
+            return;
+        }
+        self.online_pending = Some(request.clone());
+        let root = self.models_dir.clone();
+        let tx = self.online_tx.clone();
+        let epoch = self.online_epoch;
+        std::thread::spawn(move || {
+            let result =
+                discovery::online::fetch(&root, &request).map_err(|error| error.to_string());
+            let _ = tx.send(discovery::online::Response { epoch, request, result });
+        });
+    }
+
+    fn poll_online_search(&mut self) {
+        let Some((changed, query)) = self.online_search_due.clone() else { return };
+        if changed.elapsed() < Duration::from_millis(400) || self.online_pending.is_some() {
+            return;
+        }
+        self.online_search_due = None;
+        if !query.trim().is_empty() {
+            self.fetch_online(discovery::online::Request::Search {
+                query,
+                author: None,
+                sort: self.online_sort,
+            });
+        }
+    }
+
+    fn maybe_fetch_online(&mut self, force: bool) {
+        let Some(selected) = self.models.selected() else { return };
+        let Some(request) =
+            discovery::online::request_for_path(&selected.catalog_path, self.online_sort)
+        else {
+            return;
+        };
+        let cached = match &request {
+            discovery::online::Request::Repositories(_) => {
+                self.scanned_models.iter().any(|model| {
+                    model
+                        .remote
+                        .as_ref()
+                        .is_some_and(|remote| remote.file.is_none() && !remote.repo.is_empty())
+                })
+            }
+            discovery::online::Request::Repository(repo) => {
+                self.scanned_models.iter().any(|model| {
+                    model
+                        .remote
+                        .as_ref()
+                        .is_some_and(|remote| remote.repo == *repo && remote.file.is_some())
+                })
+            }
+            discovery::online::Request::Search { .. } => true,
+        };
+        if force || !cached {
+            self.fetch_online(request);
+        }
+    }
+
+    pub fn online_view_active(&self) -> bool {
+        self.focus >= Pane::Model
+            && (discovery::online::is_online_path(&self.catalog_prefix)
+                || self
+                    .models
+                    .selected()
+                    .is_some_and(|model| discovery::online::is_online_path(&model.catalog_path)))
+    }
+
+    pub fn model_pane_title(&self) -> String {
+        model_catalog_title(&self.catalog_prefix, &self.models.items, self.online_sort)
+    }
+
+    pub fn catalog_parent_title(&self) -> String {
+        self.catalog_history
+            .last()
+            .map(|(models, _, prefix)| model_catalog_title(prefix, models, self.online_sort))
+            .unwrap_or_else(|| "Model".into())
+    }
+
+    pub fn catalog_preview_title(&self) -> String {
+        self.models
+            .selected()
+            .filter(|model| model.is_catalog_dir())
+            .map(|model| {
+                model_catalog_title(&model.catalog_path, &self.catalog_preview, self.online_sort)
+            })
+            .unwrap_or_else(|| self.model_pane_title())
+    }
+
+    fn cycle_online_sort(&mut self) {
+        if !self.online_view_active() {
+            return;
+        }
+        self.online_sort = self.online_sort.next();
+        self.reload_online_layout();
+    }
+
+    fn reload_online_layout(&mut self) {
+        self.online_search_due = None;
+        self.model_search = None;
+        self.clear_online_search_results();
+        if self.online_pending.is_some() {
+            // Let the sole writer finish, then clear what it wrote before
+            // starting the replacement request. This prevents a stale worker
+            // from repopulating the cache after a view switch.
+            self.online_epoch = self.online_epoch.wrapping_add(1);
+            self.online_reload_deferred = true;
+            return;
+        }
+        self.perform_online_reload();
+    }
+
+    fn perform_online_reload(&mut self) {
+        self.online_epoch = self.online_epoch.wrapping_add(1);
+        self.online_pending = None;
+        if let Err(error) = discovery::online::clear_cached_layout(&self.models_dir) {
+            self.message = Some(Message {
+                title: "Cannot reset online catalog".into(),
+                lines: vec![error.to_string()],
+            });
+            return;
+        }
+
+        self.scanned_models.retain(|model| !discovery::online::is_online_path(&model.catalog_path));
+        self.scanned_models.extend(discovery::online::load_cached(&self.models_dir));
+        self.store.sync_models(&self.scanned_models);
+
+        self.online_restore_models = true;
+        self.show_online_models_root();
+        self.fetch_online(discovery::online::Request::Repositories(self.online_sort));
+    }
+
+    fn show_online_models_root(&mut self) {
+        if let Some(runtime) =
+            self.runtimes.items.iter().position(|runtime| runtime.name == "llama.cpp")
+        {
+            self.runtimes.state.select(Some(runtime));
+        }
+        let online = vec!["online".to_string()];
+        let huggingface = vec!["online".to_string(), "huggingface".to_string()];
+        let root_items = self.catalog_children(&[]);
+        let Some(online_selected) =
+            root_items.iter().position(|model| model.catalog_path == online)
+        else {
+            return;
+        };
+        let online_items = self.catalog_children(&online);
+        let Some(huggingface_selected) =
+            online_items.iter().position(|model| model.catalog_path == huggingface)
+        else {
+            return;
+        };
+        self.catalog_history = vec![
+            (root_items, Some(online_selected), Vec::new()),
+            (online_items, Some(huggingface_selected), online),
+        ];
+        self.catalog_prefix = huggingface.clone();
+        self.models.replace(self.catalog_children(&huggingface));
+        self.focus = Pane::Model;
+        self.rebuild_below(Pane::Model);
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -379,10 +692,19 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('/') => {
+                let selected_dir = self
+                    .models
+                    .selected()
+                    .filter(|model| model.is_catalog_dir())
+                    .map(|model| model.catalog_path.as_slice());
+                let scope = normalized_search_scope(self.focus, selected_dir, &self.catalog_prefix);
+                let online = discovery::online::is_online_path(&scope);
                 self.model_search = Some(ModelSearch {
                     query: String::new(),
                     cursor: 0,
-                    result_indices: self.ranked_model_indices(""),
+                    result_indices: self.ranked_model_indices("", &scope, online),
+                    online,
+                    scope,
                 })
             }
             KeyCode::Char('t') => self.open_sessions(),
@@ -390,6 +712,7 @@ impl App {
             KeyCode::Char('s') => self.start_session(),
             KeyCode::Char('C') => self.start_chat(),
             KeyCode::Char('b') => self.start_benchmark(),
+            KeyCode::Char('o') => self.cycle_online_sort(),
 
             // Move focus across panes. In Options (the leaf) Enter edits the
             // selected value instead; `l`/Right stay pure navigation.
@@ -435,17 +758,36 @@ impl App {
 
     fn model_search_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => self.model_search = None,
+            KeyCode::Esc => {
+                self.model_search = None;
+                self.online_search_due = None;
+                self.clear_online_search_results();
+            }
             KeyCode::Enter => {
                 let target = self
                     .model_search
                     .as_ref()
                     .and_then(|s| s.result_indices.get(s.cursor))
                     .and_then(|i| self.scanned_models.get(*i))
-                    .map(|m| m.id.clone());
+                    .cloned();
+                let promote = self.model_search.as_ref().is_some_and(|search| search.online)
+                    && target.as_ref().is_some_and(|model| {
+                        model.remote.as_ref().is_some_and(|remote| remote.file.is_none())
+                    });
                 self.model_search = None;
-                if let Some(id) = target {
-                    self.jump_to_model(&id);
+                self.online_search_due = None;
+                if let Some(target) = target {
+                    if promote && let Err(error) = self.save_online_search_selection(&target) {
+                        self.message = Some(Message {
+                            title: "Cannot save Hugging Face model".into(),
+                            lines: vec![error],
+                        });
+                        return;
+                    }
+                    self.clear_online_search_results();
+                    self.jump_to_model(&target.id);
+                } else {
+                    self.clear_online_search_results();
                 }
             }
             KeyCode::Up => {
@@ -465,6 +807,7 @@ impl App {
                     search.cursor = 0;
                 }
                 self.refresh_model_search();
+                self.schedule_online_search();
             }
             KeyCode::Char(c) => {
                 if let Some(search) = self.model_search.as_mut() {
@@ -472,6 +815,7 @@ impl App {
                     search.cursor = 0;
                 }
                 self.refresh_model_search();
+                self.schedule_online_search();
             }
             _ => {}
         }
@@ -483,15 +827,31 @@ impl App {
     }
 
     fn refresh_model_search(&mut self) {
-        let Some(query) = self.model_search.as_ref().map(|s| s.query.clone()) else { return };
-        let results = self.ranked_model_indices(&query);
+        let Some((query, scope, online)) =
+            self.model_search.as_ref().map(|s| (s.query.clone(), s.scope.clone(), s.online))
+        else {
+            return;
+        };
+        let results = self.ranked_model_indices(&query, &scope, online);
         if let Some(search) = self.model_search.as_mut() {
             search.result_indices = results;
             search.cursor = search.cursor.min(search.result_indices.len().saturating_sub(1));
         }
     }
 
-    fn ranked_model_indices(&self, raw_query: &str) -> Vec<usize> {
+    fn schedule_online_search(&mut self) {
+        let Some(search) = &self.model_search else { return };
+        if search.online && search.scope.len() <= 2 {
+            self.online_search_due = Some((Instant::now(), search.query.clone()));
+        }
+    }
+
+    fn ranked_model_indices(
+        &self,
+        raw_query: &str,
+        scope: &[String],
+        online_only: bool,
+    ) -> Vec<usize> {
         let query = raw_query.to_lowercase();
         let tokens: Vec<&str> = query.split_whitespace().collect();
         let mut matches: Vec<(i32, usize)> = self
@@ -499,6 +859,14 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(index, m)| {
+                if !catalog_entry_in_search_scope(
+                    &m.catalog_path,
+                    m.remote.is_some(),
+                    scope,
+                    online_only,
+                ) {
+                    return None;
+                }
                 let artifact = m.name.to_lowercase();
                 let path = m.catalog_path.join(" ").to_lowercase();
                 if !tokens.iter().all(|t| artifact.contains(t) || path.contains(t)) {
@@ -541,6 +909,7 @@ impl App {
         self.models.items = route.items;
         self.models.state.select(Some(route.selected));
         self.rebuild_below(Pane::Model);
+        self.maybe_fetch_online(false);
     }
 
     fn catalog_route(&self, path: &[String]) -> Option<CatalogRoute> {
@@ -553,7 +922,7 @@ impl App {
             let last = depth + 1 == path.len();
             if node.is_catalog_dir() {
                 if last {
-                    return None;
+                    return Some(CatalogRoute { items, selected, prefix, history });
                 }
                 history.push((items.clone(), Some(selected), prefix.clone()));
                 prefix = node.catalog_path.clone();
@@ -670,6 +1039,13 @@ impl App {
         }
         let rt = self.runtimes.selected().ok_or("no runtime selected")?;
         let model = self.selected_model().ok_or("no model selected")?;
+        let remote_download = model.remote.is_some() && model.path.as_os_str().is_empty();
+        if remote_download && !self.llama_hf_supported {
+            return Err(
+                "this llama-server does not advertise --hf-repo/--hf-file; upgrade llama.cpp"
+                    .into(),
+            );
+        }
         let profile = self.profiles.selected().ok_or("no profile selected")?;
         let binary = rt
             .binary_path
@@ -684,7 +1060,14 @@ impl App {
             runtime: rt.name.clone(),
             binary,
             model: model.name.clone(),
-            model_path: model.path.display().to_string(),
+            model_path: if remote_download {
+                model.remote.as_ref().and_then(|remote| remote.file.clone()).unwrap_or_default()
+            } else {
+                model.path.display().to_string()
+            },
+            hf_repo: remote_download
+                .then(|| model.remote.as_ref().map(|remote| remote.repo.clone()))
+                .flatten(),
             profile: profile.name.clone(),
             host,
             port,
@@ -699,8 +1082,17 @@ impl App {
         }
         match self.build_launch_request() {
             Ok(req) => {
-                let cmd =
-                    session::command::Command::build(&req.binary, &req.model_path, &req.options);
+                let cmd = match &req.hf_repo {
+                    Some(repo) => session::command::Command::build_huggingface(
+                        &req.binary,
+                        repo,
+                        &req.model_path,
+                        &req.options,
+                    ),
+                    None => {
+                        session::command::Command::build(&req.binary, &req.model_path, &req.options)
+                    }
+                };
                 copy_to_clipboard(&cmd.display());
                 self.message = Some(Message {
                     title: "Launch command".into(),
@@ -771,8 +1163,17 @@ impl App {
         // Drop server-only flags; keep the model plus sampling/runtime options.
         let opts: Vec<OptionItem> =
             req.options.into_iter().filter(|o| o.key != "host" && o.key != "port").collect();
-        let cmd =
-            session::command::Command::build(&cli.display().to_string(), &req.model_path, &opts);
+        let cmd = match &req.hf_repo {
+            Some(repo) => session::command::Command::build_huggingface(
+                &cli.display().to_string(),
+                repo,
+                &req.model_path,
+                &opts,
+            ),
+            None => {
+                session::command::Command::build(&cli.display().to_string(), &req.model_path, &opts)
+            }
+        };
         let mut argv = cmd.argv;
         argv.push("-cnv".into()); // conversation/chat mode
         self.pending_chat = Some(argv);
@@ -1100,7 +1501,7 @@ impl App {
             return;
         };
         let runtime = rt.name.clone();
-        let model = store::model_key(&m.path);
+        let model = m.profile_key();
         let profile = p.clone();
         let base = profiles::resolved_values(&profile, m, &self.config.defaults);
 
@@ -1121,7 +1522,7 @@ impl App {
             return;
         };
         let runtime = rt.name.clone();
-        let model = store::model_key(&m.path);
+        let model = m.profile_key();
         let profile = p.clone();
         let base = profiles::resolved_values(&profile, m, &self.config.defaults);
 
@@ -1191,7 +1592,7 @@ impl App {
             return;
         };
         let runtime = rt.name.clone();
-        let model = store::model_key(&m.path);
+        let model = m.profile_key();
         let name = p.name.clone();
 
         let cursor = self.profiles.state.selected().unwrap_or(0);
@@ -1233,7 +1634,7 @@ impl App {
             return Err("no model selected".into());
         };
         let runtime = rt.name.clone();
-        let model = store::model_key(&m.path);
+        let model = m.profile_key();
         let src_profile = Profile {
             name: src.to_string(),
             builtin: profiles::templates::is_builtin(src),
@@ -1260,7 +1661,7 @@ impl App {
     fn current_runtime_model(&self) -> Option<(String, String)> {
         let rt = self.runtimes.selected()?;
         let m = self.selected_model()?;
-        Some((rt.name.clone(), store::model_key(&m.path)))
+        Some((rt.name.clone(), m.profile_key()))
     }
 
     /// Rebuild the profile list, then optionally select a profile by name and
@@ -1287,7 +1688,7 @@ impl App {
 
     /// Whether the selected runtime exposes `llama-bench` for this model.
     pub fn benchmark_available(&self) -> bool {
-        self.selected_model().is_some()
+        self.selected_model().is_some_and(|model| !model.path.as_os_str().is_empty())
             && self.runtimes.selected().and_then(|runtime| runtime.bench_path.as_ref()).is_some()
     }
 
@@ -1296,6 +1697,12 @@ impl App {
     }
 
     fn catalog_children(&self, prefix: &[String]) -> Vec<Model> {
+        if let Some(repositories) = online_repository_children(&self.scanned_models, prefix) {
+            return repositories;
+        }
+        if let Some(artifacts) = online_artifact_children(&self.scanned_models, prefix) {
+            return artifacts;
+        }
         use std::collections::BTreeMap;
         let mut children: BTreeMap<String, Model> = BTreeMap::new();
         for model in &self.scanned_models {
@@ -1321,6 +1728,7 @@ impl App {
                         context_length: None,
                         modified: None,
                         has_chat_template: false,
+                        remote: None,
                     }
                 }
             });
@@ -1330,8 +1738,13 @@ impl App {
 
     /// Re-scan configured model directories (the `F5` refresh).
     fn refresh_models(&mut self) {
+        if self.online_view_active() {
+            self.reload_online_layout();
+            return;
+        }
         self.scanned_models = discovery::scan_models(&self.model_sources, &self.model_cache);
         discovery::reconcile(&self.models_dir, &mut self.scanned_models);
+        self.scanned_models.extend(discovery::online::load_cached(&self.models_dir));
         self.store.sync_models(&self.scanned_models);
         self.catalog_history.clear();
         self.catalog_prefix.clear();
@@ -1356,11 +1769,15 @@ impl App {
                 self.catalog_prefix = selected.catalog_path.clone();
                 self.models.replace(self.catalog_preview.clone());
                 self.rebuild_below(Pane::Model);
+                self.maybe_fetch_online(false);
             } else if !self.profiles.is_empty() {
                 self.focus = Pane::Profile;
             }
         } else if self.focus != Pane::Options && !self.preview_is_empty() {
             self.focus = self.focus.next();
+            if self.focus == Pane::Model {
+                self.maybe_fetch_online(false);
+            }
         }
     }
 
@@ -1403,6 +1820,9 @@ impl App {
             Pane::Options => self.options.move_by(delta),
         }
         self.rebuild_below(self.focus);
+        if self.focus == Pane::Model {
+            self.maybe_fetch_online(false);
+        }
     }
 
     fn select_first(&mut self) {
@@ -1413,6 +1833,9 @@ impl App {
             Pane::Options => self.options.select_first(),
         }
         self.rebuild_below(self.focus);
+        if self.focus == Pane::Model {
+            self.maybe_fetch_online(false);
+        }
     }
 
     fn select_last(&mut self) {
@@ -1423,6 +1846,9 @@ impl App {
             Pane::Options => self.options.select_last(),
         }
         self.rebuild_below(self.focus);
+        if self.focus == Pane::Model {
+            self.maybe_fetch_online(false);
+        }
     }
 
     /// Rebuild every pane below `changed` from the current selection chain,
@@ -1489,8 +1915,40 @@ impl App {
                 (primary, meta.join(" · "))
             }),
             Pane::Model => self.models.selected().map(|m| {
+                if let Some(remote) = &m.remote {
+                    let primary = match &remote.file {
+                        Some(file) => format!("hf://{}/{file}", remote.repo),
+                        None => format!("hf://{}", remote.repo),
+                    };
+                    let mut meta = vec![format!("{} downloads", remote.downloads)];
+                    meta.push(format!("{} likes", remote.likes));
+                    if remote.gated {
+                        meta.push("gated".into());
+                    }
+                    if remote.file.is_some() {
+                        meta.push(if m.path.as_os_str().is_empty() {
+                            "remote".into()
+                        } else {
+                            "cached".into()
+                        });
+                        meta.push(human_size(m.size_bytes));
+                        if let Some(quantization) = &m.quantization {
+                            meta.push(quantization.clone());
+                        }
+                    }
+                    return (primary, meta.join(" · "));
+                }
                 if m.is_catalog_dir() {
-                    return (m.catalog_path.join(" / "), "catalog directory".into());
+                    let metadata = if discovery::online::is_online_path(&m.catalog_path)
+                        && self.online_pending.is_some()
+                    {
+                        "loading Hugging Face…"
+                    } else if discovery::online::is_online_path(&m.catalog_path) {
+                        "online catalog · F5 refresh"
+                    } else {
+                        "catalog directory"
+                    };
+                    return (m.catalog_path.join(" / "), metadata.into());
                 }
                 let primary = m.path.display().to_string();
                 let mut meta = vec![human_size(m.size_bytes)];
@@ -1550,6 +2008,103 @@ impl App {
         }
         crumbs
     }
+}
+
+/// Hub repository lists are already ranked by the requested API sort. Preserve
+/// that order at the virtual repository root instead of applying the local
+/// catalog's alphabetical directory ordering.
+fn online_repository_children(models: &[Model], prefix: &[String]) -> Option<Vec<Model>> {
+    if prefix != ["online", "huggingface"] {
+        return None;
+    }
+    Some(
+        models
+            .iter()
+            .filter(|model| {
+                model.catalog_path.starts_with(prefix)
+                    && model.catalog_path.len() == prefix.len() + 1
+                    && model.remote.as_ref().is_some_and(|remote| remote.file.is_none())
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
+/// Quantized files within a Hub repository are easiest to choose when ordered
+/// from the smallest download to the largest. Unknown sizes sort last.
+fn online_artifact_children(models: &[Model], prefix: &[String]) -> Option<Vec<Model>> {
+    if prefix.len() != 3 || prefix[..2] != ["online", "huggingface"] {
+        return None;
+    }
+    let mut artifacts: Vec<Model> = models
+        .iter()
+        .filter(|model| {
+            model.catalog_path.starts_with(prefix)
+                && model.catalog_path.len() == prefix.len() + 1
+                && model.remote.as_ref().is_some_and(|remote| remote.file.is_some())
+        })
+        .cloned()
+        .collect();
+    artifacts.sort_by(|a, b| {
+        (a.size_bytes == 0, a.size_bytes, a.name.to_ascii_lowercase()).cmp(&(
+            b.size_bytes == 0,
+            b.size_bytes,
+            b.name.to_ascii_lowercase(),
+        ))
+    });
+    Some(artifacts)
+}
+
+fn model_catalog_title(
+    prefix: &[String],
+    models: &[Model],
+    sort: discovery::online::Sort,
+) -> String {
+    if prefix.len() == 3 && prefix[..2] == ["online", "huggingface"] {
+        let mut parts = vec![prefix[2].clone()];
+        if let Some(architecture) = models.iter().find_map(|model| model.architecture.clone()) {
+            parts.push(architecture);
+        }
+        if let Some(context) = models.iter().filter_map(|model| model.context_length).max() {
+            parts.push(format!("ctx {context}"));
+        }
+        return parts.join(" · ");
+    }
+    if discovery::online::is_online_path(prefix) { sort.label().into() } else { "Model".into() }
+}
+
+/// Model search follows file-manager semantics: local queries recurse from the
+/// directory currently being displayed (`catalog_prefix`), not from all model
+/// sources. Hovering the virtual `online` source from the runtime root enters
+/// the Hugging Face search scope; entering a flat repository row narrows the
+/// scope to its cached artifacts.
+fn normalized_search_scope(
+    focus: Pane,
+    selected_dir: Option<&[String]>,
+    catalog_prefix: &[String],
+) -> Vec<String> {
+    if discovery::online::is_online_path(catalog_prefix) {
+        if catalog_prefix == ["online"] {
+            return vec!["online".into(), "huggingface".into()];
+        }
+        return catalog_prefix.to_vec();
+    }
+    if selected_dir.is_some_and(discovery::online::is_online_path) {
+        return vec!["online".into(), "huggingface".into()];
+    }
+    match focus {
+        Pane::Runtime => Vec::new(),
+        Pane::Model | Pane::Profile | Pane::Options => catalog_prefix.to_vec(),
+    }
+}
+
+fn catalog_entry_in_search_scope(
+    catalog_path: &[String],
+    remote: bool,
+    scope: &[String],
+    online: bool,
+) -> bool {
+    remote == online && catalog_path.starts_with(scope) && catalog_path.len() > scope.len()
 }
 
 /// Resolve the directories to scan for models.
@@ -1802,6 +2357,129 @@ mod tests {
     fn device_hotkeys_stay_at_default_when_no_devices_are_discovered() {
         assert_eq!(cycle_device(&[], "default", 1), "default");
         assert_eq!(cycle_device(&[], "stale-device", -1), "default");
+    }
+
+    #[test]
+    fn local_search_scope_is_the_current_directory_not_the_hovered_child() {
+        let prefix = vec!["models".into(), "team".into()];
+        let hovered = vec!["models".into(), "team".into(), "project".into()];
+        assert_eq!(normalized_search_scope(Pane::Model, Some(&hovered), &prefix), prefix);
+        assert!(normalized_search_scope(Pane::Runtime, Some(&hovered), &prefix).is_empty());
+    }
+
+    #[test]
+    fn online_search_scope_tracks_the_flat_repository_folder() {
+        let online = vec!["online".into()];
+        assert_eq!(
+            normalized_search_scope(Pane::Model, Some(&online), &[]),
+            vec!["online", "huggingface"]
+        );
+
+        let repository = vec!["online".into(), "huggingface".into(), "unsloth/model".into()];
+        assert_eq!(normalized_search_scope(Pane::Profile, None, &repository), repository);
+    }
+
+    #[test]
+    fn online_repository_list_preserves_hub_ranking() {
+        let repository = |name: &str, downloads: u64| {
+            let mut model = crate::domain::stubs::vllm_models().remove(0);
+            model.name = name.into();
+            model.catalog_path = vec!["online".into(), "huggingface".into(), name.into()];
+            model.remote = Some(crate::domain::RemoteModel {
+                repo: name.into(),
+                revision: None,
+                file: None,
+                downloads,
+                likes: 0,
+                gated: false,
+            });
+            model
+        };
+        let ranked = vec![
+            repository("antirez/deepseek-v4-gguf", 5_100_000),
+            repository("HauhauCS/Qwen3.6", 2_600_000),
+        ];
+
+        let children =
+            online_repository_children(&ranked, &["online".into(), "huggingface".into()]).unwrap();
+
+        assert_eq!(
+            children.iter().map(|model| model.name.as_str()).collect::<Vec<_>>(),
+            vec!["antirez/deepseek-v4-gguf", "HauhauCS/Qwen3.6"]
+        );
+    }
+
+    #[test]
+    fn online_artifacts_are_sorted_by_size_ascending() {
+        let artifact = |name: &str, size_bytes: u64| {
+            let mut model = crate::domain::stubs::vllm_models().remove(0);
+            model.name = name.into();
+            model.size_bytes = size_bytes;
+            model.catalog_path =
+                vec!["online".into(), "huggingface".into(), "owner/repo".into(), name.into()];
+            model.remote = Some(crate::domain::RemoteModel {
+                repo: "owner/repo".into(),
+                revision: None,
+                file: Some(name.into()),
+                downloads: 0,
+                likes: 0,
+                gated: false,
+            });
+            model
+        };
+        let models = vec![
+            artifact("Q8_0.gguf", 40_000),
+            artifact("Q4_K_XL.gguf", 20_800),
+            artifact("Q4_K_M.gguf", 20_600),
+        ];
+
+        let children = online_artifact_children(
+            &models,
+            &["online".into(), "huggingface".into(), "owner/repo".into()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            children.iter().map(|model| model.name.as_str()).collect::<Vec<_>>(),
+            vec!["Q4_K_M.gguf", "Q4_K_XL.gguf", "Q8_0.gguf"]
+        );
+    }
+
+    #[test]
+    fn online_artifact_title_shows_repository_architecture_and_max_context() {
+        let mut first = crate::domain::stubs::vllm_models().remove(0);
+        first.architecture = Some("gemma3".into());
+        first.context_length = Some(65_536);
+        let mut second = first.clone();
+        second.context_length = Some(131_072);
+
+        assert_eq!(
+            model_catalog_title(
+                &["online".into(), "huggingface".into(), "DreamFast/gemma-3-12b".into()],
+                &[first, second],
+                discovery::online::Sort::Trending,
+            ),
+            "DreamFast/gemma-3-12b · gemma3 · ctx 131072"
+        );
+    }
+
+    #[test]
+    fn recursive_scope_excludes_siblings_and_the_other_source_kind() {
+        let scope = vec!["models".into(), "team".into()];
+        let nested = vec!["models".into(), "team".into(), "repo".into(), "model".into()];
+        let sibling = vec!["models".into(), "other".into(), "model".into()];
+        let online = vec!["online".into(), "huggingface".into(), "owner/repo".into()];
+
+        assert!(catalog_entry_in_search_scope(&nested, false, &scope, false));
+        assert!(!catalog_entry_in_search_scope(&scope, false, &scope, false));
+        assert!(!catalog_entry_in_search_scope(&sibling, false, &scope, false));
+        assert!(!catalog_entry_in_search_scope(&online, true, &scope, false));
+        assert!(catalog_entry_in_search_scope(
+            &online,
+            true,
+            &["online".into(), "huggingface".into()],
+            true
+        ));
     }
 
     #[test]

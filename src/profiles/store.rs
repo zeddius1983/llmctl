@@ -92,7 +92,7 @@ impl ProfileStore {
         let model_dirs: BTreeMap<String, PathBuf> = models
             .iter()
             .filter(|m| valid_catalog_dir(&m.catalog_dir))
-            .map(|m| (model_key(&m.path), m.catalog_dir.clone()))
+            .map(|m| (m.profile_key(), m.catalog_dir.clone()))
             .collect();
 
         // YAML is authoritative when both formats contain the same profile.
@@ -101,7 +101,7 @@ impl ProfileStore {
                 fallback.remove(&loaded);
             }
             for profile in super::templates::names() {
-                instances.entry(key("llama.cpp", &model_key(&model.path), profile)).or_default();
+                instances.entry(key("llama.cpp", &model.profile_key(), profile)).or_default();
             }
         }
 
@@ -117,14 +117,12 @@ impl ProfileStore {
             if !valid_catalog_dir(&model.catalog_dir) {
                 continue;
             }
-            self.model_dirs.insert(model_key(&model.path), model.catalog_dir.clone());
+            self.model_dirs.insert(model.profile_key(), model.catalog_dir.clone());
             for loaded in load_model_profiles(model, &mut self.instances) {
                 self.fallback.remove(&loaded);
             }
             for profile in super::templates::names() {
-                self.instances
-                    .entry(key("llama.cpp", &model_key(&model.path), profile))
-                    .or_default();
+                self.instances.entry(key("llama.cpp", &model.profile_key(), profile)).or_default();
             }
         }
         self.persist_registered();
@@ -356,7 +354,7 @@ fn load_model_profiles(model: &Model, instances: &mut BTreeMap<Key, Instance>) -
             .and_then(|bytes| serde_yaml::from_slice::<ProfileFile>(&bytes).ok())
         {
             Some(file) if file.schema == 1 => {
-                let entry = key("llama.cpp", &model_key(&model.path), &file.name);
+                let entry = key("llama.cpp", &model.profile_key(), &file.name);
                 instances.insert(
                     entry.clone(),
                     Instance { values: file.values, favorite: file.favorite, custom: file.custom },
@@ -402,6 +400,7 @@ fn key(runtime: &str, model: &str, profile: &str) -> Key {
 }
 
 /// Convenience for callers that have a model path.
+#[cfg(test)]
 pub fn model_key(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -443,6 +442,7 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
+            remote: None,
         };
         let store = ProfileStore::load(legacy.clone(), &[model]);
         assert_eq!(
@@ -475,6 +475,7 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
+            remote: None,
         };
         let mut store = ProfileStore::load(legacy.clone(), &[model]);
         store.set_value(

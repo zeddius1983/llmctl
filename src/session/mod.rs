@@ -110,6 +110,7 @@ pub struct LaunchRequest {
     pub binary: String,
     pub model: String,
     pub model_path: String,
+    pub hf_repo: Option<String>,
     pub profile: String,
     pub host: String,
     pub port: u16,
@@ -169,7 +170,10 @@ impl SessionManager {
         if let Some(opt) = options.iter_mut().find(|o| o.key == "port") {
             opt.value = port.to_string();
         }
-        let command = Command::build(&req.binary, &req.model_path, &options);
+        let command = match &req.hf_repo {
+            Some(repo) => Command::build_huggingface(&req.binary, repo, &req.model_path, &options),
+            None => Command::build(&req.binary, &req.model_path, &options),
+        };
 
         let id = next_id();
         let log_file = supervisor::log_path(&self.log_dir, &id);
@@ -490,6 +494,7 @@ mod tests {
             binary: server.display().to_string(),
             model: "fake.gguf".into(),
             model_path: "/models/fake.gguf".into(),
+            hf_repo: None,
             profile: "Default".into(),
             host: "127.0.0.1".into(),
             port: 18900,

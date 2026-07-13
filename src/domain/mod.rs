@@ -45,6 +45,24 @@ pub struct Model {
     /// Last-modified time, seconds since the Unix epoch (cache invalidation).
     pub modified: Option<u64>,
     pub has_chat_template: bool,
+    /// Hugging Face identity for a lazily-discovered online entry. A missing
+    /// `file` represents a repository directory; a file makes this a
+    /// launchable remote GGUF leaf even before it has a local cache path.
+    #[serde(default)]
+    pub remote: Option<RemoteModel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteModel {
+    pub repo: String,
+    pub revision: Option<String>,
+    pub file: Option<String>,
+    #[serde(default)]
+    pub downloads: u64,
+    #[serde(default)]
+    pub likes: u64,
+    #[serde(default)]
+    pub gated: bool,
 }
 
 /// A reusable launch configuration.
@@ -83,10 +101,23 @@ impl Model {
     /// Synthetic catalog directories have no launchable source path.
     pub fn is_catalog_dir(&self) -> bool {
         self.path.as_os_str().is_empty()
+            && self.remote.as_ref().and_then(|remote| remote.file.as_ref()).is_none()
     }
 
     pub fn is_model(&self) -> bool {
         !self.is_catalog_dir()
+    }
+
+    /// Stable persistence identity used before and after an online model is
+    /// downloaded into the Hugging Face cache.
+    pub fn profile_key(&self) -> String {
+        match &self.remote {
+            Some(remote) => match &remote.file {
+                Some(file) => format!("hf:{}/{}", remote.repo, file),
+                None => format!("hf:{}", remote.repo),
+            },
+            None => self.path.to_string_lossy().into_owned(),
+        }
     }
 
     pub fn display_label(&self) -> &str {
@@ -169,6 +200,7 @@ pub mod stubs {
             context_length: None,
             modified: None,
             has_chat_template: true,
+            remote: None,
         };
         vec![
             model(
