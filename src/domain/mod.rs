@@ -73,6 +73,10 @@ pub struct RemoteModel {
 pub struct RemoteBlob {
     pub oid: String,
     pub size_bytes: u64,
+    /// Repository-relative filename for this blob. Required when llmctl
+    /// downloads split GGUF artifacts directly into the Hub cache.
+    #[serde(default)]
+    pub file: String,
 }
 
 /// A reusable launch configuration.

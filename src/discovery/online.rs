@@ -1,7 +1,9 @@
 //! Lazy Hugging Face catalog discovery backed by the managed model tree.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -12,6 +14,7 @@ use crate::domain::{Model, RemoteBlob, RemoteModel};
 
 const API: &str = "https://huggingface.co/api/models";
 const SOURCE: [&str; 2] = ["online", "huggingface"];
+const DOWNLOAD_SCHEMA: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -59,6 +62,20 @@ pub struct Response {
     pub epoch: u64,
     pub request: Request,
     pub result: Result<Vec<Model>, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadJobRecord {
+    schema: u8,
+    pub model_id: String,
+    pub model: String,
+    pub remote: RemoteModel,
+}
+
+impl DownloadJobRecord {
+    pub fn new(model_id: String, model: String, remote: RemoteModel) -> Self {
+        Self { schema: DOWNLOAD_SCHEMA, model_id, model, remote }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,7 +195,14 @@ pub fn clear_cached_layout(root: &Path) -> Result<()> {
     if !online.exists() {
         return Ok(());
     }
-    for entry in walkdir::WalkDir::new(&online).into_iter().filter_map(|entry| entry.ok()) {
+    for entry in walkdir::WalkDir::new(&online)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !matches!(entry.file_name().to_str(), Some(".downloads" | "profiles"))
+        })
+        .filter_map(|entry| entry.ok())
+    {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy();
         let generated = matches!(
@@ -321,6 +345,15 @@ fn fetch_repository(root: &Path, repo: &str) -> Result<()> {
 }
 
 fn artifacts(root: &Path, detail: &RepositoryDetail) -> Vec<Model> {
+    let cache = hugging_face_cache();
+    artifacts_with_cache(root, detail, cache.as_deref())
+}
+
+fn artifacts_with_cache(
+    root: &Path,
+    detail: &RepositoryDetail,
+    cache: Option<&Path>,
+) -> Vec<Model> {
     let shard = Regex::new(r"(?i)-([0-9]{5})-of-([0-9]{5})\.gguf$").unwrap();
     let mut result = Vec::new();
     for file in &detail.siblings {
@@ -356,13 +389,30 @@ fn artifacts(root: &Path, detail: &RepositoryDetail) -> Vec<Model> {
             .iter()
             .filter_map(|file| {
                 let lfs = file.lfs.as_ref()?;
-                Some(RemoteBlob { oid: lfs.oid.clone()?, size_bytes: file.bytes() })
+                Some(RemoteBlob {
+                    oid: lfs.oid.clone()?,
+                    size_bytes: file.bytes(),
+                    file: file.rfilename.clone(),
+                })
             })
             .collect();
         let leaf = sanitize(&display);
         let catalog_dir = repository_dir(root, &detail.repository.id).join(&leaf);
         let _ = fs::create_dir_all(catalog_dir.join("profiles"));
-        let local_path = cached_file(&detail.repository.id, &file.rfilename).unwrap_or_default();
+        let cached_paths = files
+            .iter()
+            .map(|candidate| {
+                cache.and_then(|hub| {
+                    cached_file_in(hub, &detail.repository.id, &candidate.rfilename)
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default();
+        let local_path = (cached_paths.len() == files.len())
+            .then(|| cached_paths.first().cloned())
+            .flatten()
+            .unwrap_or_default();
+        let shard_paths = if local_path.as_os_str().is_empty() { Vec::new() } else { cached_paths };
         let manifest = ArtifactManifest {
             schema: 1,
             id: format!("hf:{}/{}", detail.repository.id, file.rfilename),
@@ -383,7 +433,7 @@ fn artifacts(root: &Path, detail: &RepositoryDetail) -> Vec<Model> {
             id: format!("hf:{}/{}", detail.repository.id, file.rfilename),
             name: display,
             path: local_path,
-            shard_paths: Vec::new(),
+            shard_paths,
             catalog_path: vec![
                 SOURCE[0].into(),
                 SOURCE[1].into(),
@@ -461,6 +511,10 @@ fn directory(path: &[&str]) -> Model {
 
 fn cached_file(repo: &str, file: &str) -> Option<PathBuf> {
     let hub = hugging_face_cache()?;
+    cached_file_in(&hub, repo, file)
+}
+
+fn cached_file_in(hub: &Path, repo: &str, file: &str) -> Option<PathBuf> {
     let repo_dir = hub.join(format!("models--{}", repo.replace('/', "--")));
     let revision = fs::read_to_string(repo_dir.join("refs/main")).ok()?;
     let path = repo_dir.join("snapshots").join(revision.trim()).join(file);
@@ -483,6 +537,299 @@ fn hugging_face_cache() -> Option<PathBuf> {
 /// transferring and after it has completed.
 pub fn cache_blob_paths(repo: &str, oid: &str) -> Option<(PathBuf, PathBuf)> {
     cache_blob_paths_in(&hugging_face_cache()?, repo, oid)
+}
+
+pub fn load_download_records(root: &Path) -> Vec<DownloadJobRecord> {
+    let Ok(entries) = fs::read_dir(download_records_dir(root)) else {
+        return Vec::new();
+    };
+    let mut paths = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let record = fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<DownloadJobRecord>(&bytes).ok());
+            match record {
+                Some(record) if record.schema == DOWNLOAD_SCHEMA => Some(record),
+                _ => {
+                    tracing::warn!(path = %path.display(), "ignoring invalid download record");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+pub fn save_download_record(root: &Path, record: &DownloadJobRecord) -> Result<()> {
+    fs::create_dir_all(download_records_dir(root)).context("creating download record directory")?;
+    write_json(&download_record_path(root, &record.model_id), record)
+}
+
+pub fn delete_download_record(root: &Path, model_id: &str) -> Result<()> {
+    let path = download_record_path(root, model_id);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+fn download_records_dir(root: &Path) -> PathBuf {
+    root.join(SOURCE[0]).join(SOURCE[1]).join(".downloads")
+}
+
+fn download_record_path(root: &Path, model_id: &str) -> PathBuf {
+    download_records_dir(root).join(format!("{:016x}.json", stable_hash(model_id.as_bytes())))
+}
+
+fn stable_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+/// Download one online GGUF artifact (including every shard) into the standard
+/// Hugging Face cache. Existing partial blobs are resumed when the server
+/// accepts byte ranges. `progress` receives aggregate downloaded and expected
+/// bytes often enough for the TUI without flooding its event channel.
+pub enum DownloadResult {
+    Downloaded(PathBuf),
+    Cancelled,
+}
+
+pub fn download_model(
+    remote: &RemoteModel,
+    cancelled: &AtomicBool,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<DownloadResult> {
+    let primary = remote.file.as_deref().context("Hub artifact has no filename")?;
+    if remote.blobs.is_empty() {
+        anyhow::bail!("Hub artifact has no downloadable blob metadata; refresh its repository");
+    }
+    if remote.blobs.iter().any(|blob| blob.file.is_empty()) {
+        anyhow::bail!("Hub artifact has incomplete shard metadata; refresh its repository");
+    }
+    let total = remote.blobs.iter().map(|blob| blob.size_bytes).sum::<u64>();
+    if total == 0 {
+        anyhow::bail!("Hub artifact reports an unknown download size");
+    }
+
+    progress(cached_downloaded_bytes(remote), total);
+    for blob in &remote.blobs {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(DownloadResult::Cancelled);
+        }
+        let (incomplete, complete) = cache_blob_paths(&remote.repo, &blob.oid)
+            .context("Hugging Face cache directory is unavailable")?;
+        if complete.metadata().is_ok_and(|metadata| metadata.len() == blob.size_bytes) {
+            materialize_snapshot_file(remote, &blob.file, &complete)?;
+            continue;
+        }
+        if let Some(parent) = incomplete.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating cache directory {}", parent.display()))?;
+        }
+        if incomplete.metadata().is_ok_and(|metadata| metadata.len() == blob.size_bytes) {
+            fs::rename(&incomplete, &complete)
+                .with_context(|| format!("completing cached blob {}", complete.display()))?;
+            materialize_snapshot_file(remote, &blob.file, &complete)?;
+            progress(cached_downloaded_bytes(remote), total);
+            continue;
+        }
+
+        if !download_blob(remote, blob, &incomplete, cancelled, |_, _| {
+            progress(cached_downloaded_bytes(remote), total)
+        })? {
+            return Ok(DownloadResult::Cancelled);
+        }
+        fs::rename(&incomplete, &complete)
+            .with_context(|| format!("completing cached blob {}", complete.display()))?;
+        materialize_snapshot_file(remote, &blob.file, &complete)?;
+        progress(cached_downloaded_bytes(remote), total);
+    }
+
+    cached_file(&remote.repo, primary)
+        .map(DownloadResult::Downloaded)
+        .context("download completed but cache link is unavailable")
+}
+
+fn download_blob(
+    remote: &RemoteModel,
+    blob: &RemoteBlob,
+    incomplete: &Path,
+    cancelled: &AtomicBool,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<bool> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
+    let existing = incomplete.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let revision = remote.revision.as_deref().unwrap_or("main");
+    let url = resolve_url(&remote.repo, revision, &blob.file);
+    let mut request = agent().get(&url);
+    if existing > 0 {
+        request = request.set("Range", &format!("bytes={existing}-"));
+    }
+    if let Ok(token) = std::env::var("HF_TOKEN") {
+        request = request.set("Authorization", &format!("Bearer {token}"));
+    }
+    let response = request
+        .call()
+        .with_context(|| format!("downloading hf://{}/{}", remote.repo, blob.file))?;
+    let resumed = existing > 0 && response.status() == 206;
+    let mut options = OpenOptions::new();
+    options.create(true).write(true);
+    if resumed {
+        options.append(true);
+    } else {
+        options.truncate(true);
+    }
+    let mut output = options
+        .open(incomplete)
+        .with_context(|| format!("opening partial download {}", incomplete.display()))?;
+    let mut reader = response.into_reader();
+    let mut downloaded = if resumed { existing } else { 0 };
+    let mut reported = downloaded;
+    let mut buffer = [0_u8; 256 * 1024];
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            output.flush().context("flushing cancelled Hugging Face download")?;
+            return Ok(false);
+        }
+        let read = reader.read(&mut buffer).context("reading Hugging Face response")?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read]).context("writing Hugging Face cache blob")?;
+        downloaded = downloaded.saturating_add(read as u64);
+        if downloaded.saturating_sub(reported) >= 8 * 1024 * 1024 {
+            progress(downloaded.min(blob.size_bytes), blob.size_bytes);
+            reported = downloaded;
+        }
+    }
+    output.flush().context("flushing Hugging Face cache blob")?;
+    if downloaded != blob.size_bytes {
+        anyhow::bail!(
+            "incomplete Hugging Face download for {}: received {} of {} bytes",
+            blob.file,
+            downloaded,
+            blob.size_bytes
+        );
+    }
+    progress(downloaded, blob.size_bytes);
+    Ok(true)
+}
+
+pub fn cached_downloaded_bytes(remote: &RemoteModel) -> u64 {
+    remote
+        .blobs
+        .iter()
+        .map(|blob| {
+            let Some((incomplete, complete)) = cache_blob_paths(&remote.repo, &blob.oid) else {
+                return 0;
+            };
+            if complete.metadata().is_ok_and(|metadata| metadata.len() == blob.size_bytes) {
+                blob.size_bytes
+            } else {
+                incomplete
+                    .metadata()
+                    .map(|metadata| metadata.len().min(blob.size_bytes))
+                    .unwrap_or(0)
+            }
+        })
+        .sum()
+}
+
+/// Finish cache bookkeeping without network access when every expected blob is
+/// already present (including a fully-written partial file left by a crash).
+pub fn finalize_cached_download(remote: &RemoteModel) -> Result<PathBuf> {
+    let primary = remote.file.as_deref().context("Hub artifact has no filename")?;
+    if remote.blobs.is_empty() {
+        anyhow::bail!("Hub artifact has no blob metadata");
+    }
+    for blob in &remote.blobs {
+        let (incomplete, complete) = cache_blob_paths(&remote.repo, &blob.oid)
+            .context("Hugging Face cache directory is unavailable")?;
+        if !complete.metadata().is_ok_and(|metadata| metadata.len() == blob.size_bytes) {
+            if incomplete.metadata().is_ok_and(|metadata| metadata.len() == blob.size_bytes) {
+                fs::rename(&incomplete, &complete)
+                    .with_context(|| format!("completing cached blob {}", complete.display()))?;
+            } else {
+                anyhow::bail!("download is still incomplete");
+            }
+        }
+        materialize_snapshot_file(remote, &blob.file, &complete)?;
+    }
+    cached_file(&remote.repo, primary).context("completed cache link is unavailable")
+}
+
+fn materialize_snapshot_file(remote: &RemoteModel, file: &str, blob: &Path) -> Result<PathBuf> {
+    let hub = hugging_face_cache().context("Hugging Face cache directory is unavailable")?;
+    let revision = remote.revision.as_deref().unwrap_or("main");
+    let repo = hub.join(format!("models--{}", remote.repo.replace('/', "--")));
+    let reference = repo.join("refs/main");
+    if let Some(parent) = reference.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&reference, revision)
+        .with_context(|| format!("writing Hugging Face reference {}", reference.display()))?;
+
+    let snapshot = repo.join("snapshots").join(revision).join(file);
+    if let Some(parent) = snapshot.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    reconcile_cache_link(&snapshot, blob)?;
+    Ok(snapshot)
+}
+
+#[cfg(unix)]
+fn reconcile_cache_link(link: &Path, target: &Path) -> Result<()> {
+    if fs::read_link(link).is_ok_and(|current| current == target) {
+        return Ok(());
+    }
+    if link.is_file() {
+        return Ok(());
+    }
+    if link.is_symlink() {
+        fs::remove_file(link)
+            .with_context(|| format!("replacing cache link {}", link.display()))?;
+    }
+    std::os::unix::fs::symlink(target, link)
+        .with_context(|| format!("linking cached model {}", link.display()))
+}
+
+#[cfg(not(unix))]
+fn reconcile_cache_link(link: &Path, target: &Path) -> Result<()> {
+    fs::copy(target, link)
+        .map(|_| ())
+        .with_context(|| format!("copying cached model {}", link.display()))
+}
+
+fn resolve_url(repo: &str, revision: &str, file: &str) -> String {
+    format!(
+        "https://huggingface.co/{}/resolve/{}/{}",
+        encode_url_path(repo),
+        encode_url_path(revision),
+        encode_url_path(file)
+    )
+}
+
+fn encode_url_path(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 fn cache_blob_paths_in(hub: &Path, repo: &str, oid: &str) -> Option<(PathBuf, PathBuf)> {
@@ -634,6 +981,34 @@ mod tests {
     }
 
     #[test]
+    fn resolve_url_preserves_paths_and_encodes_unsafe_bytes() {
+        assert_eq!(
+            resolve_url("owner/model", "main", "nested/model Q4_K_M.gguf"),
+            "https://huggingface.co/owner/model/resolve/main/nested/model%20Q4_K_M.gguf"
+        );
+    }
+
+    #[test]
+    fn download_honors_cancellation_before_starting_network_io() {
+        let remote = RemoteModel {
+            repo: "owner/cancel-test".into(),
+            revision: Some("abc".into()),
+            file: Some("model.gguf".into()),
+            blobs: vec![RemoteBlob {
+                oid: "ff".repeat(32),
+                size_bytes: 1_000,
+                file: "model.gguf".into(),
+            }],
+            downloads: 0,
+            likes: 0,
+            gated: false,
+        };
+        let cancelled = AtomicBool::new(true);
+        let result = download_model(&remote, &cancelled, |_, _| {}).unwrap();
+        assert!(matches!(result, DownloadResult::Cancelled));
+    }
+
+    #[test]
     fn sort_cycles_and_uses_hub_sort_names() {
         assert_eq!(Sort::Trending.next(), Sort::Popular);
         assert_eq!(Sort::Popular.next(), Sort::Downloads);
@@ -650,8 +1025,11 @@ mod tests {
     fn clearing_layout_preserves_profiles_and_records_cached_sort() {
         let root = std::env::temp_dir().join(format!("llmctl-online-clear-{}", now()));
         let artifact = root.join("online/huggingface/owner/repo/model");
+        let download_record = root.join("online/huggingface/.downloads/job.json");
         fs::create_dir_all(artifact.join("profiles")).unwrap();
+        fs::create_dir_all(download_record.parent().unwrap()).unwrap();
         fs::write(artifact.join("profiles/Chat.yml"), b"profile").unwrap();
+        fs::write(&download_record, b"download").unwrap();
         fs::write(artifact.join(".llmctl-online.yml"), b"generated").unwrap();
         fs::write(root.join("online/huggingface/owner/repo/.repository.json"), b"generated")
             .unwrap();
@@ -666,9 +1044,49 @@ mod tests {
 
         clear_cached_layout(&root).unwrap();
         assert!(artifact.join("profiles/Chat.yml").is_file());
+        assert_eq!(fs::read(download_record).unwrap(), b"download");
         assert!(!artifact.join(".llmctl-online.yml").exists());
         assert!(!root.join("online/huggingface/owner/repo/.repository.json").exists());
         assert!(!repository_list_path(&root).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn download_records_round_trip_in_managed_online_storage() {
+        let root = std::env::temp_dir().join(format!("llmctl-download-record-{}", now()));
+        let remote = RemoteModel {
+            repo: "owner/repo".into(),
+            revision: Some("revision".into()),
+            file: Some("model-Q4_K_M.gguf".into()),
+            blobs: vec![RemoteBlob {
+                oid: "ab".repeat(32),
+                size_bytes: 42,
+                file: "model-Q4_K_M.gguf".into(),
+            }],
+            downloads: 10,
+            likes: 2,
+            gated: false,
+        };
+        let record = DownloadJobRecord::new(
+            "online:huggingface:owner/repo:model-Q4_K_M.gguf".into(),
+            "owner/repo/model-Q4_K_M.gguf".into(),
+            remote,
+        );
+
+        save_download_record(&root, &record).unwrap();
+        let path = download_record_path(&root, &record.model_id);
+        assert_eq!(path.parent(), Some(download_records_dir(&root).as_path()));
+        assert!(path.is_file());
+
+        let loaded = load_download_records(&root);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].model_id, record.model_id);
+        assert_eq!(loaded[0].model, record.model);
+        assert_eq!(loaded[0].remote.repo, "owner/repo");
+        assert_eq!(loaded[0].remote.blobs[0].size_bytes, 42);
+
+        delete_download_record(&root, &record.model_id).unwrap();
+        assert!(load_download_records(&root).is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -761,6 +1179,53 @@ mod tests {
         assert_eq!(models[0].profile_key(), "hf:owner/repo/model-Q4_K_M-00001-of-00002.gguf");
         assert!(models[0].catalog_dir.join("profiles").is_dir());
         assert!(models[0].catalog_dir.join(".llmctl-online.yml").is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn split_artifact_is_cached_only_after_every_shard_exists() {
+        let root = std::env::temp_dir().join(format!("llmctl-online-split-{}", now()));
+        let hub = root.join("hub");
+        let detail = RepositoryDetail {
+            schema: 1,
+            fetched_at: 42,
+            repository: Repository {
+                id: "owner/repo".into(),
+                downloads: 0,
+                likes: 0,
+                sha: Some("abc".into()),
+                gated: false,
+            },
+            siblings: vec![
+                Sibling {
+                    rfilename: "model-00001-of-00002.gguf".into(),
+                    size: Some(10),
+                    lfs: Some(Lfs { oid: Some("aa".repeat(32)), size: Some(10) }),
+                },
+                Sibling {
+                    rfilename: "model-00002-of-00002.gguf".into(),
+                    size: Some(11),
+                    lfs: Some(Lfs { oid: Some("bb".repeat(32)), size: Some(11) }),
+                },
+            ],
+            gguf: None,
+        };
+        let repo = hub.join("models--owner--repo");
+        fs::create_dir_all(repo.join("refs")).unwrap();
+        fs::write(repo.join("refs/main"), "abc").unwrap();
+        let first = repo.join("snapshots/abc/model-00001-of-00002.gguf");
+        let second = repo.join("snapshots/abc/model-00002-of-00002.gguf");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::write(&first, vec![0; 10]).unwrap();
+
+        let partial = artifacts_with_cache(&root, &detail, Some(&hub));
+        assert!(partial[0].path.as_os_str().is_empty());
+        assert!(partial[0].shard_paths.is_empty());
+
+        fs::write(&second, vec![0; 11]).unwrap();
+        let complete = artifacts_with_cache(&root, &detail, Some(&hub));
+        assert_eq!(complete[0].path, first);
+        assert_eq!(complete[0].shard_paths, vec![first, second]);
         let _ = fs::remove_dir_all(root);
     }
 

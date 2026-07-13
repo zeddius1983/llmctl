@@ -128,12 +128,15 @@ repository file/metadata fetches; debounced `/` Hub search; split-shard
 grouping; remote profile identity; `HF_TOKEN`-safe `--hf-repo`/`--hf-file`
 launch; clean-layout `F5`; and automatic linking to the standard Hugging Face
 cache after download. Sessions track known LFS blobs in that cache and display
-`Downloading (N%)` before the model-loading `Starting` phase.
+`Downloading (N%)` before the model-loading `Starting` phase. Uncached GGUF
+artifacts can also be downloaded directly with `d`, with resumable aggregate
+shard progress displayed as concurrent jobs in a Downloads pane below Sessions;
+selected downloads support cancellation and resume. Incomplete download jobs
+survive restart as explicitly resumable `Interrupted` rows.
 
 ## Next (post-v0.2.1)
 
 ### Online Hugging Face follow-ups
-- [ ] Download-only action
 - [ ] Recent sorting and size/quantization filters
 
 ### Phase 4 — Log search & startup-failure classification

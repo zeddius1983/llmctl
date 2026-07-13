@@ -19,7 +19,9 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
 
-use crate::app::{App, Message, ModelSearch, Pane, Prompt, Screen, Selector};
+use crate::app::{
+    App, Message, ModelDownload, ModelDownloadStatus, ModelSearch, Pane, Prompt, Screen, Selector,
+};
 use crate::domain::human_size;
 use crate::session::{Session, SessionStatus, format_uptime};
 
@@ -340,6 +342,9 @@ fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
             if app.online_view_active() {
                 keys.push(("s", "sort"));
             }
+            if app.download_available() {
+                keys.push(("d", "download"));
+            }
             if app.benchmark_available() {
                 keys.push(("b", "benchmark"));
             }
@@ -438,6 +443,14 @@ fn download_size(bytes: u64) -> String {
     if unit == 0 { format!("{bytes} B") } else { format!("{size:.1} {}", UNITS[unit]) }
 }
 
+fn download_progress(downloaded: u64, total: u64, percent: u8) -> String {
+    format!("{} / {} ({percent}%)", download_size(downloaded), download_size(total))
+}
+
+fn truncate_download_name(name: &str, metadata: &str, row_width: usize) -> String {
+    truncate_left(name, row_width.saturating_sub(metadata.chars().count()))
+}
+
 // --- Session Manager screen ------------------------------------------------
 
 /// Colour for a session status indicator.
@@ -461,39 +474,48 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
     let title = Line::from(vec![
         Span::styled(format!(" {ICON_SESSION}  Sessions "), Style::default().fg(ACCENT).bold()),
         Span::styled(
-            format!("({} running)", app.sessions.sessions.len()),
+            format!("({} jobs)", app.async_job_count()),
             Style::default().fg(Color::DarkGray),
         ),
     ]);
     frame.render_widget(Paragraph::new(title), header);
 
-    if app.sessions.sessions.is_empty() {
-        let hint = Paragraph::new(Text::from(vec![
-            Line::raw(""),
-            Line::from("No sessions yet.".dim()),
-            Line::from("Pick a model + profile in the browser and press 's' to launch one.".dim()),
-        ]))
-        .block(pane_block("Sessions", true));
-        frame.render_widget(hint, body);
-    } else {
-        let [list, detail] =
-            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
-                .areas(body);
-        render_session_list(frame, list, app);
-        render_session_detail(frame, detail, app);
-    }
+    let [jobs, detail] =
+        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(body);
+    let [sessions, downloads] =
+        Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(jobs);
+    render_session_list(frame, sessions, app);
+    render_download_list(frame, downloads, app);
+    render_session_detail(frame, detail, app);
 
-    let keys = [
-        ("x", "stop"),
-        ("K", "kill"),
-        ("R", "restart"),
-        ("L", "logs"),
-        ("c", "copy url"),
-        ("y", "yank cmd"),
-        ("d", "remove"),
-        ("Esc", "back"),
-        ("q", "quit"),
-    ];
+    let keys = if let Some(download) = app.selected_model_download() {
+        match &download.status {
+            ModelDownloadStatus::Downloading => {
+                vec![("x", "cancel"), ("Esc", "back"), ("q", "quit")]
+            }
+            ModelDownloadStatus::Cancelling => vec![("Esc", "back"), ("q", "quit")],
+            ModelDownloadStatus::Cancelled
+            | ModelDownloadStatus::Interrupted
+            | ModelDownloadStatus::Failed(_) => {
+                vec![("R", "resume"), ("d", "remove"), ("Esc", "back"), ("q", "quit")]
+            }
+            ModelDownloadStatus::Downloaded(_) => {
+                vec![("d", "remove"), ("Esc", "back"), ("q", "quit")]
+            }
+        }
+    } else {
+        vec![
+            ("x", "stop"),
+            ("K", "kill"),
+            ("R", "restart"),
+            ("L", "logs"),
+            ("c", "copy url"),
+            ("y", "yank cmd"),
+            ("d", "remove"),
+            ("Esc", "back"),
+            ("q", "quit"),
+        ]
+    };
     render_keyline(frame, footer, &keys);
 }
 
@@ -515,25 +537,102 @@ fn render_session_list(frame: &mut Frame, area: Rect, app: &mut App) {
             ]))
         })
         .collect();
-
+    let focused = app.selected_server_session().is_some() || app.async_job_count() == 0;
+    let mut state = ListState::default();
+    state.select(app.session_sel.selected().filter(|index| *index < app.sessions.sessions.len()));
     let list = List::new(items)
-        .block(pane_block("Sessions", true))
+        .block(pane_block("Sessions", focused))
         .highlight_style(Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD))
         .highlight_symbol("▌ ");
-    frame.render_stateful_widget(list, area, &mut app.session_sel);
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_download_list(frame: &mut Frame, area: Rect, app: &App) {
+    // Borders consume two columns and the selected-row marker consumes two
+    // more. Reserve the progress suffix, then retain the filename tail.
+    let row_width = area.width.saturating_sub(4) as usize;
+    let items = app.model_downloads.iter().map(|download| {
+        let suffix = match &download.status {
+            ModelDownloadStatus::Downloading => "",
+            ModelDownloadStatus::Cancelling => "  cancelling",
+            ModelDownloadStatus::Downloaded(_) => "  downloaded",
+            ModelDownloadStatus::Cancelled => "  cancelled",
+            ModelDownloadStatus::Interrupted => "  interrupted",
+            ModelDownloadStatus::Failed(_) => "  failed",
+        };
+        let metadata = format!(
+            " ⇣ {}{suffix}",
+            download_progress(download.downloaded_bytes, download.total_bytes, download.percent())
+        );
+        let name = truncate_download_name(&download.model, &metadata, row_width);
+        ListItem::new(Line::from(vec![
+            Span::raw(name),
+            Span::styled(metadata, Style::default().fg(Color::DarkGray)),
+        ]))
+    });
+
+    let selected = app
+        .session_sel
+        .selected()
+        .and_then(|index| index.checked_sub(app.sessions.sessions.len()))
+        .filter(|index| *index < app.model_downloads.len());
+    let mut state = ListState::default();
+    state.select(selected);
+    let list = List::new(items)
+        .block(pane_block("Downloads", selected.is_some()))
+        .highlight_style(Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▌ ");
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn render_session_detail(frame: &mut Frame, area: Rect, app: &App) {
     let block = pane_block("Detail", false);
-    let Some(session) = app.session_sel.selected().and_then(|i| app.sessions.sessions.get(i))
-    else {
+    let text = if let Some(session) = app.selected_server_session() {
+        session_detail_lines(session)
+    } else if let Some(download) = app.selected_model_download() {
+        download_detail_lines(download)
+    } else {
         frame.render_widget(block, area);
         return;
     };
-    frame.render_widget(
-        Paragraph::new(session_detail_lines(session)).block(block).wrap(Wrap { trim: false }),
-        area,
-    );
+    frame.render_widget(Paragraph::new(text).block(block).wrap(Wrap { trim: false }), area);
+}
+
+fn download_detail_lines(download: &ModelDownload) -> Text<'static> {
+    let (status, color, detail) = match &download.status {
+        ModelDownloadStatus::Downloading => ("Downloading", Color::Cyan, String::new()),
+        ModelDownloadStatus::Cancelling => (
+            "Cancelling",
+            Color::DarkGray,
+            "Waiting for the transfer worker to preserve its partial file.".into(),
+        ),
+        ModelDownloadStatus::Downloaded(path) => {
+            ("Downloaded", Color::Green, path.display().to_string())
+        }
+        ModelDownloadStatus::Cancelled => {
+            ("Cancelled", Color::DarkGray, "Press R to resume the partial download.".into())
+        }
+        ModelDownloadStatus::Interrupted => (
+            "Interrupted",
+            Color::DarkGray,
+            "The previous llmctl process stopped. Press R to resume the partial download.".into(),
+        ),
+        ModelDownloadStatus::Failed(error) => ("Failed", Color::Red, error.clone()),
+    };
+    Text::from(vec![
+        Line::from(download.model.clone().bold().fg(ACCENT)),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(status.to_string(), Style::default().fg(color)),
+        ]),
+        kv(
+            "Progress",
+            &download_progress(download.downloaded_bytes, download.total_bytes, download.percent()),
+        ),
+        Line::raw(""),
+        Line::from(detail),
+    ])
 }
 
 fn session_detail_lines(session: &Session) -> Text<'static> {
@@ -651,6 +750,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         help_row("g / G", "first / last item"),
         help_row("/", "search models"),
         help_row("s", "sort online models"),
+        help_row("d", "download selected online file"),
         Line::raw(""),
         Line::from("Profiles".bold()),
         help_row("a", "create profile"),
@@ -672,8 +772,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
         help_row("b", "benchmark selected model (llama-bench)"),
         help_row("y", "yank command"),
         help_row("t", "session manager"),
-        help_row("x / K", "stop / kill"),
-        help_row("R", "restart"),
+        help_row("x / K", "stop / kill / cancel"),
+        help_row("R", "restart / resume"),
         help_row("L", "view logs"),
         help_row("c", "copy endpoint"),
         Line::raw(""),
@@ -857,7 +957,10 @@ fn center(area: Rect, horizontal: Constraint, vertical: Constraint) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{ICON_CLOUD, ICON_DIRECTORY, compact_count, model_artifact_columns, model_icon};
+    use super::{
+        ICON_CLOUD, ICON_DIRECTORY, compact_count, download_progress, model_artifact_columns,
+        model_icon, truncate_download_name,
+    };
 
     #[test]
     fn counts_use_compact_repository_badges() {
@@ -865,6 +968,22 @@ mod tests {
         assert_eq!(compact_count(1_200), "1.2k");
         assert_eq!(compact_count(445_400), "445.4k");
         assert_eq!(compact_count(1_250_000), "1.2m");
+    }
+
+    #[test]
+    fn download_progress_is_rendered_on_one_compact_line() {
+        assert_eq!(download_progress(400_000_000, 1_000_000_000, 40), "400.0 MB / 1.0 GB (40%)");
+    }
+
+    #[test]
+    fn download_name_is_truncated_from_the_left_to_preserve_progress() {
+        let name = "HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ2_M.gguf";
+        let metadata = " ⇣ 9.0 GB / 20.0 GB (45%)";
+        let truncated = truncate_download_name(name, metadata, 72);
+
+        assert!(truncated.starts_with('…'));
+        assert!(truncated.ends_with("Aggressive-IQ2_M.gguf"));
+        assert!(truncated.chars().count() + metadata.chars().count() <= 72);
     }
 
     #[test]

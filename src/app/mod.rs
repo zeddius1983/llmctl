@@ -10,6 +10,8 @@ use ratatui::DefaultTerminal;
 use ratatui::widgets::ListState;
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -69,6 +71,82 @@ pub struct ModelSearch {
     result_indices: Vec<usize>,
     pub online: bool,
     pub scope: Vec<String>,
+}
+
+#[derive(Debug)]
+pub enum ModelDownloadStatus {
+    Downloading,
+    Cancelling,
+    Downloaded(PathBuf),
+    Cancelled,
+    Interrupted,
+    Failed(String),
+}
+
+pub struct ModelDownload {
+    id: u64,
+    pub model_id: String,
+    pub model: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub status: ModelDownloadStatus,
+    remote: crate::domain::RemoteModel,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl ModelDownload {
+    pub fn percent(&self) -> u8 {
+        transfer_percent(self.downloaded_bytes, self.total_bytes)
+    }
+}
+
+fn transfer_percent(downloaded_bytes: u64, total_bytes: u64) -> u8 {
+    if total_bytes == 0 {
+        return 0;
+    }
+    ((downloaded_bytes as u128 * 100 / total_bytes as u128).min(100)) as u8
+}
+
+fn restore_model_downloads(models_dir: &std::path::Path) -> (Vec<ModelDownload>, u64) {
+    let mut downloads = Vec::new();
+    let mut next_id = 1_u64;
+    for record in discovery::online::load_download_records(models_dir) {
+        let total_bytes = record.remote.blobs.iter().map(|blob| blob.size_bytes).sum();
+        let downloaded_bytes = discovery::online::cached_downloaded_bytes(&record.remote);
+        if total_bytes > 0
+            && downloaded_bytes >= total_bytes
+            && discovery::online::finalize_cached_download(&record.remote).is_ok()
+        {
+            if let Err(error) =
+                discovery::online::delete_download_record(models_dir, &record.model_id)
+            {
+                tracing::warn!(%error, model = %record.model_id, "failed to remove completed download record");
+            }
+            continue;
+        }
+        let status = if total_bytes == 0 {
+            ModelDownloadStatus::Failed("persisted download has no blob size metadata".into())
+        } else {
+            ModelDownloadStatus::Interrupted
+        };
+        downloads.push(ModelDownload {
+            id: next_id,
+            model_id: record.model_id,
+            model: record.model,
+            downloaded_bytes,
+            total_bytes,
+            status,
+            remote: record.remote,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        next_id = next_id.wrapping_add(1).max(1);
+    }
+    (downloads, next_id)
+}
+
+enum ModelDownloadEvent {
+    Progress { id: u64, downloaded_bytes: u64, total_bytes: u64 },
+    Finished { id: u64, result: std::result::Result<discovery::online::DownloadResult, String> },
 }
 
 struct CatalogRoute {
@@ -260,6 +338,10 @@ pub struct App {
     online_reload_deferred: bool,
     online_restore_models: bool,
     online_search_results: Vec<String>,
+    download_tx: Sender<ModelDownloadEvent>,
+    download_rx: Receiver<ModelDownloadEvent>,
+    pub model_downloads: Vec<ModelDownload>,
+    next_download_id: u64,
 }
 
 impl App {
@@ -274,6 +356,7 @@ impl App {
         let mut scanned_models = discovery::scan_models(&model_sources, &model_cache);
         discovery::reconcile(&paths.models_dir, &mut scanned_models);
         let online_sort = discovery::online::cached_sort(&paths.models_dir);
+        let (model_downloads, next_download_id) = restore_model_downloads(&paths.models_dir);
         scanned_models.extend(discovery::online::load_cached(&paths.models_dir));
         let store = ProfileStore::load(paths.state_dir.join("profiles.json"), &scanned_models);
         // Built after discovery's one-shot `Command`s: the supervisor ignores
@@ -281,6 +364,7 @@ impl App {
         let sessions = SessionManager::new(paths.sessions_dir.clone(), paths.log_dir.clone());
 
         let (online_tx, online_rx) = mpsc::channel();
+        let (download_tx, download_rx) = mpsc::channel();
         let mut app = Self {
             config,
             focus: Pane::Runtime,
@@ -321,6 +405,10 @@ impl App {
             online_reload_deferred: false,
             online_restore_models: false,
             online_search_results: Vec::new(),
+            download_tx,
+            download_rx,
+            model_downloads,
+            next_download_id,
         };
         app.sync_session_selection();
         // Derive the whole chain from the initially-selected runtime.
@@ -335,6 +423,7 @@ impl App {
         while !self.should_quit {
             self.poll_online();
             self.poll_online_search();
+            self.poll_model_download();
             if self.last_tick.elapsed() >= Duration::from_secs(1) {
                 self.tick();
             }
@@ -563,13 +652,13 @@ impl App {
     }
 
     pub fn model_pane_title(&self) -> String {
-        model_catalog_title(&self.catalog_prefix, &self.models.items, self.online_sort)
+        model_catalog_title(&self.catalog_prefix, self.online_sort)
     }
 
     pub fn catalog_parent_title(&self) -> String {
         self.catalog_history
             .last()
-            .map(|(models, _, prefix)| model_catalog_title(prefix, models, self.online_sort))
+            .map(|(_, _, prefix)| model_catalog_title(prefix, self.online_sort))
             .unwrap_or_else(|| "Model".into())
     }
 
@@ -577,9 +666,7 @@ impl App {
         self.models
             .selected()
             .filter(|model| model.is_catalog_dir())
-            .map(|model| {
-                model_catalog_title(&model.catalog_path, &self.catalog_preview, self.online_sort)
-            })
+            .map(|model| model_catalog_title(&model.catalog_path, self.online_sort))
             .unwrap_or_else(|| self.model_pane_title())
     }
 
@@ -753,6 +840,9 @@ impl App {
             KeyCode::Char('a') => self.prompt_new_profile(),
             KeyCode::Char('r') => self.prompt_rename_profile(),
             KeyCode::Char('D') => self.prompt_duplicate_profile(),
+            KeyCode::Char('d') if self.focus == Pane::Model && self.download_available() => {
+                self.download_selected_model()
+            }
             KeyCode::Char('d') if self.focus == Pane::Options => self.reset_option_default(),
             KeyCode::Char('d') => self.delete_profile(),
 
@@ -952,17 +1042,17 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => self.move_session(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_session(-1),
             KeyCode::Char('g') | KeyCode::Home => {
-                let any = !self.sessions.sessions.is_empty();
+                let any = self.async_job_count() > 0;
                 self.session_sel.select(any.then_some(0));
             }
             KeyCode::Char('G') | KeyCode::End => {
-                let len = self.sessions.sessions.len();
+                let len = self.async_job_count();
                 self.session_sel.select((len > 0).then_some(len - 1));
             }
-            KeyCode::Char('x') => self.session_action(|m, i| m.stop(i), "stop"),
-            KeyCode::Char('K') => self.session_action(|m, i| m.kill(i), "kill"),
-            KeyCode::Char('R') => self.session_action(|m, i| m.restart(i), "restart"),
-            KeyCode::Char('d') => self.remove_session(),
+            KeyCode::Char('x') => self.stop_async_job(false),
+            KeyCode::Char('K') => self.stop_async_job(true),
+            KeyCode::Char('R') => self.restart_async_job(),
+            KeyCode::Char('d') => self.remove_async_job(),
             KeyCode::Char('c') => self.copy_endpoint(),
             KeyCode::Char('y') => self.yank_session_command(),
             KeyCode::Char('L') | KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
@@ -1020,7 +1110,7 @@ impl App {
 
     /// Keep the session selection cursor within the bounds of the session list.
     fn sync_session_selection(&mut self) {
-        let len = self.sessions.sessions.len();
+        let len = self.async_job_count();
         if len == 0 {
             self.session_sel.select(None);
         } else {
@@ -1030,7 +1120,7 @@ impl App {
     }
 
     fn move_session(&mut self, delta: isize) {
-        let len = self.sessions.sessions.len();
+        let len = self.async_job_count();
         if len == 0 {
             return;
         }
@@ -1164,6 +1254,208 @@ impl App {
         }
     }
 
+    fn download_selected_model(&mut self) {
+        let Some(model) = self.selected_model().cloned() else { return };
+        let Some(remote) = model.remote.clone() else { return };
+        if remote.file.is_none() || !model.path.as_os_str().is_empty() {
+            return;
+        }
+        if remote.gated && std::env::var_os("HF_TOKEN").is_none() {
+            self.message = Some(Message {
+                title: "Cannot download".into(),
+                lines: vec!["This gated model requires HF_TOKEN.".into()],
+            });
+            return;
+        }
+        let total_bytes = remote.blobs.iter().map(|blob| blob.size_bytes).sum();
+        if remote.blobs.is_empty() || total_bytes == 0 {
+            self.message = Some(Message {
+                title: "Cannot download".into(),
+                lines: vec![
+                    "Download metadata is unavailable; press F5 in this repository and retry."
+                        .into(),
+                ],
+            });
+            return;
+        }
+
+        if let Some(index) =
+            self.model_downloads.iter().position(|download| download.model_id == model.id)
+        {
+            if matches!(
+                self.model_downloads[index].status,
+                ModelDownloadStatus::Cancelled
+                    | ModelDownloadStatus::Interrupted
+                    | ModelDownloadStatus::Failed(_)
+            ) {
+                self.resume_model_download(index);
+            }
+            self.screen = Screen::Sessions;
+            self.session_sel.select(Some(self.sessions.sessions.len() + index));
+            return;
+        }
+
+        let id = self.next_download_id();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let display =
+            format!("{}/{}", remote.repo, remote.file.as_deref().unwrap_or(model.name.as_str()));
+        let record = discovery::online::DownloadJobRecord::new(
+            model.id.clone(),
+            display.clone(),
+            remote.clone(),
+        );
+        if let Err(error) = discovery::online::save_download_record(&self.models_dir, &record) {
+            self.message = Some(Message {
+                title: "Cannot download".into(),
+                lines: vec![format!("Cannot persist download state: {error}")],
+            });
+            return;
+        }
+        self.model_downloads.push(ModelDownload {
+            id,
+            model_id: model.id,
+            model: display,
+            downloaded_bytes: 0,
+            total_bytes,
+            status: ModelDownloadStatus::Downloading,
+            remote: remote.clone(),
+            cancelled: cancelled.clone(),
+        });
+        self.screen = Screen::Sessions;
+        self.session_sel
+            .select(Some(self.sessions.sessions.len() + self.model_downloads.len() - 1));
+        self.spawn_model_download(id, remote, cancelled);
+    }
+
+    fn next_download_id(&mut self) -> u64 {
+        let id = self.next_download_id;
+        self.next_download_id = self.next_download_id.wrapping_add(1).max(1);
+        id
+    }
+
+    fn spawn_model_download(
+        &self,
+        id: u64,
+        remote: crate::domain::RemoteModel,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        let tx = self.download_tx.clone();
+        std::thread::spawn(move || {
+            let result = discovery::online::download_model(
+                &remote,
+                &cancelled,
+                |downloaded_bytes, total_bytes| {
+                    let _ =
+                        tx.send(ModelDownloadEvent::Progress { id, downloaded_bytes, total_bytes });
+                },
+            )
+            .map_err(|error| error.to_string());
+            let _ = tx.send(ModelDownloadEvent::Finished { id, result });
+        });
+    }
+
+    fn poll_model_download(&mut self) {
+        let mut refresh_models = false;
+        let mut completed_records = Vec::new();
+        while let Ok(event) = self.download_rx.try_recv() {
+            match event {
+                ModelDownloadEvent::Progress { id, downloaded_bytes, total_bytes } => {
+                    let Some(download) =
+                        self.model_downloads.iter_mut().find(|download| download.id == id)
+                    else {
+                        continue;
+                    };
+                    if !matches!(download.status, ModelDownloadStatus::Downloading) {
+                        continue;
+                    }
+                    download.downloaded_bytes = downloaded_bytes.min(total_bytes);
+                    download.total_bytes = total_bytes;
+                }
+                ModelDownloadEvent::Finished { id, result } => {
+                    let Some(download) =
+                        self.model_downloads.iter_mut().find(|download| download.id == id)
+                    else {
+                        continue;
+                    };
+                    match result {
+                        Ok(discovery::online::DownloadResult::Downloaded(path)) => {
+                            download.downloaded_bytes = download.total_bytes;
+                            download.status = ModelDownloadStatus::Downloaded(path);
+                            completed_records.push(download.model_id.clone());
+                            refresh_models = true;
+                        }
+                        Ok(discovery::online::DownloadResult::Cancelled) => {
+                            download.status = ModelDownloadStatus::Cancelled;
+                        }
+                        Err(_) if download.cancelled.load(Ordering::Relaxed) => {
+                            download.status = ModelDownloadStatus::Cancelled;
+                        }
+                        Err(error) => download.status = ModelDownloadStatus::Failed(error),
+                    }
+                }
+            }
+        }
+        for model_id in completed_records {
+            if let Err(error) =
+                discovery::online::delete_download_record(&self.models_dir, &model_id)
+            {
+                tracing::warn!(%error, model = %model_id, "failed to remove completed download record");
+            }
+        }
+        if refresh_models {
+            self.refresh_downloaded_online_models();
+        }
+    }
+
+    fn refresh_downloaded_online_models(&mut self) {
+        let selected = self.models.selected().map(|model| model.id.clone());
+        self.scanned_models.retain(|model| !discovery::online::is_online_path(&model.catalog_path));
+        self.scanned_models.extend(discovery::online::load_cached(&self.models_dir));
+        self.store.sync_models(&self.scanned_models);
+        if self.runtimes.selected().is_some_and(|runtime| runtime.name == "llama.cpp") {
+            let items = self.catalog_children(&self.catalog_prefix);
+            let index = selected
+                .as_ref()
+                .and_then(|id| items.iter().position(|model| &model.id == id))
+                .unwrap_or(0);
+            self.models.items = items;
+            self.models.state.select((!self.models.items.is_empty()).then_some(index));
+            self.rebuild_below(Pane::Model);
+        }
+    }
+
+    fn resume_model_download(&mut self, index: usize) {
+        let Some(download) = self.model_downloads.get(index) else { return };
+        if matches!(
+            download.status,
+            ModelDownloadStatus::Downloading
+                | ModelDownloadStatus::Cancelling
+                | ModelDownloadStatus::Downloaded(_)
+        ) {
+            return;
+        }
+        let id = self.next_download_id();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let remote = self.model_downloads[index].remote.clone();
+        let record = discovery::online::DownloadJobRecord::new(
+            self.model_downloads[index].model_id.clone(),
+            self.model_downloads[index].model.clone(),
+            remote.clone(),
+        );
+        if let Err(error) = discovery::online::save_download_record(&self.models_dir, &record) {
+            self.message = Some(Message {
+                title: "Cannot resume".into(),
+                lines: vec![format!("Cannot persist download state: {error}")],
+            });
+            return;
+        }
+        let download = &mut self.model_downloads[index];
+        download.id = id;
+        download.status = ModelDownloadStatus::Downloading;
+        download.cancelled = cancelled.clone();
+        self.spawn_model_download(id, remote, cancelled);
+    }
+
     /// Launch an interactive `llama-cli` chat for the current selection in the
     /// foreground (`C`). Server-only flags (host/port) are dropped and
     /// conversation mode is forced; the TUI is suspended while it runs.
@@ -1219,22 +1511,90 @@ impl App {
         self.pending_benchmark = Some(benchmark_argv(bench, &model.path, &self.options.items));
     }
 
-    /// Apply a fallible supervisor action to the selected session.
+    pub fn async_job_count(&self) -> usize {
+        self.sessions.sessions.len() + self.model_downloads.len()
+    }
+
+    fn selected_server_index(&self) -> Option<usize> {
+        self.session_sel.selected().filter(|index| *index < self.sessions.sessions.len())
+    }
+
+    fn selected_download_index(&self) -> Option<usize> {
+        self.session_sel
+            .selected()?
+            .checked_sub(self.sessions.sessions.len())
+            .filter(|index| *index < self.model_downloads.len())
+    }
+
+    pub fn selected_server_session(&self) -> Option<&session::Session> {
+        self.selected_server_index().and_then(|index| self.sessions.sessions.get(index))
+    }
+
+    pub fn selected_model_download(&self) -> Option<&ModelDownload> {
+        self.selected_download_index().and_then(|index| self.model_downloads.get(index))
+    }
+
+    /// Apply a fallible supervisor action to the selected server session.
     fn session_action(&mut self, f: impl Fn(&mut SessionManager, usize) -> Result<()>, verb: &str) {
-        let Some(i) = self.session_sel.selected() else {
-            return;
-        };
+        let Some(i) = self.selected_server_index() else { return };
         if let Err(e) = f(&mut self.sessions, i) {
             self.message =
                 Some(Message { title: format!("Failed to {verb}"), lines: vec![e.to_string()] });
         }
     }
 
-    /// Remove a terminated session record (`d`).
-    fn remove_session(&mut self) {
-        let Some(i) = self.session_sel.selected() else {
+    fn stop_async_job(&mut self, force: bool) {
+        if let Some(index) = self.selected_download_index() {
+            let download = &mut self.model_downloads[index];
+            if matches!(download.status, ModelDownloadStatus::Downloading) {
+                download.cancelled.store(true, Ordering::Relaxed);
+                download.status = ModelDownloadStatus::Cancelling;
+            }
             return;
-        };
+        }
+        if force {
+            self.session_action(|manager, index| manager.kill(index), "kill");
+        } else {
+            self.session_action(|manager, index| manager.stop(index), "stop");
+        }
+    }
+
+    fn restart_async_job(&mut self) {
+        if let Some(index) = self.selected_download_index() {
+            self.resume_model_download(index);
+        } else {
+            self.session_action(|manager, index| manager.restart(index), "restart");
+        }
+    }
+
+    /// Remove a terminated server or inactive download record (`d`).
+    fn remove_async_job(&mut self) {
+        if let Some(index) = self.selected_download_index() {
+            if matches!(
+                self.model_downloads[index].status,
+                ModelDownloadStatus::Downloading | ModelDownloadStatus::Cancelling
+            ) {
+                self.message = Some(Message {
+                    title: "Cannot remove".into(),
+                    lines: vec!["Cancel the download before removing it.".into()],
+                });
+                return;
+            }
+            let model_id = self.model_downloads[index].model_id.clone();
+            if let Err(error) =
+                discovery::online::delete_download_record(&self.models_dir, &model_id)
+            {
+                self.message = Some(Message {
+                    title: "Cannot remove".into(),
+                    lines: vec![format!("Cannot remove persisted download state: {error}")],
+                });
+                return;
+            }
+            self.model_downloads.remove(index);
+            self.sync_session_selection();
+            return;
+        }
+        let Some(i) = self.selected_server_index() else { return };
         if self.sessions.remove(i) {
             self.sync_session_selection();
         } else {
@@ -1249,9 +1609,7 @@ impl App {
 
     /// Copy the selected session's endpoint URL to the clipboard (`c`).
     fn copy_endpoint(&mut self) {
-        let Some(i) = self.session_sel.selected() else {
-            return;
-        };
+        let Some(i) = self.selected_server_index() else { return };
         let endpoint = self.sessions.sessions[i].record.endpoint();
         copy_to_clipboard(&endpoint);
         self.message = Some(Message { title: "Endpoint copied".into(), lines: vec![endpoint] });
@@ -1259,9 +1617,7 @@ impl App {
 
     /// Show + copy the selected session's stored launch command (`y`).
     fn yank_session_command(&mut self) {
-        let Some(i) = self.session_sel.selected() else {
-            return;
-        };
+        let Some(i) = self.selected_server_index() else { return };
         let argv = self.sessions.sessions[i].record.command.clone();
         let cmd = session::command::Command { argv };
         copy_to_clipboard(&cmd.display());
@@ -1271,7 +1627,7 @@ impl App {
 
     /// Open the log-tail screen for the selected session (`L`).
     fn open_logs(&mut self) {
-        if self.session_sel.selected().is_none() {
+        if self.selected_server_index().is_none() {
             return;
         }
         self.screen = Screen::Logs;
@@ -1714,6 +2070,14 @@ impl App {
         self.models.selected().filter(|m| m.is_model())
     }
 
+    pub fn download_available(&self) -> bool {
+        self.focus == Pane::Model
+            && self.selected_model().is_some_and(|model| {
+                model.path.as_os_str().is_empty()
+                    && model.remote.as_ref().is_some_and(|remote| remote.file.is_some())
+            })
+    }
+
     /// Whether the selected runtime exposes `llama-bench` for this model.
     pub fn benchmark_available(&self) -> bool {
         self.selected_model().is_some_and(|model| !model.path.as_os_str().is_empty())
@@ -2083,20 +2447,9 @@ fn online_artifact_children(models: &[Model], prefix: &[String]) -> Option<Vec<M
     Some(artifacts)
 }
 
-fn model_catalog_title(
-    prefix: &[String],
-    models: &[Model],
-    sort: discovery::online::Sort,
-) -> String {
+fn model_catalog_title(prefix: &[String], sort: discovery::online::Sort) -> String {
     if prefix.len() == 3 && prefix[..2] == ["online", "huggingface"] {
-        let mut parts = vec![prefix[2].clone()];
-        if let Some(architecture) = models.iter().find_map(|model| model.architecture.clone()) {
-            parts.push(architecture);
-        }
-        if let Some(context) = models.iter().filter_map(|model| model.context_length).max() {
-            parts.push(format!("ctx {context}"));
-        }
-        return parts.join(" · ");
+        return "Model".into();
     }
     if discovery::online::is_online_path(prefix) { sort.label().into() } else { "Model".into() }
 }
@@ -2345,6 +2698,50 @@ mod tests {
     }
 
     #[test]
+    fn model_download_percentage_is_bounded() {
+        assert_eq!(transfer_percent(0, 300), 0);
+        assert_eq!(transfer_percent(201, 300), 67);
+        assert_eq!(transfer_percent(400, 300), 100);
+    }
+
+    #[test]
+    fn persisted_download_is_restored_as_interrupted() {
+        let stamp =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("llmctl-app-download-{stamp}"));
+        let model_id = format!("online:huggingface:llmctl-tests/restart-{stamp}:model.gguf");
+        let remote = crate::domain::RemoteModel {
+            repo: format!("llmctl-tests/restart-{stamp}"),
+            revision: Some("revision".into()),
+            file: Some("model.gguf".into()),
+            blobs: vec![crate::domain::RemoteBlob {
+                oid: "cd".repeat(32),
+                size_bytes: 42,
+                file: "model.gguf".into(),
+            }],
+            downloads: 0,
+            likes: 0,
+            gated: false,
+        };
+        let record = discovery::online::DownloadJobRecord::new(
+            model_id.clone(),
+            format!("{}/model.gguf", remote.repo),
+            remote,
+        );
+        discovery::online::save_download_record(&root, &record).unwrap();
+
+        let (downloads, next_id) = restore_model_downloads(&root);
+        assert_eq!(downloads.len(), 1);
+        assert_eq!(downloads[0].model_id, model_id);
+        assert_eq!(downloads[0].downloaded_bytes, 0);
+        assert_eq!(downloads[0].total_bytes, 42);
+        assert!(matches!(downloads[0].status, ModelDownloadStatus::Interrupted));
+        assert_eq!(next_id, 2);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn selector_selection_tracks_the_filtered_list() {
         let mut sel = selector();
         assert_eq!(sel.selected(), Some("default")); // cursor 0, no filter
@@ -2476,20 +2873,13 @@ mod tests {
     }
 
     #[test]
-    fn online_artifact_title_shows_repository_architecture_and_max_context() {
-        let mut first = crate::domain::stubs::vllm_models().remove(0);
-        first.architecture = Some("gemma3".into());
-        first.context_length = Some(65_536);
-        let mut second = first.clone();
-        second.context_length = Some(131_072);
-
+    fn online_artifact_pane_uses_the_standard_model_title() {
         assert_eq!(
             model_catalog_title(
                 &["online".into(), "huggingface".into(), "DreamFast/gemma-3-12b".into()],
-                &[first, second],
                 discovery::online::Sort::Trending,
             ),
-            "DreamFast/gemma-3-12b · gemma3 · ctx 131072"
+            "Model"
         );
     }
 

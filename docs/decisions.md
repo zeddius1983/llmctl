@@ -259,8 +259,22 @@ llama.cpp-compatible multimodal repositories classified as `image-text-to-text`
 or `any-to-any` (for example, current Gemma 4 GGUF releases).
 
 The online repository pane exposes three views: Trending (`trendingScore`),
-Most likes (`likes`), and Most downloads (`downloads`), cycled with `s`. The GGUF pane
-uses `author/model · architecture · ctx maximum` as its contextual title.
+Most likes (`likes`), and Most downloads (`downloads`), cycled with `s`. The GGUF
+files pane uses the same `Model` title as local repositories.
 Switching views or pressing online `F5` cancels the logical generation, removes
 generated online metadata and symlinks, and fetches a clean first page. Profile
 YAML and actual Hugging Face cache files are user/model data and remain intact.
+
+An uncached artifact can also be downloaded without launching a server by
+pressing `d`. llmctl streams every GGUF shard into the standard Hugging Face
+blob and snapshot cache. Multiple transfers can run concurrently as peers of
+server processes. Sessions and Downloads occupy a 70/30 vertical split in the
+left jobs column and use one continuous up/down selection. Each job owns a
+cancellation token; cancelled partial files remain resumable with `R` or
+another `d`. This keeps download-only files compatible with llama.cpp and
+other Hub-cache consumers. A minimal per-job JSON record lives under the
+managed catalogue's `online/huggingface/.downloads` directory. Refresh and sort
+cleanup explicitly skip that directory. On restart, llmctl reconstructs byte
+progress from the Hub blobs and presents the job as `Interrupted`; it does not
+resume network activity until the user presses `R` or selects the model with
+`d`. Completed or explicitly removed jobs delete their record.

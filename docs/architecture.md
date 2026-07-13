@@ -58,7 +58,16 @@ state.
     entered. View state maps Trending/Most likes/Most downloads to
     `trendingScore`/`likes`/`downloads`; switching view or online `F5`
     invalidates in-flight responses and rebuilds generated online metadata
-    while preserving profiles and downloaded files.
+    while preserving profiles and downloaded files. Independently identified
+    download workers stream `d`-selected artifacts into the standard Hub
+    blob/snapshot layout and report aggregate shard progress to `App` over a
+    shared channel. Per-job cancellation tokens preserve partial blobs for a
+    later `R`/`d` resume. Minimal job records are atomically persisted beneath
+    `online/huggingface/.downloads`; startup restores unfinished jobs as
+    `Interrupted` and recomputes progress from cached blob sizes. Catalogue
+    cleanup preserves those records. The left jobs column stacks Sessions over Downloads
+    with a 70/30 split; both panes map into one continuous selection index and
+    share the right-hand Detail pane.
   - `runtimes.rs` — locate `llama-server` (explicit path or `$PATH`), capture
     `--version`, cache `--help`.
 - **`profiles/`**

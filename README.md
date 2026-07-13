@@ -99,6 +99,7 @@ overlay.
 | `g` / `G` | First / last item |
 | `/` | Search recursively in the current catalog directory |
 | `s` | Sort online models: Trending / Most likes / Most downloads |
+| `d` | Download the selected online GGUF file |
 | **Profiles** | |
 | `a` | Create profile |
 | `r` | Rename (custom profiles only) |
@@ -115,8 +116,8 @@ overlay.
 | `b` | Benchmark selected model with its profile device and GPU layers (when available) |
 | `y` | Yank launch command |
 | `t` | Session manager |
-| `x` / `K` | Stop / kill |
-| `R` | Restart |
+| `x` / `K` | Stop / kill a server; cancel a download |
+| `R` | Restart a server or resume a download |
 | `L` | View logs |
 | `c` | Copy endpoint |
 | **General** | |
@@ -180,12 +181,23 @@ profile, and press `s`. llmctl launches llama.cpp with `--hf-repo` and
 `--hf-file`, then links the downloaded file from the standard Hugging Face
 cache into the managed catalog.
 
+Press `d` on an uncached online GGUF to download it without starting a server.
+Multiple models can download concurrently in a Downloads pane below Sessions.
+The left jobs column is split 70/30 between servers and downloads, with one
+continuous up/down selection across both panes. Each download row shows
+aggregate shard progress; `x` cancels the selected transfer while preserving
+its partial files, and `R` (or `d` on the model) resumes it. Completed rows
+retain the final cache path in their detail pane. Incomplete jobs are recorded
+under `online/huggingface/.downloads` in the managed model directory. After an
+llmctl restart they return as `Interrupted`, with progress reconstructed from
+the Hub cache; press `R` to continue them.
+
 The online repository pane is titled `Trending`, `Most likes`, or `Most downloads`.
-Inside a repository, the GGUF pane title shows `author/model · architecture ·
-ctx maximum`. Press `s` to cycle between Hub trending score, most likes, and
-most downloads. A view change or online `F5` discards generated online layout
+Inside a repository, the GGUF files pane uses the standard `Model` title, like
+local repositories. Press `s` to cycle between Hub trending score, most likes,
+and most downloads. A view change or online `F5` discards generated online layout
 metadata and fetches a clean first page for the active view; profile YAML and
-downloaded model data are preserved. `/` performs debounced server-side search
+download records and model data are preserved. `/` performs debounced server-side search
 across Hugging Face.
 Hub search results remain transient until Enter saves the selected repository;
 closing the search does not expand the local catalogue. Inside a repository it

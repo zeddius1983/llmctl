@@ -51,12 +51,25 @@ transient; only the repository selected with Enter is added to the persistent
 online catalogue.
 
 The online repository pane title reflects its active view: `Trending`,
-`Most likes`, or `Most downloads`. A repository's GGUF pane title shows its Hub ID,
-architecture, and maximum context length. `s` cycles through Hub trending
-score, likes, and download count. Changing view or pressing `F5` anywhere in
+`Most likes`, or `Most downloads`. A repository's GGUF files pane uses the
+standard `Model` title. `s` cycles through Hub trending score, likes, and
+download count. Changing view or pressing `F5` anywhere in
 the online hierarchy resets all generated online catalog metadata and fetches a
 clean first page. User profiles and the standard Hugging Face model cache are
 never deleted by this reset.
+
+Pressing `d` on an uncached online GGUF downloads the artifact immediately
+without launching a server. Multiple downloads may run concurrently in a
+Downloads pane below the server Sessions pane. The jobs column uses a 70/30
+vertical split and one continuous up/down selection across both panes. Each
+split artifact reports aggregate byte and percentage progress on one line. `x`
+cancels the selected transfer without deleting partial blobs; `R`, or `d` on
+the model again, resumes it. Completion refreshes the model as a cached local
+file while retaining its online identity and profiles. Incomplete jobs persist
+as JSON records in the managed online catalogue and are restored as
+`Interrupted` after restart. Restored progress is derived from actual Hub-cache
+blob sizes, jobs never auto-resume, and online refresh/sort operations preserve
+the records.
 
 For local catalog directories, `/` searches recursively only below the current
 directory. Local searches exclude the virtual online catalog; selecting or
