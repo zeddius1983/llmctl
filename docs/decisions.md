@@ -259,7 +259,7 @@ llama.cpp-compatible multimodal repositories classified as `image-text-to-text`
 or `any-to-any` (for example, current Gemma 4 GGUF releases).
 
 The online repository pane exposes three views: Trending (`trendingScore`),
-Popular (`likes`), and Downloads (`downloads`), cycled with `o`. The GGUF pane
+Most likes (`likes`), and Most downloads (`downloads`), cycled with `s`. The GGUF pane
 uses `author/model · architecture · ctx maximum` as its contextual title.
 Switching views or pressing online `F5` cancels the logical generation, removes
 generated online metadata and symlinks, and fetches a clean first page. Profile

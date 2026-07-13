@@ -98,7 +98,7 @@ overlay.
 | `h` / `←` | Back up a level |
 | `g` / `G` | First / last item |
 | `/` | Search recursively in the current catalog directory |
-| `o` | Cycle online view: Trending / Popular / Downloads |
+| `s` | Sort online models: Trending / Most likes / Most downloads |
 | **Profiles** | |
 | `a` | Create profile |
 | `r` | Rename (custom profiles only) |
@@ -180,9 +180,9 @@ profile, and press `s`. llmctl launches llama.cpp with `--hf-repo` and
 `--hf-file`, then links the downloaded file from the standard Hugging Face
 cache into the managed catalog.
 
-The online repository pane is titled `Trending`, `Popular`, or `Downloads`.
+The online repository pane is titled `Trending`, `Most likes`, or `Most downloads`.
 Inside a repository, the GGUF pane title shows `author/model · architecture ·
-ctx maximum`. Press `o` to cycle between Hub trending score, most likes, and
+ctx maximum`. Press `s` to cycle between Hub trending score, most likes, and
 most downloads. A view change or online `F5` discards generated online layout
 metadata and fetches a clean first page for the active view; profile YAML and
 downloaded model data are preserved. `/` performs debounced server-side search

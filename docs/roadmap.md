@@ -123,7 +123,7 @@ profile device and GPU-layer settings.
 
 ### Phase 7 — Online Hugging Face catalog
 Virtual `online ▸ huggingface` hierarchy with cached 20-model Trending,
-Popular, and Downloads views across text and multimodal pipelines; lazy
+Most likes, and Most downloads views across text and multimodal pipelines; lazy
 repository file/metadata fetches; debounced `/` Hub search; split-shard
 grouping; remote profile identity; `HF_TOKEN`-safe `--hf-repo`/`--hf-file`
 launch; clean-layout `F5`; and automatic linking to the standard Hugging Face

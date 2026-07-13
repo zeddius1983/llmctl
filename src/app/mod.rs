@@ -715,11 +715,12 @@ impl App {
             }
             KeyCode::Char('t') => self.open_sessions(),
             KeyCode::Char('y') => self.yank_command(),
+            KeyCode::Char('s') if self.focus == Pane::Model && self.online_view_active() => {
+                self.cycle_online_sort()
+            }
             KeyCode::Char('s') => self.start_session(),
             KeyCode::Char('C') => self.start_chat(),
             KeyCode::Char('b') => self.start_benchmark(),
-            KeyCode::Char('o') => self.cycle_online_sort(),
-
             // Move focus across panes. In Options (the leaf) Enter edits the
             // selected value instead; `l`/Right stay pure navigation.
             KeyCode::Enter if self.focus == Pane::Options => self.open_editor(),

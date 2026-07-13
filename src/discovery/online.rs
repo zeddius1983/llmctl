@@ -26,8 +26,8 @@ impl Sort {
     pub fn label(self) -> &'static str {
         match self {
             Self::Trending => "Trending",
-            Self::Popular => "Popular",
-            Self::Downloads => "Downloads",
+            Self::Popular => "Most likes",
+            Self::Downloads => "Most downloads",
         }
     }
 
@@ -638,6 +638,9 @@ mod tests {
         assert_eq!(Sort::Trending.next(), Sort::Popular);
         assert_eq!(Sort::Popular.next(), Sort::Downloads);
         assert_eq!(Sort::Downloads.next(), Sort::Trending);
+        assert_eq!(Sort::Trending.label(), "Trending");
+        assert_eq!(Sort::Popular.label(), "Most likes");
+        assert_eq!(Sort::Downloads.label(), "Most downloads");
         assert_eq!(Sort::Trending.api_value(), "trendingScore");
         assert_eq!(Sort::Popular.api_value(), "likes");
         assert_eq!(Sort::Downloads.api_value(), "downloads");

@@ -34,6 +34,8 @@ const ICON_OPTION: &str = "\u{f1de}"; // sliders
 const ICON_ROOT: &str = "\u{f015}"; // home
 const ICON_SESSION: &str = "\u{f233}"; // server
 const ICON_LOG: &str = "\u{f15c}"; // file-text
+const ICON_DIRECTORY: &str = "\u{f07b}"; // folder
+const ICON_CLOUD: &str = "\u{f0c2}"; // cloud
 
 fn level_icon(level: Pane) -> &'static str {
     match level {
@@ -84,9 +86,9 @@ fn draw_browser(frame: &mut Frame, app: &mut App) {
 
     // Parent | Current | Preview.
     let [parent, current, preview] = Layout::horizontal([
-        Constraint::Percentage(22),
-        Constraint::Percentage(38),
-        Constraint::Percentage(40),
+        Constraint::Percentage(18),
+        Constraint::Percentage(48),
+        Constraint::Percentage(34),
     ])
     .areas(body);
 
@@ -142,7 +144,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
                     && remote.file.is_none()
                 {
                     return ListItem::new(Line::from(vec![
-                        Span::raw(format!("  {label}  ")),
+                        Span::raw(format!("{ICON_CLOUD}  {label}  ")),
                         Span::styled(
                             format!(
                                 "♥{} ⇩{}",
@@ -159,7 +161,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
                         Span::raw(filename),
                     ]));
                 }
-                let item_icon = if m.is_catalog_dir() { "" } else { icon };
+                let item_icon = model_icon(m);
                 ListItem::new(format!("{item_icon}  {label}"))
             })
             .collect(),
@@ -224,7 +226,7 @@ fn render_catalog_parent(frame: &mut Frame, area: Rect, app: &App) {
         .map(|(i, m)| {
             let label = m.display_label();
             let marker = if Some(i) == selected { "▸" } else { " " };
-            ListItem::new(format!("{marker}    {label}"))
+            ListItem::new(format!("{marker}  {}  {label}", model_icon(m)))
         })
         .collect();
     frame.render_widget(
@@ -247,7 +249,7 @@ fn render_catalog_preview(frame: &mut Frame, area: Rect, app: &App) {
                     Span::raw(filename),
                 ]));
             }
-            let icon = if m.is_catalog_dir() { "" } else { level_icon(Pane::Model) };
+            let icon = model_icon(m);
             ListItem::new(format!("{icon}  {label}"))
         })
         .collect();
@@ -336,7 +338,7 @@ fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
             keys.push(("/", "search models"));
             keys.push(("F5", "rescan"));
             if app.online_view_active() {
-                keys.push(("o", "trending/popular/downloads"));
+                keys.push(("s", "sort"));
             }
             if app.benchmark_available() {
                 keys.push(("b", "benchmark"));
@@ -401,6 +403,16 @@ fn compact_count(value: u64) -> String {
         format!("{:.1}k", value as f64 / 1_000.0)
     } else {
         value.to_string()
+    }
+}
+
+fn model_icon(model: &crate::domain::Model) -> &'static str {
+    if crate::discovery::online::is_online_path(&model.catalog_path) {
+        ICON_CLOUD
+    } else if model.is_catalog_dir() {
+        ICON_DIRECTORY
+    } else {
+        ICON_MODEL
     }
 }
 
@@ -638,7 +650,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         help_row("h / ←", "back up a level"),
         help_row("g / G", "first / last item"),
         help_row("/", "search models"),
-        help_row("o", "cycle online view"),
+        help_row("s", "sort online models"),
         Line::raw(""),
         Line::from("Profiles".bold()),
         help_row("a", "create profile"),
@@ -655,7 +667,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         help_row("Home/End", "min / max"),
         Line::raw(""),
         Line::from("Launch & sessions".bold()),
-        help_row("s", "start server"),
+        help_row("s", "start server (profile/options)"),
         help_row("C", "chat in terminal (llama-cli)"),
         help_row("b", "benchmark selected model (llama-bench)"),
         help_row("y", "yank command"),
@@ -845,7 +857,7 @@ fn center(area: Rect, horizontal: Constraint, vertical: Constraint) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_count, model_artifact_columns};
+    use super::{ICON_CLOUD, ICON_DIRECTORY, compact_count, model_artifact_columns, model_icon};
 
     #[test]
     fn counts_use_compact_repository_badges() {
@@ -882,5 +894,20 @@ mod tests {
             model_artifact_columns(&model).unwrap(),
             ("Q4_K_M      20.6 GB  ".into(), "Qwen-AgentWorld-35B-A3B-UD-Q4_K_M.gguf".into())
         );
+    }
+
+    #[test]
+    fn online_catalog_nodes_use_cloud_icons() {
+        let mut model = crate::domain::stubs::vllm_models().remove(0);
+        model.path = std::path::PathBuf::new();
+
+        model.catalog_path = vec!["online".into()];
+        assert_eq!(model_icon(&model), ICON_CLOUD);
+
+        model.catalog_path = vec!["online".into(), "huggingface".into()];
+        assert_eq!(model_icon(&model), ICON_CLOUD);
+
+        model.catalog_path = vec!["local-models".into()];
+        assert_eq!(model_icon(&model), ICON_DIRECTORY);
     }
 }

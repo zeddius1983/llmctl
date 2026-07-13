@@ -51,8 +51,8 @@ transient; only the repository selected with Enter is added to the persistent
 online catalogue.
 
 The online repository pane title reflects its active view: `Trending`,
-`Popular`, or `Downloads`. A repository's GGUF pane title shows its Hub ID,
-architecture, and maximum context length. `o` cycles through Hub trending
+`Most likes`, or `Most downloads`. A repository's GGUF pane title shows its Hub ID,
+architecture, and maximum context length. `s` cycles through Hub trending
 score, likes, and download count. Changing view or pressing `F5` anywhere in
 the online hierarchy resets all generated online catalog metadata and fetches a
 clean first page. User profiles and the standard Hugging Face model cache are

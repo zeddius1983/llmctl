@@ -55,7 +55,7 @@ state.
     Downloaded files are detected in the standard Hugging Face cache. Online
     search is Hub-wide and transient from the repository list, persisting only
     the result selected with Enter; it is artifact-local after a repository is
-    entered. View state maps Trending/Popular/Downloads to
+    entered. View state maps Trending/Most likes/Most downloads to
     `trendingScore`/`likes`/`downloads`; switching view or online `F5`
     invalidates in-flight responses and rebuilds generated online metadata
     while preserving profiles and downloaded files.
