@@ -200,6 +200,7 @@ fn build_model(path: &Path, size: u64, modified: Option<u64>) -> Model {
         context_length: info.as_ref().and_then(|i| i.context_length),
         modified,
         has_chat_template: info.as_ref().map(|i| i.has_chat_template).unwrap_or(false),
+        remote: None,
     }
 }
 
@@ -264,7 +265,7 @@ fn is_projector(path: &Path) -> bool {
 
 /// Heuristic quantization label from the filename (e.g. `Q4_K_XL`, `IQ3_XXS`,
 /// `MXFP4`). Longer/more-specific patterns are matched first.
-fn quant_from_filename(name: &str) -> Option<String> {
+pub fn quant_from_filename(name: &str) -> Option<String> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
         Regex::new(
@@ -313,6 +314,7 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
+            remote: None,
         }
     }
 

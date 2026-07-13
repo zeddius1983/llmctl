@@ -48,6 +48,26 @@ state.
     (first shard only, suffix stripped, sizes summed); projector (`mmproj`)
     filtering; filename-first quant detection; cache to `models.json` keyed by
     size+mtime; `F5` rescan.
+  - `online.rs` — lazy `online ▸ huggingface` virtual source. Background HTTPS
+    requests fetch trending repositories and repository GGUF details; cached
+    metadata is exposed as flat `provider/repository` rows followed by GGUF
+    artifacts, and profile leaves are materialized below the managed catalog.
+    Downloaded files are detected in the standard Hugging Face cache. Online
+    search is Hub-wide and transient from the repository list, persisting only
+    the result selected with Enter; it is artifact-local after a repository is
+    entered. View state maps Trending/Most likes/Most downloads to
+    `trendingScore`/`likes`/`downloads`; switching view or online `F5`
+    invalidates in-flight responses and rebuilds generated online metadata
+    while preserving profiles and downloaded files. Independently identified
+    download workers stream `d`-selected artifacts into the standard Hub
+    blob/snapshot layout and report aggregate shard progress to `App` over a
+    shared channel. Per-job cancellation tokens preserve partial blobs for a
+    later `R`/`d` resume. Minimal job records are atomically persisted beneath
+    `online/huggingface/.downloads`; startup restores unfinished jobs as
+    `Interrupted` and recomputes progress from cached blob sizes. Catalogue
+    cleanup preserves those records. The left jobs column stacks Sessions over Downloads
+    with a 70/30 split; both panes map into one continuous selection index and
+    share the right-hand Detail pane.
   - `runtimes.rs` — locate `llama-server` (explicit path or `$PATH`), capture
     `--version`, cache `--help`.
 - **`profiles/`**
@@ -61,7 +81,8 @@ state.
     `current_values`, `effective_kind` (model-aware ctx-size bound).
 - **`session/`**
   - `command.rs` — pure launch-command builder (argv + shell-quoted display;
-    bool flags emitted only when on, model via `-m`).
+    bool flags emitted only when on, local model via `-m`, remote model via
+    `--hf-repo` and `--hf-file`).
   - `supervisor.rs` — `SessionSupervisor` trait + `DetachedSupervisor` (`setsid`
     pre-exec, stdio→log file, `SIGCHLD` auto-reap, `kill(-pgid, …)`); plus the
     OSC 52 base64 helper used for clipboard yank.
@@ -129,14 +150,15 @@ Lifecycle is hidden behind a `SessionSupervisor` trait. The MVP
 process group (survives TUI exit, ignores tty signals), redirects stdio to a
 per-session log file, and ignores `SIGCHLD` so detached children are auto-reaped.
 Each launch writes `session-<id>.json` (id, name, pid, host, port, full argv,
-model/profile, log path, start time). On startup `SessionManager::rediscover`
+model/profile, log path, optional Hub download blobs, start time). On startup `SessionManager::rediscover`
 keeps sessions whose PID is alive *and* whose `/proc/<pid>/cmdline` still
 contains the model path (PID-reuse guard), deleting the JSON for the rest.
 
-`SessionManager::refresh` (called on the ≈1 s tick) derives status — `Starting`
-until a `GET /health` returns 200, then `Running`; `Stopped` if the user asked it
-to stop and the process is gone, else `Crashed` — and samples `/proc` for RSS and
-CPU%. Launch resolves a bindable port (skipping ports held by other live
+`SessionManager::refresh` (called on the ≈1 s tick) derives status —
+`Downloading (N%)` while known Hub blobs are incomplete, `Starting` while the
+model loads, then `Running` after `GET /health` returns 200; `Stopped` if the
+user asked it to stop and the process is gone, else `Crashed` — and samples
+`/proc` for RSS and CPU%. Launch resolves a bindable port (skipping ports held by other live
 sessions) before spawning. A future `DaemonSupervisor` or `systemd-run` backend
 can implement the same trait. See ADR-005 and ADR-007.
 

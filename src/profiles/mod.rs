@@ -26,7 +26,7 @@ pub fn effective_kind(spec: &registry::OptionSpec, model: &Model) -> OptionKind 
 /// Profiles available for a (runtime, model): built-in templates plus any
 /// user-created custom profiles, with favorite flags from the store.
 pub fn list_profiles(runtime: &Runtime, model: &Model, store: &ProfileStore) -> Vec<Profile> {
-    let model_key = store::model_key(&model.path);
+    let model_key = model.profile_key();
     let mut profiles: Vec<Profile> = templates::names()
         .map(|name| Profile {
             name: name.to_string(),
@@ -53,7 +53,7 @@ pub fn resolve_options(
     store: &ProfileStore,
     defaults: &Defaults,
 ) -> Vec<OptionItem> {
-    let model_key = store::model_key(&model.path);
+    let model_key = model.profile_key();
     let instance = store.get(&runtime.name, &model_key, &profile.name);
     let template = templates::find(&profile.name);
 
@@ -214,6 +214,7 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
+            remote: None,
         }
     }
 

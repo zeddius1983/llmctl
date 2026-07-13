@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod gguf;
 pub mod models;
+pub mod online;
 pub mod runtimes;
 
 pub use catalog::{ModelSource, reconcile};

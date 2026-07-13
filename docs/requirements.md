@@ -33,8 +33,50 @@ Users should be able to:
 6. Inspect logs.
 7. Reuse previous configurations.
 8. Restart or stop servers.
+9. Browse compatible Hugging Face GGUF repositories as an online catalog and
+   launch selected artifacts through llama.cpp's native downloader.
 
 Everything should be available from a single terminal application.
+
+## Online model catalog
+
+The llama.cpp hierarchy contains the virtual source `online ▸ huggingface`.
+Selecting it loads 20 trending models filtered for GGUF and llama.cpp
+compatibility, including text-only and multimodal pipelines. Repository
+contents are fetched lazily, cached into the managed catalog, and use the same
+Model → Profile → Options workflow as local models. Authentication is inherited
+from `HF_TOKEN` and is never persisted by llmctl. `/` searches the Hub
+server-side when invoked from the online hierarchy. Search results are
+transient; only the repository selected with Enter is added to the persistent
+online catalogue.
+
+The online repository pane title reflects its active view: `Trending`,
+`Most likes`, or `Most downloads`. A repository's GGUF files pane uses the
+standard `Model` title. `s` cycles through Hub trending score, likes, and
+download count. Changing view or pressing `F5` anywhere in
+the online hierarchy resets all generated online catalog metadata and fetches a
+clean first page. User profiles and the standard Hugging Face model cache are
+never deleted by this reset.
+
+Pressing `d` on an uncached online GGUF downloads the artifact immediately
+without launching a server. Multiple downloads may run concurrently in a
+Downloads pane below the server Sessions pane. The jobs column uses a 70/30
+vertical split and one continuous up/down selection across both panes. Each
+split artifact reports aggregate byte and percentage progress on one line. `x`
+cancels the selected transfer without deleting partial blobs; `R`, or `d` on
+the model again, resumes it. Completion refreshes the model as a cached local
+file while retaining its online identity and profiles. Incomplete jobs persist
+as JSON records in the managed online catalogue and are restored as
+`Interrupted` after restart. Restored progress is derived from actual Hub-cache
+blob sizes, jobs never auto-resume, and online refresh/sort operations preserve
+the records.
+
+For local catalog directories, `/` searches recursively only below the current
+directory. Local searches exclude the virtual online catalog; selecting or
+entering `online ▸ huggingface` switches `/` to an isolated Hub-wide search.
+Online repositories are displayed as flat `provider/repository` rows, followed
+by their GGUF artifacts when entered. Inside a repository, search is limited to
+its fetched artifacts.
 
 ---
 
@@ -315,6 +357,7 @@ Status indicators:
 
 ```text
 ● Running
+⇩ Downloading (67%)
 ◐ Starting
 ✖ Crashed
 ■ Stopped
@@ -488,6 +531,7 @@ Supported states:
 ```text
 Running
 Stopped
+Downloading
 Starting
 Crashed
 Unknown
@@ -782,4 +826,3 @@ The MVP is successful when a user can:
 9. Restart or stop servers.
 
 without manually writing or remembering llama.cpp commands.
-

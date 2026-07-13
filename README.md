@@ -23,7 +23,12 @@ and watch them from a built-in session manager.
   chat template; dedupes multi-shard models and sums their sizes. `F5` to rescan.
 - **Physical model catalog** — mirrors discovery below
   `~/.config/llmctl/models` using source-aware folders, safe manifests, model
-  symlinks, and per-model YAML profiles. Press `/` for global model search.
+  symlinks, and per-model YAML profiles. Press `/` to search recursively from
+  the current local catalog directory.
+- **Online Hugging Face catalog** — browse `online ▸ huggingface` like a local
+  directory. It lazily caches trending llama.cpp-compatible GGUF repositories
+  and their artifacts; starting a remote model lets llama.cpp download it into
+  the standard Hugging Face cache.
 - **Profiles & options** — built-in, read-only templates (Default, Chat, Coding,
   Long Context, Server) that fork into per-model editable instances on first edit.
   Edit options with live validation, cycle enums/flags in place, and adjust
@@ -36,9 +41,10 @@ and watch them from a built-in session manager.
 - **Detached sessions** — `s` launches a server in its own process group
   (`setsid`), with stdout/stderr redirected to a per-session log file and
   automatic port-conflict resolution. Sessions are rediscovered across restarts.
-- **Session manager** (`t`) — live status (Starting / Running / Crashed), PID,
+- **Session manager** (`t`) — live status (Downloading / Starting / Running /
+  Crashed), PID,
   port, uptime, and `/proc`-sampled CPU & memory; a `/health` probe promotes
-  Starting → Running. Stop (`x`), kill (`K`), restart (`R`), copy endpoint (`c`),
+  Downloading → Starting → Running. Stop (`x`), kill (`K`), restart (`R`), copy endpoint (`c`),
   and tail logs (`L`).
 
 ## Requirements
@@ -91,7 +97,9 @@ overlay.
 | `l` / `→` | Drill into selection |
 | `h` / `←` | Back up a level |
 | `g` / `G` | First / last item |
-| `/` | Search all models and jump to a result |
+| `/` | Search recursively in the current catalog directory |
+| `s` | Sort online models: Trending / Most likes / Most downloads |
+| `d` | Download the selected online GGUF file |
 | **Profiles** | |
 | `a` | Create profile |
 | `r` | Rename (custom profiles only) |
@@ -108,8 +116,8 @@ overlay.
 | `b` | Benchmark selected model with its profile device and GPU layers (when available) |
 | `y` | Yank launch command |
 | `t` | Session manager |
-| `x` / `K` | Stop / kill |
-| `R` | Restart |
+| `x` / `K` | Stop / kill a server; cancel a download |
+| `R` | Restart a server or resume a download |
 | `L` | View logs |
 | `c` | Copy endpoint |
 | **General** | |
@@ -162,6 +170,40 @@ The generated file explicitly lists the standard locations so they are easy to
 inspect and extend. Older `[models].paths` arrays remain supported, but named
 `[[models.sources]]` entries provide stable catalog names and layout control.
 Your `$HOME` is never scanned wholesale.
+
+### Online models
+
+Under the llama.cpp runtime, enter `online`, then `huggingface`. Selecting the
+source fetches 20 trending llama.cpp-compatible GGUF repositories. Repositories
+appear as flat `provider/repository` rows with likes and download counts;
+entering one fetches its GGUF variants. Choose an artifact, configure a normal
+profile, and press `s`. llmctl launches llama.cpp with `--hf-repo` and
+`--hf-file`, then links the downloaded file from the standard Hugging Face
+cache into the managed catalog.
+
+Press `d` on an uncached online GGUF to download it without starting a server.
+Multiple models can download concurrently in a Downloads pane below Sessions.
+The left jobs column is split 70/30 between servers and downloads, with one
+continuous up/down selection across both panes. Each download row shows
+aggregate shard progress; `x` cancels the selected transfer while preserving
+its partial files, and `R` (or `d` on the model) resumes it. Completed rows
+retain the final cache path in their detail pane. Incomplete jobs are recorded
+under `online/huggingface/.downloads` in the managed model directory. After an
+llmctl restart they return as `Interrupted`, with progress reconstructed from
+the Hub cache; press `R` to continue them.
+
+The online repository pane is titled `Trending`, `Most likes`, or `Most downloads`.
+Inside a repository, the GGUF files pane uses the standard `Model` title, like
+local repositories. Press `s` to cycle between Hub trending score, most likes,
+and most downloads. A view change or online `F5` discards generated online layout
+metadata and fetches a clean first page for the active view; profile YAML and
+download records and model data are preserved. `/` performs debounced server-side search
+across Hugging Face.
+Hub search results remain transient until Enter saves the selected repository;
+closing the search does not expand the local catalogue. Inside a repository it
+searches only fetched GGUF artifacts. Online results never mix into local
+folder searches. Set `HF_TOKEN` in the environment for gated/private models;
+llmctl never persists the token.
 
 ## Roadmap
 

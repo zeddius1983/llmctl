@@ -37,8 +37,8 @@ identically named GGUF files from different providers remain distinguishable.
 - Handles multi-shard GGUFs, overlapping scan roots, sanitized-name and
   leaf/directory collisions, stale catalog entries, and deterministic Hugging
   Face snapshot selection (`refs/main` preferred).
-- Profile mutations write only the affected YAML file, unchanged manifests are
-  not rewritten, and search results are cached per query.
+- Profile mutations write only the affected YAML file and unchanged manifests
+  are not rewritten.
 - Catalog write failures fall back to legacy JSON persistence rather than
   losing profile edits.
 

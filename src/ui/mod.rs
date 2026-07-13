@@ -19,7 +19,9 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
 
-use crate::app::{App, Message, ModelSearch, Pane, Prompt, Screen, Selector};
+use crate::app::{
+    App, Message, ModelDownload, ModelDownloadStatus, ModelSearch, Pane, Prompt, Screen, Selector,
+};
 use crate::domain::human_size;
 use crate::session::{Session, SessionStatus, format_uptime};
 
@@ -34,6 +36,8 @@ const ICON_OPTION: &str = "\u{f1de}"; // sliders
 const ICON_ROOT: &str = "\u{f015}"; // home
 const ICON_SESSION: &str = "\u{f233}"; // server
 const ICON_LOG: &str = "\u{f15c}"; // file-text
+const ICON_DIRECTORY: &str = "\u{f07b}"; // folder
+const ICON_CLOUD: &str = "\u{f0c2}"; // cloud
 
 fn level_icon(level: Pane) -> &'static str {
     match level {
@@ -84,9 +88,9 @@ fn draw_browser(frame: &mut Frame, app: &mut App) {
 
     // Parent | Current | Preview.
     let [parent, current, preview] = Layout::horizontal([
-        Constraint::Percentage(22),
-        Constraint::Percentage(38),
-        Constraint::Percentage(40),
+        Constraint::Percentage(18),
+        Constraint::Percentage(48),
+        Constraint::Percentage(34),
     ])
     .areas(body);
 
@@ -119,7 +123,8 @@ fn draw_browser(frame: &mut Frame, app: &mut App) {
 /// Render one level's list into a column, styled for its role.
 fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: Role) {
     let focused = role == Role::Current;
-    let block = pane_block(level.title(), focused);
+    let title = if level == Pane::Model { app.model_pane_title() } else { level.title().into() };
+    let block = pane_block(&title, focused);
 
     // Build owned items first so the immutable borrow ends before we take the
     // mutable state borrow below.
@@ -137,7 +142,28 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
             .iter()
             .map(|m| {
                 let label = m.display_label();
-                let item_icon = if m.is_catalog_dir() { "" } else { icon };
+                if let Some(remote) = &m.remote
+                    && remote.file.is_none()
+                {
+                    return ListItem::new(Line::from(vec![
+                        Span::raw(format!("{ICON_CLOUD}  {label}  ")),
+                        Span::styled(
+                            format!(
+                                "♥{} ⇩{}",
+                                compact_count(remote.likes),
+                                compact_count(remote.downloads)
+                            ),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                }
+                if let Some((metadata, filename)) = model_artifact_columns(m) {
+                    return ListItem::new(Line::from(vec![
+                        Span::styled(metadata, Style::default().fg(Color::DarkGray)),
+                        Span::raw(filename),
+                    ]));
+                }
+                let item_icon = model_icon(m);
                 ListItem::new(format!("{item_icon}  {label}"))
             })
             .collect(),
@@ -202,11 +228,13 @@ fn render_catalog_parent(frame: &mut Frame, area: Rect, app: &App) {
         .map(|(i, m)| {
             let label = m.display_label();
             let marker = if Some(i) == selected { "▸" } else { " " };
-            ListItem::new(format!("{marker}    {label}"))
+            ListItem::new(format!("{marker}  {}  {label}", model_icon(m)))
         })
         .collect();
     frame.render_widget(
-        List::new(items).block(pane_block("Model", false)).style(Style::default().dim()),
+        List::new(items)
+            .block(pane_block(&app.catalog_parent_title(), false))
+            .style(Style::default().dim()),
         area,
     );
 }
@@ -217,12 +245,20 @@ fn render_catalog_preview(frame: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|m| {
             let label = m.display_label();
-            let icon = if m.is_catalog_dir() { "" } else { level_icon(Pane::Model) };
+            if let Some((metadata, filename)) = model_artifact_columns(m) {
+                return ListItem::new(Line::from(vec![
+                    Span::styled(metadata, Style::default().fg(Color::DarkGray)),
+                    Span::raw(filename),
+                ]));
+            }
+            let icon = model_icon(m);
             ListItem::new(format!("{icon}  {label}"))
         })
         .collect();
     frame.render_widget(
-        List::new(items).block(pane_block("Model", false)).style(Style::default().dim()),
+        List::new(items)
+            .block(pane_block(&app.catalog_preview_title(), false))
+            .style(Style::default().dim()),
         area,
     );
 }
@@ -303,6 +339,12 @@ fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
             keys.push(("h/l", "back/enter"));
             keys.push(("/", "search models"));
             keys.push(("F5", "rescan"));
+            if app.online_view_active() {
+                keys.push(("s", "sort"));
+            }
+            if app.download_available() {
+                keys.push(("d", "download"));
+            }
             if app.benchmark_available() {
                 keys.push(("b", "benchmark"));
             }
@@ -359,11 +401,62 @@ fn truncate_left(s: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
+fn compact_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}m", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn model_icon(model: &crate::domain::Model) -> &'static str {
+    if crate::discovery::online::is_online_path(&model.catalog_path) {
+        ICON_CLOUD
+    } else if model.is_catalog_dir() {
+        ICON_DIRECTORY
+    } else {
+        ICON_MODEL
+    }
+}
+
+fn model_artifact_columns(model: &crate::domain::Model) -> Option<(String, String)> {
+    if !model.is_model() {
+        return None;
+    }
+    let quantization = model.quantization.as_deref().unwrap_or("-");
+    Some((
+        format!("{quantization:<12}{:>7}  ", download_size(model.size_bytes)),
+        model.display_label().into(),
+    ))
+}
+
+fn download_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1_000.0 && unit < UNITS.len() - 1 {
+        size /= 1_000.0;
+        unit += 1;
+    }
+    if unit == 0 { format!("{bytes} B") } else { format!("{size:.1} {}", UNITS[unit]) }
+}
+
+fn download_progress(downloaded: u64, total: u64, percent: u8) -> String {
+    format!("{} / {} ({percent}%)", download_size(downloaded), download_size(total))
+}
+
+fn truncate_download_name(name: &str, metadata: &str, row_width: usize) -> String {
+    truncate_left(name, row_width.saturating_sub(metadata.chars().count()))
+}
+
 // --- Session Manager screen ------------------------------------------------
 
 /// Colour for a session status indicator.
 fn status_color(status: SessionStatus) -> Color {
     match status {
+        SessionStatus::Downloading => Color::Cyan,
         SessionStatus::Running => Color::Green,
         SessionStatus::Starting => ACCENT,
         SessionStatus::Crashed => Color::Red,
@@ -381,39 +474,48 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
     let title = Line::from(vec![
         Span::styled(format!(" {ICON_SESSION}  Sessions "), Style::default().fg(ACCENT).bold()),
         Span::styled(
-            format!("({} running)", app.sessions.sessions.len()),
+            format!("({} jobs)", app.async_job_count()),
             Style::default().fg(Color::DarkGray),
         ),
     ]);
     frame.render_widget(Paragraph::new(title), header);
 
-    if app.sessions.sessions.is_empty() {
-        let hint = Paragraph::new(Text::from(vec![
-            Line::raw(""),
-            Line::from("No sessions yet.".dim()),
-            Line::from("Pick a model + profile in the browser and press 's' to launch one.".dim()),
-        ]))
-        .block(pane_block("Sessions", true));
-        frame.render_widget(hint, body);
-    } else {
-        let [list, detail] =
-            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
-                .areas(body);
-        render_session_list(frame, list, app);
-        render_session_detail(frame, detail, app);
-    }
+    let [jobs, detail] =
+        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(body);
+    let [sessions, downloads] =
+        Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(jobs);
+    render_session_list(frame, sessions, app);
+    render_download_list(frame, downloads, app);
+    render_session_detail(frame, detail, app);
 
-    let keys = [
-        ("x", "stop"),
-        ("K", "kill"),
-        ("R", "restart"),
-        ("L", "logs"),
-        ("c", "copy url"),
-        ("y", "yank cmd"),
-        ("d", "remove"),
-        ("Esc", "back"),
-        ("q", "quit"),
-    ];
+    let keys = if let Some(download) = app.selected_model_download() {
+        match &download.status {
+            ModelDownloadStatus::Downloading => {
+                vec![("x", "cancel"), ("Esc", "back"), ("q", "quit")]
+            }
+            ModelDownloadStatus::Cancelling => vec![("Esc", "back"), ("q", "quit")],
+            ModelDownloadStatus::Cancelled
+            | ModelDownloadStatus::Interrupted
+            | ModelDownloadStatus::Failed(_) => {
+                vec![("R", "resume"), ("d", "remove"), ("Esc", "back"), ("q", "quit")]
+            }
+            ModelDownloadStatus::Downloaded(_) => {
+                vec![("d", "remove"), ("Esc", "back"), ("q", "quit")]
+            }
+        }
+    } else {
+        vec![
+            ("x", "stop"),
+            ("K", "kill"),
+            ("R", "restart"),
+            ("L", "logs"),
+            ("c", "copy url"),
+            ("y", "yank cmd"),
+            ("d", "remove"),
+            ("Esc", "back"),
+            ("q", "quit"),
+        ]
+    };
     render_keyline(frame, footer, &keys);
 }
 
@@ -435,25 +537,102 @@ fn render_session_list(frame: &mut Frame, area: Rect, app: &mut App) {
             ]))
         })
         .collect();
-
+    let focused = app.selected_server_session().is_some() || app.async_job_count() == 0;
+    let mut state = ListState::default();
+    state.select(app.session_sel.selected().filter(|index| *index < app.sessions.sessions.len()));
     let list = List::new(items)
-        .block(pane_block("Sessions", true))
+        .block(pane_block("Sessions", focused))
         .highlight_style(Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD))
         .highlight_symbol("▌ ");
-    frame.render_stateful_widget(list, area, &mut app.session_sel);
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_download_list(frame: &mut Frame, area: Rect, app: &App) {
+    // Borders consume two columns and the selected-row marker consumes two
+    // more. Reserve the progress suffix, then retain the filename tail.
+    let row_width = area.width.saturating_sub(4) as usize;
+    let items = app.model_downloads.iter().map(|download| {
+        let suffix = match &download.status {
+            ModelDownloadStatus::Downloading => "",
+            ModelDownloadStatus::Cancelling => "  cancelling",
+            ModelDownloadStatus::Downloaded(_) => "  downloaded",
+            ModelDownloadStatus::Cancelled => "  cancelled",
+            ModelDownloadStatus::Interrupted => "  interrupted",
+            ModelDownloadStatus::Failed(_) => "  failed",
+        };
+        let metadata = format!(
+            " ⇣ {}{suffix}",
+            download_progress(download.downloaded_bytes, download.total_bytes, download.percent())
+        );
+        let name = truncate_download_name(&download.model, &metadata, row_width);
+        ListItem::new(Line::from(vec![
+            Span::raw(name),
+            Span::styled(metadata, Style::default().fg(Color::DarkGray)),
+        ]))
+    });
+
+    let selected = app
+        .session_sel
+        .selected()
+        .and_then(|index| index.checked_sub(app.sessions.sessions.len()))
+        .filter(|index| *index < app.model_downloads.len());
+    let mut state = ListState::default();
+    state.select(selected);
+    let list = List::new(items)
+        .block(pane_block("Downloads", selected.is_some()))
+        .highlight_style(Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▌ ");
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn render_session_detail(frame: &mut Frame, area: Rect, app: &App) {
     let block = pane_block("Detail", false);
-    let Some(session) = app.session_sel.selected().and_then(|i| app.sessions.sessions.get(i))
-    else {
+    let text = if let Some(session) = app.selected_server_session() {
+        session_detail_lines(session)
+    } else if let Some(download) = app.selected_model_download() {
+        download_detail_lines(download)
+    } else {
         frame.render_widget(block, area);
         return;
     };
-    frame.render_widget(
-        Paragraph::new(session_detail_lines(session)).block(block).wrap(Wrap { trim: false }),
-        area,
-    );
+    frame.render_widget(Paragraph::new(text).block(block).wrap(Wrap { trim: false }), area);
+}
+
+fn download_detail_lines(download: &ModelDownload) -> Text<'static> {
+    let (status, color, detail) = match &download.status {
+        ModelDownloadStatus::Downloading => ("Downloading", Color::Cyan, String::new()),
+        ModelDownloadStatus::Cancelling => (
+            "Cancelling",
+            Color::DarkGray,
+            "Waiting for the transfer worker to preserve its partial file.".into(),
+        ),
+        ModelDownloadStatus::Downloaded(path) => {
+            ("Downloaded", Color::Green, path.display().to_string())
+        }
+        ModelDownloadStatus::Cancelled => {
+            ("Cancelled", Color::DarkGray, "Press R to resume the partial download.".into())
+        }
+        ModelDownloadStatus::Interrupted => (
+            "Interrupted",
+            Color::DarkGray,
+            "The previous llmctl process stopped. Press R to resume the partial download.".into(),
+        ),
+        ModelDownloadStatus::Failed(error) => ("Failed", Color::Red, error.clone()),
+    };
+    Text::from(vec![
+        Line::from(download.model.clone().bold().fg(ACCENT)),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(status.to_string(), Style::default().fg(color)),
+        ]),
+        kv(
+            "Progress",
+            &download_progress(download.downloaded_bytes, download.total_bytes, download.percent()),
+        ),
+        Line::raw(""),
+        Line::from(detail),
+    ])
 }
 
 fn session_detail_lines(session: &Session) -> Text<'static> {
@@ -469,7 +648,7 @@ fn session_detail_lines(session: &Session) -> Text<'static> {
         Line::from(vec![
             Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{} {}", session.status.glyph(), session.status.label()),
+                format!("{} {}", session.status.glyph(), session.status_label()),
                 Style::default().fg(color),
             ),
         ]),
@@ -570,6 +749,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
         help_row("h / ←", "back up a level"),
         help_row("g / G", "first / last item"),
         help_row("/", "search models"),
+        help_row("s", "sort online models"),
+        help_row("d", "download selected online file"),
         Line::raw(""),
         Line::from("Profiles".bold()),
         help_row("a", "create profile"),
@@ -586,13 +767,13 @@ fn render_help(frame: &mut Frame, area: Rect) {
         help_row("Home/End", "min / max"),
         Line::raw(""),
         Line::from("Launch & sessions".bold()),
-        help_row("s", "start server"),
+        help_row("s", "start server (profile/options)"),
         help_row("C", "chat in terminal (llama-cli)"),
         help_row("b", "benchmark selected model (llama-bench)"),
         help_row("y", "yank command"),
         help_row("t", "session manager"),
-        help_row("x / K", "stop / kill"),
-        help_row("R", "restart"),
+        help_row("x / K", "stop / kill / cancel"),
+        help_row("R", "restart / resume"),
         help_row("L", "view logs"),
         help_row("c", "copy endpoint"),
         Line::raw(""),
@@ -623,7 +804,16 @@ fn render_model_search(frame: &mut Frame, area: Rect, app: &App, search: &ModelS
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ACCENT))
-        .title(" Search models ");
+        .title(if search.online {
+            let suffix = search.scope.get(2..).unwrap_or_default().join(" / ");
+            if suffix.is_empty() {
+                " Search Hugging Face ".to_string()
+            } else {
+                format!(" Search Hugging Face / {suffix} ")
+            }
+        } else {
+            format!(" Search {} ", search.scope.last().map(String::as_str).unwrap_or("models"))
+        });
     let mut lines = vec![Line::from(vec![
         Span::styled("❯ ", Style::default().fg(ACCENT)),
         Span::raw(search.query.clone()),
@@ -763,4 +953,80 @@ fn center(area: Rect, horizontal: Constraint, vertical: Constraint) -> Rect {
     let [h] = Layout::horizontal([horizontal]).flex(Flex::Center).areas(area);
     let [v] = Layout::vertical([vertical]).flex(Flex::Center).areas(h);
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ICON_CLOUD, ICON_DIRECTORY, compact_count, download_progress, model_artifact_columns,
+        model_icon, truncate_download_name,
+    };
+
+    #[test]
+    fn counts_use_compact_repository_badges() {
+        assert_eq!(compact_count(999), "999");
+        assert_eq!(compact_count(1_200), "1.2k");
+        assert_eq!(compact_count(445_400), "445.4k");
+        assert_eq!(compact_count(1_250_000), "1.2m");
+    }
+
+    #[test]
+    fn download_progress_is_rendered_on_one_compact_line() {
+        assert_eq!(download_progress(400_000_000, 1_000_000_000, 40), "400.0 MB / 1.0 GB (40%)");
+    }
+
+    #[test]
+    fn download_name_is_truncated_from_the_left_to_preserve_progress() {
+        let name = "HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ2_M.gguf";
+        let metadata = " ⇣ 9.0 GB / 20.0 GB (45%)";
+        let truncated = truncate_download_name(name, metadata, 72);
+
+        assert!(truncated.starts_with('…'));
+        assert!(truncated.ends_with("Aggressive-IQ2_M.gguf"));
+        assert!(truncated.chars().count() + metadata.chars().count() <= 72);
+    }
+
+    #[test]
+    fn artifact_columns_show_quant_size_and_filename() {
+        let mut model = crate::domain::stubs::vllm_models().remove(0);
+        model.name = "Qwen-AgentWorld-35B-A3B-UD-Q4_K_M.gguf".into();
+        model.catalog_path = vec![model.name.clone()];
+        model.size_bytes = 20_600_000_000;
+        model.quantization = Some("Q4_K_M".into());
+        model.remote = Some(crate::domain::RemoteModel {
+            repo: "owner/repo".into(),
+            revision: None,
+            file: Some(model.name.clone()),
+            blobs: Vec::new(),
+            downloads: 0,
+            likes: 0,
+            gated: false,
+        });
+
+        assert_eq!(
+            model_artifact_columns(&model).unwrap(),
+            ("Q4_K_M      20.6 GB  ".into(), "Qwen-AgentWorld-35B-A3B-UD-Q4_K_M.gguf".into())
+        );
+
+        model.remote = None;
+        assert_eq!(
+            model_artifact_columns(&model).unwrap(),
+            ("Q4_K_M      20.6 GB  ".into(), "Qwen-AgentWorld-35B-A3B-UD-Q4_K_M.gguf".into())
+        );
+    }
+
+    #[test]
+    fn online_catalog_nodes_use_cloud_icons() {
+        let mut model = crate::domain::stubs::vllm_models().remove(0);
+        model.path = std::path::PathBuf::new();
+
+        model.catalog_path = vec!["online".into()];
+        assert_eq!(model_icon(&model), ICON_CLOUD);
+
+        model.catalog_path = vec!["online".into(), "huggingface".into()];
+        assert_eq!(model_icon(&model), ICON_CLOUD);
+
+        model.catalog_path = vec!["local-models".into()];
+        assert_eq!(model_icon(&model), ICON_DIRECTORY);
+    }
 }

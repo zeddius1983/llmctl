@@ -14,6 +14,7 @@ Living status of the build. Update this when phases complete or scope shifts
 | 4 | Log search & startup-failure classification | ◻ Post-v0.1.0 |
 | 5 | Search/filter & polish | ◻ Post-v0.1.0 |
 | 6 | Source-aware model catalog | ✅ Done |
+| 7 | Online Hugging Face catalog | ✅ Done |
 
 **v0.1.0 released** — Phases 0–3 (the MVP), plus extra launch options
 (`--no-mmap`, `--cache-type-k`/`-v`, speculative decoding) and a README, were
@@ -33,6 +34,12 @@ configuration on first run. See [release notes](release-notes-v0.2.0.md).
 device selection populated by `llama-server --list-devices`, plus optional
 `llama-bench` discovery and the `b` benchmark shortcut. See
 [release notes](release-notes-v0.2.1.md).
+
+**Online Hugging Face catalog implemented** — adds a lazy virtual
+`online ▸ huggingface` source, cached trending/repository metadata, remote
+model-scoped profiles, transient debounced server-side search with
+selection-only persistence, context-sensitive refresh, and llama.cpp-native
+download-and-launch.
 
 Branching: each remaining phase is built on its own `feature/<task>` branch.
 When a batch is ready to ship, the feature branches merge into a release umbrella
@@ -114,7 +121,23 @@ supports selector or inline hotkey cycling. When `llama-bench` is installed,
 `b` benchmarks the selected model in the foreground and forwards concrete
 profile device and GPU-layer settings.
 
+### Phase 7 — Online Hugging Face catalog
+Virtual `online ▸ huggingface` hierarchy with cached 20-model Trending,
+Most likes, and Most downloads views across text and multimodal pipelines; lazy
+repository file/metadata fetches; debounced `/` Hub search; split-shard
+grouping; remote profile identity; `HF_TOKEN`-safe `--hf-repo`/`--hf-file`
+launch; clean-layout `F5`; and automatic linking to the standard Hugging Face
+cache after download. Sessions track known LFS blobs in that cache and display
+`Downloading (N%)` before the model-loading `Starting` phase. Uncached GGUF
+artifacts can also be downloaded directly with `d`, with resumable aggregate
+shard progress displayed as concurrent jobs in a Downloads pane below Sessions;
+selected downloads support cancellation and resume. Incomplete download jobs
+survive restart as explicitly resumable `Interrupted` rows.
+
 ## Next (post-v0.2.1)
+
+### Online Hugging Face follow-ups
+- [ ] Recent sorting and size/quantization filters
 
 ### Phase 4 — Log search & startup-failure classification
 - [ ] Log view search / filtering (`L` already tails + scrolls)

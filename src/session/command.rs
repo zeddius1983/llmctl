@@ -28,6 +28,25 @@ impl Command {
     pub fn build(binary: &str, model_path: &str, options: &[OptionItem]) -> Self {
         let mut argv = vec![binary.to_string(), "-m".to_string(), model_path.to_string()];
 
+        Self::append_options(&mut argv, options);
+        Self { argv }
+    }
+
+    /// Build a command that lets llama.cpp download/cache an exact GGUF file
+    /// from Hugging Face before loading it.
+    pub fn build_huggingface(binary: &str, repo: &str, file: &str, options: &[OptionItem]) -> Self {
+        let mut argv = vec![
+            binary.to_string(),
+            "--hf-repo".into(),
+            repo.to_string(),
+            "--hf-file".into(),
+            file.to_string(),
+        ];
+        Self::append_options(&mut argv, options);
+        Self { argv }
+    }
+
+    fn append_options(argv: &mut Vec<String>, options: &[OptionItem]) {
         for opt in options {
             if registry::omit_token(&opt.key) == Some(opt.value.as_str()) {
                 continue;
@@ -37,7 +56,6 @@ impl Command {
                 argv.push(registry::cli_value(&opt.key, &opt.value));
             }
         }
-        Self { argv }
     }
 
     /// Single-line, shell-quoted command suitable for copy/paste.
@@ -134,6 +152,21 @@ mod tests {
                 "8000",
             ]
         );
+    }
+
+    #[test]
+    fn builds_hugging_face_repo_and_exact_file() {
+        let cmd = Command::build_huggingface(
+            "llama-server",
+            "owner/model-GGUF",
+            "model-Q4_K_M.gguf",
+            &sample_options(),
+        );
+        assert_eq!(
+            &cmd.argv[..5],
+            ["llama-server", "--hf-repo", "owner/model-GGUF", "--hf-file", "model-Q4_K_M.gguf",]
+        );
+        assert!(!cmd.argv.iter().any(|arg| arg.starts_with("hf_")));
     }
 
     #[test]
