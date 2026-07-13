@@ -35,11 +35,11 @@ device selection populated by `llama-server --list-devices`, plus optional
 `llama-bench` discovery and the `b` benchmark shortcut. See
 [release notes](release-notes-v0.2.1.md).
 
-**Online Hugging Face catalog implemented** — adds a lazy virtual
-`online ▸ huggingface` source, cached trending/repository metadata, remote
-model-scoped profiles, transient debounced server-side search with
-selection-only persistence, context-sensitive refresh, and llama.cpp-native
-download-and-launch.
+**v0.3.0 — online Hugging Face catalog** — adds a lazy virtual
+`online ▸ huggingface` source, Trending/Most likes/Most downloads views,
+scoped Hub search, remote model profiles and llama.cpp-native launch, plus
+concurrent resumable downloads that survive restart. See
+[release notes](release-notes-v0.3.0.md).
 
 Branching: each remaining phase is built on its own `feature/<task>` branch.
 When a batch is ready to ship, the feature branches merge into a release umbrella
@@ -134,7 +134,7 @@ shard progress displayed as concurrent jobs in a Downloads pane below Sessions;
 selected downloads support cancellation and resume. Incomplete download jobs
 survive restart as explicitly resumable `Interrupted` rows.
 
-## Next (post-v0.2.1)
+## Next (post-v0.3.0)
 
 ### Online Hugging Face follow-ups
 - [ ] Recent sorting and size/quantization filters

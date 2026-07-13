@@ -69,7 +69,8 @@ legacy profile migration), `~/.cache/llmctl/` (models.json, llama-server.help.tx
 - Synchronous poll-tick refresh + `libc` for process control, not tokio/nix —
   ADR-007.
 - Source-aware physical model catalog with per-model profiles — ADR-009.
-- Lazy `online ▸ huggingface` catalog, with llama.cpp-owned downloads — ADR-010.
+- Lazy `online ▸ huggingface` catalog, with native llama.cpp launches and
+  resumable llmctl-managed downloads — ADR-010.
 
 ## Coding standards
 
