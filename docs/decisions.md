@@ -125,7 +125,10 @@ one-line registry addition.
 
 ## ADR-007: Synchronous poll-tick + `libc` for sessions (not tokio/nix)
 
-**Status:** Accepted (supersedes the Phase 3 plan to add tokio + nix)
+**Status:** Accepted (supersedes the Phase 3 plan to add tokio + nix).
+*Amended 2026-07-13:* avoiding an async runtime is no longer a hard
+constraint — tokio is acceptable when it genuinely simplifies a feature
+(see ADR-010, which still chose blocking threads).
 
 **Context:** Phase 3 (launch & sessions) needs to spawn detached servers, signal
 them, sample `/proc`, poll `/health`, and refresh the UI periodically. The
@@ -219,3 +222,61 @@ descriptors, catalog reconciliation, collision-safe path normalization, legacy
 profile migration, and variable-depth browser state. The catalog contains
 absolute source paths and is therefore local machine state despite residing in
 the XDG configuration directory.
+
+---
+
+## ADR-010: Online Hugging Face hub browser with blocking worker threads
+
+**Status:** Accepted
+
+**Context:** Users want to discover and fetch models without leaving the TUI:
+search Hugging Face online, pick a quantization, download it, and launch it.
+The hub's browse page filter (`pipeline_tag=text-generation&library=gguf&
+apps=llama.cpp&sort=trending`) maps directly onto the REST API
+(`sort=trendingScore`), so results can be pre-filtered to models llama.cpp can
+actually run. ADR-007 chose a synchronous poll-tick loop with no async runtime;
+the user has since relaxed that constraint — an async runtime is acceptable
+when it simplifies development.
+
+**Decision:** The hub is browsed **as a folder, not a screen**: a virtual
+`online ▸ huggingface` directory beside the local sources in the normal Miller
+columns (initially built as a dedicated `H` screen, reworked per user feedback
+before merging). Its children are synthesized from hub state: the repo list
+(trending, or the last committed search) and, inside a repo, its GGUF
+artifacts as remote file leaves (`Model::remote` marks virtual nodes; remote
+files are leaves but not launchable). Enter on a remote file downloads it, or
+jumps to the local catalog leaf once it is on disk.
+
+`/` search became **folder-scoped everywhere**: it searches recursively under
+the current catalog prefix only — never parents. Locally that filters the
+scanned models under the prefix; at the hub folder it queries the Hugging Face
+API live per keystroke (epoch-guarded); inside a repo it filters that repo's
+files. Committing an online search makes its results the folder listing.
+
+Networking uses blocking `ureq` (rustls, no new runtime): even with tokio
+permitted, the TUI loop stays synchronous, so worker `std::thread`s reporting
+over an `mpsc` channel — drained once per loop turn — remain the simpler
+bridge. Download progress is shared via `Arc<AtomicU64>` and rendered every
+frame (row markers plus a header activity indicator); cancellation via
+`Arc<AtomicBool>` checked between chunks.
+
+Repo file listings (`/api/models/<id>?blobs=true`) are collapsed into logical
+artifacts: `mmproj` projectors dropped, `-000NN-of-000NN` shard sets grouped
+and size-summed, quant labels reused from discovery. Downloads stream into
+`<file>.part` and are renamed into place only when complete, so the scanner
+never sees partial GGUFs; interrupted/cancelled transfers resume with HTTP
+`Range`. Files land in `models.download_dir` (default `~/models/huggingface`,
+under the standard `~/models` source) as `<owner>/<repo>/<file>`; when the
+configured directory is outside every scanned source an implicit `downloads`
+source covers it. A finished download triggers the normal rescan, so the model
+appears in the catalog with profiles and is launched like any local model —
+no special "remote model" state beyond the virtual browse nodes. `HF_TOKEN`
+(env) is forwarded for gated repos.
+
+**Consequences:** One new dependency (`ureq`). Search/listing/download logic is
+unit-tested from JSON fixtures; the API's response shape is normalized in one
+place (`hub/api.rs`). Because completed downloads are plain files in a scanned
+source, removal, re-download detection ("✓ downloaded"), and launching all
+reuse existing machinery. Parallel multi-file downloads work naturally (one
+thread each); a future switch to async (per the relaxed ADR-007) would only
+change the transport, not the screen or event flow.

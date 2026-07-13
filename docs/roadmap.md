@@ -14,6 +14,7 @@ Living status of the build. Update this when phases complete or scope shifts
 | 4 | Log search & startup-failure classification | ◻ Post-v0.1.0 |
 | 5 | Search/filter & polish | ◻ Post-v0.1.0 |
 | 6 | Source-aware model catalog | ✅ Done |
+| 7 | Hugging Face hub browser | ✅ Done (`feature/hf-browse`, unreleased) |
 
 **v0.1.0 released** — Phases 0–3 (the MVP), plus extra launch options
 (`--no-mmap`, `--cache-type-k`/`-v`, speculative decoding) and a README, were
@@ -113,6 +114,22 @@ Profile-level `device` selection discovers accelerator identifiers such as
 supports selector or inline hotkey cycling. When `llama-bench` is installed,
 `b` benchmarks the selected model in the foreground and forwards concrete
 profile device and GPU-layer settings.
+
+### Phase 7 — Hugging Face hub browser (`feature/hf-browse`)
+The hub as a virtual `online/huggingface` folder in the normal Miller
+navigation (no separate screen): trending repos pre-filtered to
+llama.cpp-runnable GGUF models (`pipeline_tag=text-generation&library=gguf&
+apps=llama.cpp`), repo folders listing artifacts with shard grouping, quant
+labels, sizes, arch/ctx, gated flag. `/` is folder-scoped everywhere
+(recursive under the current prefix only): local filter in local folders, live
+online search at the hub folder, file filter inside a repo. Enter on a file
+downloads in the background (blocking `ureq` on worker threads + mpsc, per
+ADR-010) with row/header progress, `x` cancel, `.part` staging and HTTP-Range
+resume; `HF_TOKEN` for gated repos. Downloads land in `models.download_dir`
+(default `~/models/huggingface`, implicit `downloads` source if uncovered),
+rescan quietly on completion, and Enter on a downloaded file jumps to its
+catalog leaf. 10 new unit tests; PTY-verified end-to-end (real 88 MB download,
+byte-exact, catalog reconciled; online search, filter, cancel/resume, jump).
 
 ## Next (post-v0.2.1)
 

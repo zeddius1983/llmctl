@@ -40,6 +40,16 @@ and watch them from a built-in session manager.
   port, uptime, and `/proc`-sampled CPU & memory; a `/health` probe promotes
   Starting → Running. Stop (`x`), kill (`K`), restart (`R`), copy endpoint (`c`),
   and tail logs (`L`).
+- **Hugging Face hub as a folder** — a virtual `online/huggingface` directory
+  sits beside your local sources: browse trending repos (pre-filtered to GGUF
+  models that run with llama.cpp); selecting a repo previews its quantizations
+  with sizes in the Files pane automatically. Press Enter on a file to
+  download it in the background with progress and resume (`x` cancels).
+  Finished downloads land in the model catalog ready to launch; Enter on a
+  downloaded file jumps straight to it. Set `HF_TOKEN` for gated repos.
+- **Scoped search** — `/` searches recursively **within the folder you're in**
+  (never parents). Inside `online/huggingface` it searches Hugging Face online
+  as you type; inside a repo it filters that repo's files.
 
 ## Requirements
 
@@ -91,7 +101,7 @@ overlay.
 | `l` / `→` | Drill into selection |
 | `h` / `←` | Back up a level |
 | `g` / `G` | First / last item |
-| `/` | Search all models and jump to a result |
+| `/` | Search the current folder recursively (online search inside the hub) |
 | **Profiles** | |
 | `a` | Create profile |
 | `r` | Rename (custom profiles only) |
@@ -112,6 +122,10 @@ overlay.
 | `R` | Restart |
 | `L` | View logs |
 | `c` | Copy endpoint |
+| **Hugging Face (`online/` folder)** | |
+| `Enter` / `l` | Open repo / download file / open downloaded model |
+| `x` | Cancel the selected file's download (resumable) |
+| `F5` | Refresh the current hub listing |
 | **General** | |
 | `F5` | Rescan / reload |
 | `?` / `q` | Help / quit |
@@ -134,6 +148,10 @@ first run it creates `~/.config/llmctl/config.toml` with the llama.cpp cache,
 Hugging Face, LM Studio, and `~/models` sources. Edit that file to add a source:
 
 ```toml
+[models]
+# Where downloads from the online/huggingface folder are stored.
+download_dir = "~/models/huggingface"
+
 [[models.sources]]
 name = "nas"
 path = "/mnt/nas/llms"

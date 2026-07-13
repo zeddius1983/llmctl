@@ -21,6 +21,16 @@ pub struct Runtime {
     pub devices: Vec<String>,
 }
 
+/// What a virtual node in the online hub subtree represents. Local models and
+/// plain catalog directories leave [`Model::remote`] unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemoteKind {
+    /// A Hugging Face repository — behaves like a directory of artifacts.
+    Repo,
+    /// A downloadable GGUF artifact — a leaf, but not launchable until fetched.
+    File,
+}
+
 /// A discovered GGUF model. Serializable so the scanner can cache results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
@@ -45,6 +55,9 @@ pub struct Model {
     /// Last-modified time, seconds since the Unix epoch (cache invalidation).
     pub modified: Option<u64>,
     pub has_chat_template: bool,
+    /// Set for virtual nodes under the `online` hub subtree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteKind>,
 }
 
 /// A reusable launch configuration.
@@ -80,13 +93,20 @@ impl Runtime {
 }
 
 impl Model {
-    /// Synthetic catalog directories have no launchable source path.
+    /// Synthetic catalog directories have no launchable source path. Remote
+    /// files also have no path but are leaves, not directories.
     pub fn is_catalog_dir(&self) -> bool {
-        self.path.as_os_str().is_empty()
+        self.path.as_os_str().is_empty() && !self.is_remote_file()
     }
 
+    /// A launchable local model leaf.
     pub fn is_model(&self) -> bool {
-        !self.is_catalog_dir()
+        !self.path.as_os_str().is_empty()
+    }
+
+    /// A downloadable hub artifact that is browsed like a file.
+    pub fn is_remote_file(&self) -> bool {
+        self.remote == Some(RemoteKind::File)
     }
 
     pub fn display_label(&self) -> &str {
@@ -108,6 +128,15 @@ pub fn format_unix_date(secs: u64) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     let year = if month <= 2 { year + 1 } else { year };
     format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Compact counts for likes/downloads (e.g. `86k`, `1.2M`).
+pub fn human_count(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => format!("{:.1}k", n as f64 / 1_000.0),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
 }
 
 /// Format a byte count as a short human string (e.g. "12.3 GB").
@@ -169,6 +198,7 @@ pub mod stubs {
             context_length: None,
             modified: None,
             has_chat_template: true,
+            remote: None,
         };
         vec![
             model(

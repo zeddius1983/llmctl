@@ -214,6 +214,7 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
+            remote: None,
         }
     }
 

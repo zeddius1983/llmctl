@@ -19,8 +19,8 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
 
-use crate::app::{App, Message, ModelSearch, Pane, Prompt, Screen, Selector};
-use crate::domain::human_size;
+use crate::app::{App, Message, ModelSearch, Pane, Prompt, Screen, SearchMode, Selector};
+use crate::domain::{Model, RemoteKind, human_count, human_size};
 use crate::session::{Session, SessionStatus, format_uptime};
 
 const ACCENT: Color = Color::Yellow;
@@ -34,6 +34,7 @@ const ICON_OPTION: &str = "\u{f1de}"; // sliders
 const ICON_ROOT: &str = "\u{f015}"; // home
 const ICON_SESSION: &str = "\u{f233}"; // server
 const ICON_LOG: &str = "\u{f15c}"; // file-text
+const ICON_HUB: &str = "\u{f0c2}"; // cloud (online hub nodes)
 
 fn level_icon(level: Pane) -> &'static str {
     match level {
@@ -119,7 +120,12 @@ fn draw_browser(frame: &mut Frame, app: &mut App) {
 /// Render one level's list into a column, styled for its role.
 fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: Role) {
     let focused = role == Role::Current;
-    let block = pane_block(level.title(), focused);
+    // Inside a hub repository, the model column keeps the "Files" tab name.
+    let title = match level {
+        Pane::Model => app.model_pane_title(),
+        other => other.title().to_string(),
+    };
+    let block = pane_block(&title, focused);
 
     // Build owned items first so the immutable borrow ends before we take the
     // mutable state borrow below.
@@ -131,16 +137,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
             .iter()
             .map(|r| ListItem::new(format!("{icon}  {}", r.name)))
             .collect(),
-        Pane::Model => app
-            .models
-            .items
-            .iter()
-            .map(|m| {
-                let label = m.display_label();
-                let item_icon = if m.is_catalog_dir() { "" } else { icon };
-                ListItem::new(format!("{item_icon}  {label}"))
-            })
-            .collect(),
+        Pane::Model => app.models.items.iter().map(|m| model_item(app, m)).collect(),
         Pane::Profile => app
             .profiles
             .items
@@ -212,19 +209,60 @@ fn render_catalog_parent(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_catalog_preview(frame: &mut Frame, area: Rect, app: &App) {
-    let items: Vec<ListItem> = app
-        .catalog_preview
-        .iter()
-        .map(|m| {
-            let label = m.display_label();
-            let icon = if m.is_catalog_dir() { "" } else { level_icon(Pane::Model) };
-            ListItem::new(format!("{icon}  {label}"))
-        })
-        .collect();
+    // Previewing a repository shows its file listing under the classic title.
+    let title = match app.models.selected() {
+        Some(m) if m.remote == Some(RemoteKind::Repo) => "Files",
+        _ => "Model",
+    };
+    let items: Vec<ListItem> = app.catalog_preview.iter().map(|m| model_item(app, m)).collect();
     frame.render_widget(
-        List::new(items).block(pane_block("Model", false)).style(Style::default().dim()),
+        List::new(items).block(pane_block(title, false)).style(Style::default().dim()),
         area,
     );
+}
+
+/// One model-pane row. Local leaves and directories render as before; online
+/// hub nodes add popularity / size / download-state context.
+fn model_item(app: &App, m: &Model) -> ListItem<'static> {
+    let label = m.display_label();
+    // Remote files use the classic Files-view columns: quant, size, name.
+    if m.is_remote_file() {
+        let quant = m.quantization.clone().unwrap_or_default();
+        let size = if m.size_bytes > 0 { human_size(m.size_bytes) } else { "?".into() };
+        let parts = if m.shard_paths.len() > 1 {
+            format!(" ({} parts)", m.shard_paths.len())
+        } else {
+            String::new()
+        };
+        let mut spans = vec![
+            Span::raw(format!("{quant:<9} ")),
+            Span::styled(format!("{size:>9}"), Style::default().fg(ACCENT)),
+            Span::raw(format!("  {label}{parts}")),
+        ];
+        if let Some(marker) = app.hub_file_marker(m) {
+            spans.push(Span::styled(format!("  {marker}"), Style::default().fg(Color::Green)));
+        }
+        return ListItem::new(Line::from(spans));
+    }
+    if m.remote == Some(RemoteKind::Repo) {
+        let meta = app
+            .hub_repo_meta(m)
+            .map(|r| format!("  ♥{} ⇩{}", human_count(r.likes), human_count(r.downloads)))
+            .unwrap_or_default();
+        return ListItem::new(Line::from(vec![
+            Span::raw(format!("{ICON_HUB}  {label}")),
+            Span::styled(meta, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    if m.is_catalog_dir() {
+        let icon = if m.catalog_path.first().map(String::as_str) == Some("online") {
+            ICON_HUB
+        } else {
+            "\u{f07b}" // folder
+        };
+        return ListItem::new(format!("{icon}  {label}"));
+    }
+    ListItem::new(format!("{}  {label}", level_icon(Pane::Model)))
 }
 
 /// The virtual root shown left of the Runtime column.
@@ -261,11 +299,20 @@ fn render_option_detail(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let crumbs = app.breadcrumb().join(" / ");
-    let breadcrumb = Line::from(vec![
+    let mut spans = vec![
         Span::styled(" / ", Style::default().fg(Color::DarkGray)),
         Span::styled(crumbs, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-    ]);
-    frame.render_widget(Paragraph::new(breadcrumb), area);
+    ];
+    // Background hub activity: in-flight fetches, downloads, or errors.
+    if let Some((text, is_error)) = app.hub_activity() {
+        let style = if is_error {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(format!("   {text}"), style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// All status lives at the bottom: path, then metadata, then context hotkeys.
@@ -297,12 +344,17 @@ fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
     match app.focus {
         Pane::Runtime => {
             keys.push(("l", "enter"));
-            keys.push(("/", "search models"));
+            keys.push(("/", "search"));
         }
         Pane::Model => {
             keys.push(("h/l", "back/enter"));
-            keys.push(("/", "search models"));
-            keys.push(("F5", "rescan"));
+            keys.push(("/", if app.browsing_hub() { "search hub" } else { "search folder" }));
+            let remote_file = app.models.selected().map(|m| m.is_remote_file()).unwrap_or(false);
+            if remote_file {
+                keys.push(("Enter", "download/open"));
+                keys.push(("x", "cancel dl"));
+            }
+            keys.push(("F5", if app.browsing_hub() { "refresh" } else { "rescan" }));
             if app.benchmark_available() {
                 keys.push(("b", "benchmark"));
             }
@@ -569,7 +621,12 @@ fn render_help(frame: &mut Frame, area: Rect) {
         help_row("l / →", "drill into selection"),
         help_row("h / ←", "back up a level"),
         help_row("g / G", "first / last item"),
-        help_row("/", "search models"),
+        help_row("/", "search current folder (recursive)"),
+        Line::raw(""),
+        Line::from("Hugging Face (online/ folder)".bold()),
+        help_row("/", "search the hub online"),
+        help_row("Enter", "download / open artifact"),
+        help_row("x", "cancel download (resumable)"),
         Line::raw(""),
         Line::from("Profiles".bold()),
         help_row("a", "create profile"),
@@ -615,30 +672,42 @@ fn render_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
+/// The `/` search popup. Scoped to the current folder: local models, the
+/// online Hugging Face repo search, or the opened hub repo's files.
 fn render_model_search(frame: &mut Frame, area: Rect, app: &App, search: &ModelSearch) {
-    let results = app.search_results();
-    let visible = results.len().min(12);
+    let rows = app.search_rows();
+    let visible = rows.len().min(12);
     let popup = center(area, Constraint::Percentage(72), Constraint::Length(visible as u16 + 4));
+    let title = match search.mode {
+        SearchMode::HubRepos => " Search Hugging Face ".to_string(),
+        SearchMode::HubFiles => {
+            format!(" Search files — {} ", search.scope.last().map(String::as_str).unwrap_or(""))
+        }
+        SearchMode::Local if search.scope.is_empty() => " Search models ".into(),
+        SearchMode::Local => format!(" Search in {} ", search.scope.join("/")),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ACCENT))
-        .title(" Search models ");
+        .title(title);
     let mut lines = vec![Line::from(vec![
         Span::styled("❯ ", Style::default().fg(ACCENT)),
         Span::raw(search.query.clone()),
         Span::styled("▏", Style::default().add_modifier(Modifier::SLOW_BLINK)),
     ])];
-    if results.is_empty() {
-        lines.push(Line::from("  No matching models".dim()));
+    if rows.is_empty() {
+        let empty = if search.mode == SearchMode::HubRepos && app.hub_activity().is_some() {
+            "  Searching…"
+        } else {
+            "  No matches"
+        };
+        lines.push(Line::from(empty.dim()));
     } else {
         let start = search.cursor.saturating_sub(visible.saturating_sub(1));
-        for (index, model) in results.iter().enumerate().skip(start).take(visible) {
+        for (index, (label, context)) in rows.iter().enumerate().skip(start).take(visible) {
             let selected = index == search.cursor;
-            let label = model.display_label();
-            let context =
-                model.catalog_path[..model.catalog_path.len().saturating_sub(1)].join(" / ");
-            let line = format!("{} {}  ·  {}", if selected { "▸" } else { " " }, label, context);
+            let line = format!("{} {label}  ·  {context}", if selected { "▸" } else { " " });
             lines.push(if selected {
                 Line::from(line).fg(Color::Black).bg(ACCENT).bold()
             } else {

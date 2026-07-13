@@ -305,6 +305,7 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
+            remote: None,
         }];
         let catalog = root.join("catalog");
         reconcile(&catalog, &mut models);

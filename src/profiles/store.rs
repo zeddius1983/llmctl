@@ -443,6 +443,7 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
+            remote: None,
         };
         let store = ProfileStore::load(legacy.clone(), &[model]);
         assert_eq!(
@@ -475,6 +476,7 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
+            remote: None,
         };
         let mut store = ProfileStore::load(legacy.clone(), &[model]);
         store.set_value(

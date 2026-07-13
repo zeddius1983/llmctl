@@ -23,15 +23,21 @@ command again. The MVP targets **llama.cpp + GGUF on Linux**; other runtimes
 - **anyhow** / **thiserror** — errors. **tracing** — file-based logging.
 - **libc** — `setsid`/signals for detached sessions, `/proc` sampling, `sysconf`.
   No async runtime: a poll-based tick (`crossterm::event::poll`) drives live
-  session refresh instead of tokio (ADR-007).
+  session refresh instead of tokio (ADR-007; amended — tokio is now allowed
+  when it simplifies a feature, but nothing uses it yet).
+- **ureq** — blocking HTTP for the Hugging Face hub browser; network work runs
+  on worker threads reporting over `mpsc` (ADR-010).
 
 ## Architecture (summary)
 
 Yazi-style sliding three-column view (Parent | Current | Preview) over the
 hierarchy `root ▸ Runtime ▸ source ▸ provider/repository ▸ Model ▸ Profile ▸ Options`.
 The catalog portion has variable depth. Child lists are derived
-from the parent selection. See [docs/architecture.md](docs/architecture.md) for
-component structure and data flow.
+from the parent selection. A virtual `online ▸ huggingface` folder at the
+catalog root exposes the Hugging Face hub as browsable/downloadable remote
+nodes (ADR-010); `/` search is always scoped to the current folder. See
+[docs/architecture.md](docs/architecture.md) for component structure and data
+flow.
 
 ## Directory layout
 
@@ -43,6 +49,8 @@ src/
   domain/        pure types (Runtime, Model, Profile, OptionItem), helpers, vLLM stubs
   discovery/     catalog.rs (source parsing + managed tree), gguf.rs (header parser),
                  models.rs (scan+cache), runtimes.rs (llama.cpp)
+  hub/           Hugging Face: api.rs (search + file listings), download.rs (.part + resume),
+                 mod.rs (worker-thread spawns + HubEvent channel)
   profiles/      registry.rs (option specs), templates.rs, store.rs (per-model YAML), mod.rs (resolution)
   session/       command.rs (builder), supervisor.rs (DetachedSupervisor: setsid/signals),
                  record.rs (session-<id>.json), proc.rs (/proc), health.rs (/health), mod.rs (SessionManager)
@@ -65,8 +73,11 @@ legacy profile migration), `~/.cache/llmctl/` (models.json, llama-server.help.tx
 - Sessions: detached processes (`setsid`) + rediscover, behind a
   `SessionSupervisor` trait — ADR-005 (implemented in Phase 3).
 - Synchronous poll-tick refresh + `libc` for process control, not tokio/nix —
-  ADR-007.
+  ADR-007 (amended: tokio permissible when it simplifies).
 - Source-aware physical model catalog with per-model profiles — ADR-009.
+- Hugging Face hub browsed as a virtual `online/huggingface` folder with
+  folder-scoped `/` search; blocking `ureq` on worker threads + mpsc,
+  downloads staged as `.part` with resume — ADR-010.
 
 ## Coding standards
 

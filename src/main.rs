@@ -4,6 +4,7 @@ mod app;
 mod config;
 mod discovery;
 mod domain;
+mod hub;
 mod profiles;
 mod session;
 mod ui;

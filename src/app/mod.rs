@@ -4,18 +4,25 @@
 //! parent's selection and only revealed one level ahead of focus (see
 //! `IMPLEMENTATION_PLAN.md` → Navigation model).
 
+pub mod hub;
+
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::DefaultTerminal;
 use ratatui::widgets::ListState;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, ModelLayout, ModelSourceConfig, Paths};
 use crate::discovery;
 use crate::discovery::ModelSource;
-use crate::domain::{Model, OptionItem, Profile, Runtime, format_unix_date, human_size, stubs};
+use crate::domain::{
+    Model, OptionItem, Profile, RemoteKind, Runtime, format_unix_date, human_count, human_size,
+    stubs,
+};
+use crate::hub::{HubEvent, HubModel};
 use crate::profiles::{self, ProfileStore, store};
 use crate::session::{self, LaunchRequest, SessionManager};
 use crate::ui;
@@ -62,10 +69,39 @@ pub struct Selector {
     pub cursor: usize,
 }
 
+/// What `/` searches at the current location. Search is always scoped to the
+/// folder the user is in (recursively) — never across parent folders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    /// Local models under the current catalog folder.
+    Local,
+    /// Online Hugging Face repository search (inside `online/huggingface`).
+    HubRepos,
+    /// The opened hub repository's GGUF artifacts.
+    HubFiles,
+}
+
 pub struct ModelSearch {
     pub query: String,
     pub cursor: usize,
+    pub mode: SearchMode,
+    /// The catalog folder this search is scoped to.
+    pub scope: Vec<String>,
+    /// Matches for [`SearchMode::Local`] (indices into the scanned models)
+    /// and [`SearchMode::HubFiles`] (indices into the model pane items).
     result_indices: Vec<usize>,
+    /// Live results for [`SearchMode::HubRepos`], updated as responses land.
+    pub online_results: Vec<HubModel>,
+}
+
+impl ModelSearch {
+    /// How many rows the popup currently has.
+    pub fn len(&self) -> usize {
+        match self.mode {
+            SearchMode::HubRepos => self.online_results.len(),
+            _ => self.result_indices.len(),
+        }
+    }
 }
 
 struct CatalogRoute {
@@ -247,13 +283,24 @@ pub struct App {
     pending_chat: Option<Vec<String>>,
     /// A foreground `llama-bench` invocation for the selected model.
     pending_benchmark: Option<Vec<String>>,
+    /// Hugging Face hub browser state (results, file listings, downloads).
+    pub hub: hub::HubState,
+    /// Sender cloned into hub worker threads.
+    hub_tx: mpsc::Sender<HubEvent>,
+    /// Completed hub work, drained every loop turn.
+    hub_events: mpsc::Receiver<HubEvent>,
+    /// Where hub downloads are stored (`models.download_dir`).
+    download_dir: PathBuf,
 }
 
 impl App {
     pub fn new(config: Config, paths: Paths) -> Self {
         // Discover the real llama.cpp runtime; keep vLLM as a demo stub.
         let llama = discovery::discover_llama_cpp(&config.runtime.llama_cpp, &paths.cache_dir);
-        let model_sources = resolve_model_sources(&config.models.paths, &config.models.sources);
+        let download_dir =
+            resolve_download_dir(config.models.download_dir.as_ref(), &paths.cache_dir);
+        let model_sources =
+            resolve_model_sources(&config.models.paths, &config.models.sources, &download_dir);
         let model_cache = paths.cache_dir.join("models.json");
         let mut scanned_models = discovery::scan_models(&model_sources, &model_cache);
         discovery::reconcile(&paths.models_dir, &mut scanned_models);
@@ -261,6 +308,7 @@ impl App {
         // Built after discovery's one-shot `Command`s: the supervisor ignores
         // SIGCHLD, which would otherwise prevent reaping those probe processes.
         let sessions = SessionManager::new(paths.sessions_dir.clone(), paths.log_dir.clone());
+        let (hub_tx, hub_events) = mpsc::channel();
 
         let mut app = Self {
             config,
@@ -292,6 +340,10 @@ impl App {
             last_tick: Instant::now(),
             pending_chat: None,
             pending_benchmark: None,
+            hub: hub::HubState::new(),
+            hub_tx,
+            hub_events,
+            download_dir,
         };
         app.sync_session_selection();
         // Derive the whole chain from the initially-selected runtime.
@@ -304,6 +356,8 @@ impl App {
     /// blocking on input (no async runtime needed — see ADR-007).
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.should_quit {
+            // Apply finished hub work (searches, downloads) before drawing.
+            self.drain_hub_events();
             if self.last_tick.elapsed() >= Duration::from_secs(1) {
                 self.tick();
             }
@@ -378,18 +432,14 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.show_help = true,
-            KeyCode::Char('/') => {
-                self.model_search = Some(ModelSearch {
-                    query: String::new(),
-                    cursor: 0,
-                    result_indices: self.ranked_model_indices(""),
-                })
-            }
+            KeyCode::Char('/') => self.open_search(),
             KeyCode::Char('t') => self.open_sessions(),
             KeyCode::Char('y') => self.yank_command(),
             KeyCode::Char('s') => self.start_session(),
             KeyCode::Char('C') => self.start_chat(),
             KeyCode::Char('b') => self.start_benchmark(),
+            // Cancel the selected remote file's download (hub subtree).
+            KeyCode::Char('x') => self.hub_cancel_selected(),
 
             // Move focus across panes. In Options (the leaf) Enter edits the
             // selected value instead; `l`/Right stay pure navigation.
@@ -433,21 +483,39 @@ impl App {
         }
     }
 
+    /// Open the `/` search, scoped to the current folder. In the hub subtree
+    /// it searches Hugging Face online (repo lists) or the opened repository's
+    /// files; everywhere else it searches local models under the prefix.
+    fn open_search(&mut self) {
+        let scope = self.catalog_prefix.clone();
+        let mode = if hub::in_hub_tree(&scope) {
+            if scope.len() >= 3 { SearchMode::HubFiles } else { SearchMode::HubRepos }
+        } else {
+            SearchMode::Local
+        };
+        let mut search = ModelSearch {
+            query: String::new(),
+            cursor: 0,
+            mode,
+            scope,
+            result_indices: Vec::new(),
+            online_results: Vec::new(),
+        };
+        match mode {
+            SearchMode::Local => {
+                search.result_indices = self.ranked_model_indices("", &search.scope)
+            }
+            SearchMode::HubFiles => search.result_indices = self.hub_file_indices(""),
+            // Start from what the folder already shows; typing re-queries.
+            SearchMode::HubRepos => search.online_results = self.hub.results.clone(),
+        }
+        self.model_search = Some(search);
+    }
+
     fn model_search_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => self.model_search = None,
-            KeyCode::Enter => {
-                let target = self
-                    .model_search
-                    .as_ref()
-                    .and_then(|s| s.result_indices.get(s.cursor))
-                    .and_then(|i| self.scanned_models.get(*i))
-                    .map(|m| m.id.clone());
-                self.model_search = None;
-                if let Some(id) = target {
-                    self.jump_to_model(&id);
-                }
-            }
+            KeyCode::Enter => self.commit_search(),
             KeyCode::Up => {
                 if let Some(search) = self.model_search.as_mut() {
                     search.cursor = search.cursor.saturating_sub(1);
@@ -455,7 +523,7 @@ impl App {
             }
             KeyCode::Down => {
                 if let Some(search) = self.model_search.as_mut() {
-                    let max = search.result_indices.len().saturating_sub(1);
+                    let max = search.len().saturating_sub(1);
                     search.cursor = (search.cursor + 1).min(max);
                 }
             }
@@ -477,30 +545,135 @@ impl App {
         }
     }
 
-    pub fn search_results(&self) -> Vec<&Model> {
+    /// Apply the selection under the cursor and close the popup.
+    fn commit_search(&mut self) {
+        let Some(search) = self.model_search.take() else { return };
+        match search.mode {
+            SearchMode::Local => {
+                let target = search
+                    .result_indices
+                    .get(search.cursor)
+                    .and_then(|i| self.scanned_models.get(*i))
+                    .map(|m| m.id.clone());
+                if let Some(id) = target {
+                    self.jump_to_model(&id);
+                }
+            }
+            SearchMode::HubFiles => {
+                if let Some(i) = search.result_indices.get(search.cursor) {
+                    self.models.state.select(Some(*i));
+                    self.rebuild_below(Pane::Model);
+                }
+            }
+            SearchMode::HubRepos => {
+                if search.online_results.is_empty() {
+                    return;
+                }
+                let cursor = search.cursor.min(search.online_results.len() - 1);
+                let picked = search.online_results[cursor].id.clone();
+                // The committed results become the folder listing.
+                self.hub.results = search.online_results;
+                self.hub.query = search.query;
+                self.hub_goto_repo_list(&picked);
+            }
+        }
+    }
+
+    /// Land on the `online/huggingface` repo list with `select` under the
+    /// cursor (after committing an online search from `online` or deeper).
+    fn hub_goto_repo_list(&mut self, select: &str) {
+        let root = vec![hub::ONLINE.to_string(), hub::HUGGINGFACE.to_string()];
+        if self.catalog_prefix != root {
+            self.catalog_history.push((
+                self.models.items.clone(),
+                self.models.state.selected(),
+                self.catalog_prefix.clone(),
+            ));
+            self.catalog_prefix = root.clone();
+        }
+        let items = self.catalog_children(&root);
+        let index =
+            items.iter().position(|m| m.catalog_path.get(2).map(String::as_str) == Some(select));
+        self.models.items = items;
+        self.models.state.select(index.or(Some(0)).filter(|_| !self.models.items.is_empty()));
+        self.rebuild_below(Pane::Model);
+    }
+
+    /// Rows for the search popup: `(label, dim context)`, in rank order.
+    pub fn search_rows(&self) -> Vec<(String, String)> {
         let Some(search) = &self.model_search else { return Vec::new() };
-        search.result_indices.iter().filter_map(|i| self.scanned_models.get(*i)).collect()
+        match search.mode {
+            SearchMode::Local => search
+                .result_indices
+                .iter()
+                .filter_map(|i| self.scanned_models.get(*i))
+                .map(|m| {
+                    // Show where the match sits relative to the searched folder.
+                    let from = search.scope.len().min(m.catalog_path.len());
+                    let to = m.catalog_path.len().saturating_sub(1).max(from);
+                    (m.display_label().to_string(), m.catalog_path[from..to].join(" / "))
+                })
+                .collect(),
+            SearchMode::HubFiles => search
+                .result_indices
+                .iter()
+                .filter_map(|i| self.models.items.get(*i))
+                .map(|m| {
+                    let mut context = human_size(m.size_bytes);
+                    if let Some(quant) = &m.quantization {
+                        context = format!("{quant} · {context}");
+                    }
+                    (m.display_label().to_string(), context)
+                })
+                .collect(),
+            SearchMode::HubRepos => search
+                .online_results
+                .iter()
+                .map(|m| {
+                    let context =
+                        format!("♥{} ⇩{}", human_count(m.likes), human_count(m.downloads));
+                    (m.id.clone(), context)
+                })
+                .collect(),
+        }
     }
 
     fn refresh_model_search(&mut self) {
-        let Some(query) = self.model_search.as_ref().map(|s| s.query.clone()) else { return };
-        let results = self.ranked_model_indices(&query);
+        let Some((query, mode)) = self.model_search.as_ref().map(|s| (s.query.clone(), s.mode))
+        else {
+            return;
+        };
+        let results = match mode {
+            SearchMode::Local => {
+                let scope = self.model_search.as_ref().map(|s| s.scope.clone()).unwrap_or_default();
+                self.ranked_model_indices(&query, &scope)
+            }
+            SearchMode::HubFiles => self.hub_file_indices(&query),
+            // Online: fire a fresh query; results land via the event drain.
+            SearchMode::HubRepos => {
+                self.hub_search(query);
+                return;
+            }
+        };
         if let Some(search) = self.model_search.as_mut() {
             search.result_indices = results;
             search.cursor = search.cursor.min(search.result_indices.len().saturating_sub(1));
         }
     }
 
-    fn ranked_model_indices(&self, raw_query: &str) -> Vec<usize> {
+    /// Local models under `scope`, ranked by match quality. Only the folder
+    /// currently browsed is searched — never parents or siblings.
+    fn ranked_model_indices(&self, raw_query: &str, scope: &[String]) -> Vec<usize> {
         let query = raw_query.to_lowercase();
         let tokens: Vec<&str> = query.split_whitespace().collect();
         let mut matches: Vec<(i32, usize)> = self
             .scanned_models
             .iter()
             .enumerate()
+            .filter(|(_, m)| m.catalog_path.starts_with(scope))
             .filter_map(|(index, m)| {
                 let artifact = m.name.to_lowercase();
-                let path = m.catalog_path.join(" ").to_lowercase();
+                let path = m.catalog_path[scope.len()..].join(" ").to_lowercase();
                 if !tokens.iter().all(|t| artifact.contains(t) || path.contains(t)) {
                     return None;
                 }
@@ -520,6 +693,28 @@ impl App {
             })
         });
         matches.into_iter().map(|(_, index)| index).collect()
+    }
+
+    /// The opened hub repository's artifacts matching the query (by name or
+    /// quantization label), as indices into the model pane items.
+    fn hub_file_indices(&self, raw_query: &str) -> Vec<usize> {
+        let query = raw_query.to_lowercase();
+        let tokens: Vec<&str> = query.split_whitespace().collect();
+        self.models
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.is_remote_file())
+            .filter(|(_, m)| {
+                let hay = format!(
+                    "{} {}",
+                    m.display_label().to_lowercase(),
+                    m.quantization.as_deref().unwrap_or_default().to_lowercase()
+                );
+                tokens.iter().all(|t| hay.contains(t))
+            })
+            .map(|(index, _)| index)
+            .collect()
     }
 
     fn jump_to_model(&mut self, id: &str) {
@@ -1297,6 +1492,10 @@ impl App {
 
     fn catalog_children(&self, prefix: &[String]) -> Vec<Model> {
         use std::collections::BTreeMap;
+        // The online subtree is virtual — its children come from hub state.
+        if let Some(children) = self.hub_children(prefix) {
+            return children;
+        }
         let mut children: BTreeMap<String, Model> = BTreeMap::new();
         for model in &self.scanned_models {
             if !model.catalog_path.starts_with(prefix) || model.catalog_path.len() <= prefix.len() {
@@ -1321,30 +1520,56 @@ impl App {
                         context_length: None,
                         modified: None,
                         has_chat_template: false,
+                        remote: None,
                     }
                 }
             });
         }
-        children.into_values().collect()
+        let mut children: Vec<Model> = children.into_values().collect();
+        // The catalog root also offers the virtual online hub folder.
+        if prefix.is_empty() {
+            children.push(hub::online_root_node());
+        }
+        children
     }
 
-    /// Re-scan configured model directories (the `F5` refresh).
+    /// Re-scan configured model directories (the `F5` refresh). Inside the hub
+    /// subtree, refresh the online listing instead of resetting navigation.
     fn refresh_models(&mut self) {
-        self.scanned_models = discovery::scan_models(&self.model_sources, &self.model_cache);
-        discovery::reconcile(&self.models_dir, &mut self.scanned_models);
-        self.store.sync_models(&self.scanned_models);
+        if hub::in_hub_tree(&self.catalog_prefix) {
+            self.rescan_models_quiet();
+            self.hub_refresh_current();
+            return;
+        }
+        self.rescan_models_quiet();
         self.catalog_history.clear();
         self.catalog_prefix.clear();
         // Models or anything downstream may have changed; rebuild from runtime.
         self.rebuild_below(Pane::Runtime);
     }
 
+    /// Re-scan local models without touching browser navigation (used when a
+    /// hub download finishes while the user is browsing elsewhere).
+    pub(crate) fn rescan_models_quiet(&mut self) {
+        self.scanned_models = discovery::scan_models(&self.model_sources, &self.model_cache);
+        discovery::reconcile(&self.models_dir, &mut self.scanned_models);
+        self.store.sync_models(&self.scanned_models);
+    }
+
     /// Drill into the preview pane, but only if it actually has items.
     fn enter(&mut self) {
         if self.focus == Pane::Model {
             let Some(selected) = self.models.selected() else { return };
+            // A hub artifact: Enter downloads it (or opens it once on disk).
+            if selected.is_remote_file() {
+                self.hub_download_or_open();
+                return;
+            }
             if selected.is_catalog_dir() {
-                if self.catalog_preview.is_empty() {
+                // Hub folders may be entered while still loading — their
+                // children arrive asynchronously.
+                let hub_dir = hub::in_hub_tree(&selected.catalog_path);
+                if self.catalog_preview.is_empty() && !hub_dir {
                     return;
                 }
                 let previous = (
@@ -1354,7 +1579,9 @@ impl App {
                 );
                 self.catalog_history.push(previous);
                 self.catalog_prefix = selected.catalog_path.clone();
-                self.models.replace(self.catalog_preview.clone());
+                let children = self.catalog_children(&self.catalog_prefix);
+                self.models.replace(children);
+                self.hub_ensure_loaded();
                 self.rebuild_below(Pane::Model);
             } else if !self.profiles.is_empty() {
                 self.focus = Pane::Profile;
@@ -1441,6 +1668,9 @@ impl App {
             self.models.replace(models);
         }
         if level < Pane::Profile.index() {
+            // Hovering the hub folder kicks off the trending fetch so its
+            // contents exist by the time the user drills in.
+            self.hub_prefetch_on_preview();
             self.catalog_preview = match self.models.selected() {
                 Some(m) if m.is_catalog_dir() => {
                     if self.is_stub_runtime() {
@@ -1489,8 +1719,50 @@ impl App {
                 (primary, meta.join(" · "))
             }),
             Pane::Model => self.models.selected().map(|m| {
+                // Hub artifact: origin URL plus size/quant and download state.
+                if m.is_remote_file() {
+                    let repo = m.catalog_path.get(2).map(String::as_str).unwrap_or_default();
+                    let primary = format!("huggingface.co/{repo} — {}", m.display_label());
+                    let mut meta = vec![human_size(m.size_bytes)];
+                    if let Some(q) = &m.quantization {
+                        meta.push(q.clone());
+                    }
+                    meta.push(
+                        self.hub_file_marker(m).unwrap_or_else(|| "Enter to download".into()),
+                    );
+                    return (primary, meta.join(" · "));
+                }
+                // Hub repository: popularity plus (once listed) model details.
+                if m.remote == Some(RemoteKind::Repo) {
+                    let repo_id = m.catalog_path.get(2).map(String::as_str).unwrap_or_default();
+                    let mut meta = Vec::new();
+                    if let Some(repo) = self.hub_repo_meta(m) {
+                        meta.push(format!("♥ {}", human_count(repo.likes)));
+                        meta.push(format!("⇩ {}", human_count(repo.downloads)));
+                        if let Some(created) = &repo.created {
+                            meta.push(created.clone());
+                        }
+                    }
+                    if let Some(listing) = self.hub.listings.get(repo_id) {
+                        if let Some(arch) = &listing.architecture {
+                            meta.push(arch.clone());
+                        }
+                        if let Some(ctx) = listing.context_length {
+                            meta.push(format!("ctx {ctx}"));
+                        }
+                        if listing.gated {
+                            meta.push("gated — needs HF_TOKEN".into());
+                        }
+                    }
+                    return (format!("huggingface.co/{repo_id}"), meta.join(" · "));
+                }
                 if m.is_catalog_dir() {
-                    return (m.catalog_path.join(" / "), "catalog directory".into());
+                    let kind = if hub::in_hub_tree(&m.catalog_path) {
+                        "online model hub"
+                    } else {
+                        "catalog directory"
+                    };
+                    return (m.catalog_path.join(" / "), kind.into());
                 }
                 let primary = m.path.display().to_string();
                 let mut meta = vec![human_size(m.size_bytes)];
@@ -1556,8 +1828,14 @@ impl App {
 ///
 /// When `config.models.paths` is set we honor it (expanding `~`); otherwise we
 /// fall back to the well-known runtime model locations. We never scan `$HOME`
-/// itself, only specific subdirectories (per the requirements).
-fn resolve_model_sources(configured: &[PathBuf], named: &[ModelSourceConfig]) -> Vec<ModelSource> {
+/// itself, only specific subdirectories (per the requirements). The hub
+/// download directory is always scanned, as an implicit `downloads` source
+/// unless an explicit source already covers it.
+fn resolve_model_sources(
+    configured: &[PathBuf],
+    named: &[ModelSourceConfig],
+    download_dir: &Path,
+) -> Vec<ModelSource> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let expand = |p: &PathBuf| match (p.strip_prefix("~"), &home) {
         (Ok(rest), Some(home)) => home.join(rest),
@@ -1589,7 +1867,31 @@ fn resolve_model_sources(configured: &[PathBuf], named: &[ModelSourceConfig]) ->
     // De-duplicate roots (e.g. LLAMA_CACHE may equal ~/.cache/llama.cpp).
     sources.sort_by(|a, b| a.root.cmp(&b.root));
     sources.dedup_by(|a, b| a.root == b.root);
+
+    // Hub downloads must always be discoverable, wherever they're configured.
+    if !sources.iter().any(|s| download_dir.starts_with(&s.root)) {
+        sources.push(ModelSource {
+            name: "downloads".into(),
+            root: download_dir.to_path_buf(),
+            layout: ModelLayout::Directory,
+        });
+    }
     sources
+}
+
+/// Where hub downloads land: `models.download_dir` (expanding `~`), defaulting
+/// to `~/models/huggingface` — under the standard `~/models` source.
+fn resolve_download_dir(configured: Option<&PathBuf>, cache_dir: &Path) -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match configured {
+        Some(p) => match (p.strip_prefix("~"), &home) {
+            (Ok(rest), Some(home)) => home.join(rest),
+            _ => p.clone(),
+        },
+        None => home
+            .map(|h| h.join("models/huggingface"))
+            .unwrap_or_else(|| cache_dir.join("downloads")),
+    }
 }
 
 /// Well-known directories where local runtimes keep models, including
@@ -1831,6 +2133,44 @@ mod tests {
                 &defaults
             ),
             vec!["/opt/llama/llama-bench", "-m", "/models/qwen.gguf"]
+        );
+    }
+
+    #[test]
+    fn download_dir_gets_an_implicit_source_only_when_uncovered() {
+        let named = [ModelSourceConfig {
+            name: "models".into(),
+            path: "/data/models".into(),
+            layout: ModelLayout::Directory,
+        }];
+
+        // Covered by an existing root: no extra source.
+        let covered = resolve_model_sources(&[], &named, Path::new("/data/models/huggingface"));
+        assert_eq!(covered.len(), 1);
+
+        // Outside every configured root: scanned via the implicit source.
+        let outside = resolve_model_sources(&[], &named, Path::new("/downloads/hf"));
+        let extra = outside.last().unwrap();
+        assert_eq!(outside.len(), 2);
+        assert_eq!(extra.name, "downloads");
+        assert_eq!(extra.root, PathBuf::from("/downloads/hf"));
+        assert_eq!(extra.layout, ModelLayout::Directory);
+    }
+
+    #[test]
+    fn download_dir_expands_tilde_and_defaults_under_models() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(
+            resolve_download_dir(Some(&PathBuf::from("~/dl")), Path::new("/cache")),
+            home.join("dl")
+        );
+        assert_eq!(
+            resolve_download_dir(None, Path::new("/cache")),
+            home.join("models/huggingface")
+        );
+        assert_eq!(
+            resolve_download_dir(Some(&PathBuf::from("/abs/dl")), Path::new("/cache")),
+            PathBuf::from("/abs/dl")
         );
     }
 

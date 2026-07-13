@@ -18,6 +18,11 @@ const DEFAULT_CONFIG: &str = r#"# llmctl configuration
 # Model sources are scanned recursively for GGUF files. `directory` preserves
 # relative folders; the two store-specific layouts normalize their cache paths.
 
+[models]
+# Models downloaded from the online/huggingface folder land here as
+# <owner>/<repo>/<file>.gguf. The directory is scanned like any other source.
+download_dir = "~/models/huggingface"
+
 [[models.sources]]
 name = "llama-cache"
 path = "~/.cache/llama.cpp"
@@ -65,6 +70,9 @@ pub struct ModelsConfig {
     /// Named model roots. Known layouts are parsed semantically; arbitrary
     /// directories retain their relative hierarchy below `name`.
     pub sources: Vec<ModelSourceConfig>,
+    /// Where the Hugging Face hub browser stores downloads
+    /// (default: `~/models/huggingface`).
+    pub download_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -207,6 +215,7 @@ mod tests {
         let config = Config::load_from(&path).unwrap();
 
         assert!(path.is_file());
+        assert_eq!(config.models.download_dir, Some(PathBuf::from("~/models/huggingface")));
         assert_eq!(config.models.sources.len(), 4);
         assert_eq!(config.models.sources[0].name, "llama-cache");
         assert_eq!(config.models.sources[1].layout, ModelLayout::HuggingFace);
