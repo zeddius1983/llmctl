@@ -6,6 +6,18 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadBlob {
+    pub incomplete_file: PathBuf,
+    pub complete_file: PathBuf,
+    pub expected_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadRecord {
+    pub blobs: Vec<DownloadBlob>,
+}
+
 /// Everything we persist about a launched server, enough to rediscover it,
 /// show it in the manager, copy its endpoint, and restart it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +33,9 @@ pub struct SessionRecord {
     pub port: u16,
     pub command: Vec<String>,
     pub log_file: PathBuf,
+    /// Cache blobs observed while llama.cpp downloads a remote Hub artifact.
+    #[serde(default)]
+    pub download: Option<DownloadRecord>,
     /// Process start time, seconds since the Unix epoch (for uptime).
     pub started_unix: u64,
 }

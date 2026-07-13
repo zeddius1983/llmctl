@@ -21,12 +21,14 @@ use crate::domain::OptionItem;
 use command::Command;
 use health::Health;
 use proc::CpuSample;
-use record::SessionRecord;
+use record::{DownloadRecord, SessionRecord};
 use supervisor::{DetachedSupervisor, LaunchSpec, SessionSupervisor};
 
 /// Observable lifecycle state of a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStatus {
+    /// llama.cpp is downloading one or more GGUF blobs into the Hub cache.
+    Downloading,
     /// Process is up but `/health` isn't ready yet (model still loading).
     Starting,
     /// `/health` returned 200 (or it was previously Running and is still alive).
@@ -46,6 +48,7 @@ impl SessionStatus {
     /// Status glyph (matches the requirements' indicators).
     pub fn glyph(self) -> &'static str {
         match self {
+            SessionStatus::Downloading => "⇩",
             SessionStatus::Running => "●",
             SessionStatus::Starting => "◐",
             SessionStatus::Crashed => "✖",
@@ -56,6 +59,7 @@ impl SessionStatus {
 
     pub fn label(self) -> &'static str {
         match self {
+            SessionStatus::Downloading => "Downloading",
             SessionStatus::Running => "Running",
             SessionStatus::Starting => "Starting",
             SessionStatus::Crashed => "Crashed",
@@ -76,6 +80,7 @@ pub struct Session {
     pub status: SessionStatus,
     pub cpu_percent: Option<f64>,
     pub rss_bytes: Option<u64>,
+    pub download_percent: Option<u8>,
     /// True once the user requested a stop/kill — distinguishes Stopped vs Crashed.
     requested_stop: bool,
     /// Previous CPU sample for delta-based percentage.
@@ -84,11 +89,13 @@ pub struct Session {
 
 impl Session {
     fn new(record: SessionRecord, status: SessionStatus) -> Self {
+        let download_percent = download_percent(&record);
         Self {
             record,
             status,
             cpu_percent: None,
             rss_bytes: None,
+            download_percent,
             requested_stop: false,
             last_cpu: None,
         }
@@ -101,6 +108,43 @@ impl Session {
         }
         now_unix().checked_sub(self.record.started_unix)
     }
+
+    pub fn status_label(&self) -> String {
+        session_status_label(self.status, self.download_percent)
+    }
+}
+
+fn session_status_label(status: SessionStatus, download_percent: Option<u8>) -> String {
+    match download_percent {
+        Some(percent) if status == SessionStatus::Downloading => {
+            format!("Downloading ({percent}%)")
+        }
+        _ => status.label().into(),
+    }
+}
+
+fn download_percent(record: &SessionRecord) -> Option<u8> {
+    download_record_percent(record.download.as_ref()?)
+}
+
+fn download_record_percent(download: &DownloadRecord) -> Option<u8> {
+    let expected: u128 = download.blobs.iter().map(|blob| blob.expected_bytes as u128).sum();
+    if expected == 0 || download.blobs.is_empty() {
+        return None;
+    }
+    let mut downloaded = 0_u128;
+    let mut complete = true;
+    for blob in &download.blobs {
+        if blob.complete_file.is_file() {
+            downloaded += blob.expected_bytes as u128;
+        } else {
+            complete = false;
+            downloaded += std::fs::metadata(&blob.incomplete_file)
+                .map(|metadata| metadata.len().min(blob.expected_bytes) as u128)
+                .unwrap_or(0);
+        }
+    }
+    if complete { None } else { Some(((downloaded.saturating_mul(100) / expected).min(99)) as u8) }
 }
 
 /// Everything the manager needs to launch a server. Built by the app from the
@@ -111,6 +155,7 @@ pub struct LaunchRequest {
     pub model: String,
     pub model_path: String,
     pub hf_repo: Option<String>,
+    pub download: Option<DownloadRecord>,
     pub profile: String,
     pub host: String,
     pub port: u16,
@@ -151,6 +196,7 @@ impl SessionManager {
             if alive {
                 let status = match health::probe(&record.host, record.port) {
                     Health::Ready => SessionStatus::Running,
+                    _ if download_percent(&record).is_some() => SessionStatus::Downloading,
                     _ => SessionStatus::Starting,
                 };
                 self.sessions.push(Session::new(record, status));
@@ -192,10 +238,16 @@ impl SessionManager {
             port,
             command: command.argv,
             log_file,
+            download: req.download,
             started_unix: now_unix(),
         };
         record.save(&self.dir);
-        self.sessions.push(Session::new(record, SessionStatus::Starting));
+        let status = if download_percent(&record).is_some() {
+            SessionStatus::Downloading
+        } else {
+            SessionStatus::Starting
+        };
+        self.sessions.push(Session::new(record, status));
         Ok(self.sessions.len() - 1)
     }
 
@@ -249,7 +301,9 @@ impl SessionManager {
                     if s.requested_stop { SessionStatus::Stopped } else { SessionStatus::Crashed };
                 s.cpu_percent = None;
                 s.rss_bytes = None;
+                s.download_percent = None;
                 s.last_cpu = None;
+                s.download_percent = None;
                 continue;
             };
 
@@ -257,6 +311,7 @@ impl SessionManager {
             let port = self.sessions[idx].record.port;
             let prev = self.sessions[idx].last_cpu;
             let was_running = self.sessions[idx].status == SessionStatus::Running;
+            let progress = download_percent(&self.sessions[idx].record);
 
             let rss = proc::rss_bytes(pid);
             let sample = proc::cpu_sample(pid);
@@ -264,6 +319,7 @@ impl SessionManager {
 
             let s = &mut self.sessions[idx];
             s.rss_bytes = rss;
+            s.download_percent = progress;
             if let Some(now) = sample {
                 if let Some(prev) = prev {
                     s.cpu_percent = proc::cpu_percent(prev, now);
@@ -275,6 +331,7 @@ impl SessionManager {
             s.status = match health {
                 Health::Ready => SessionStatus::Running,
                 _ if was_running => SessionStatus::Running,
+                _ if progress.is_some() => SessionStatus::Downloading,
                 _ => SessionStatus::Starting,
             };
         }
@@ -326,7 +383,12 @@ impl SessionManager {
         session.record.log_file = log_file;
         session.record.started_unix = now_unix();
         session.record.save(&self.dir);
-        session.status = SessionStatus::Starting;
+        session.download_percent = download_percent(&session.record);
+        session.status = if session.download_percent.is_some() {
+            SessionStatus::Downloading
+        } else {
+            SessionStatus::Starting
+        };
         session.requested_stop = false;
         session.last_cpu = None;
         session.cpu_percent = None;
@@ -441,6 +503,44 @@ mod tests {
         assert_eq!(format_uptime(8225), "2h 17m");
     }
 
+    #[test]
+    fn download_progress_sums_complete_and_partial_shards() {
+        use crate::session::record::DownloadBlob;
+
+        let root = std::env::temp_dir().join(format!("llmctl-progress-{}", now_unix()));
+        std::fs::create_dir_all(&root).unwrap();
+        let first_complete = root.join("first");
+        let second_incomplete = root.join("second.incomplete");
+        let second_complete = root.join("second");
+        std::fs::write(&first_complete, vec![0; 100]).unwrap();
+        std::fs::write(&second_incomplete, vec![0; 34]).unwrap();
+        let download = DownloadRecord {
+            blobs: vec![
+                DownloadBlob {
+                    incomplete_file: root.join("first.incomplete"),
+                    complete_file: first_complete,
+                    expected_bytes: 100,
+                },
+                DownloadBlob {
+                    incomplete_file: second_incomplete,
+                    complete_file: second_complete.clone(),
+                    expected_bytes: 100,
+                },
+            ],
+        };
+
+        assert_eq!(download_record_percent(&download), Some(67));
+        std::fs::write(second_complete, vec![0; 100]).unwrap();
+        assert_eq!(download_record_percent(&download), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn downloading_status_includes_percentage() {
+        assert_eq!(session_status_label(SessionStatus::Downloading, Some(67)), "Downloading (67%)");
+        assert_eq!(session_status_label(SessionStatus::Starting, None), "Starting");
+    }
+
     fn opt(key: &str, value: &str, cli: &str) -> OptionItem {
         OptionItem {
             key: key.into(),
@@ -495,6 +595,7 @@ mod tests {
             model: "fake.gguf".into(),
             model_path: "/models/fake.gguf".into(),
             hf_repo: None,
+            download: None,
             profile: "Default".into(),
             host: "127.0.0.1".into(),
             port: 18900,

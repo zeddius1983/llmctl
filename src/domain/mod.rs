@@ -57,12 +57,22 @@ pub struct RemoteModel {
     pub repo: String,
     pub revision: Option<String>,
     pub file: Option<String>,
+    /// Hugging Face LFS blobs comprising this artifact (one or more GGUF
+    /// shards), used to observe llama.cpp's native download progress.
+    #[serde(default)]
+    pub blobs: Vec<RemoteBlob>,
     #[serde(default)]
     pub downloads: u64,
     #[serde(default)]
     pub likes: u64,
     #[serde(default)]
     pub gated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteBlob {
+    pub oid: String,
+    pub size_bytes: u64,
 }
 
 /// A reusable launch configuration.

@@ -344,6 +344,7 @@ Status indicators:
 
 ```text
 ● Running
+⇩ Downloading (67%)
 ◐ Starting
 ✖ Crashed
 ■ Stopped
@@ -517,6 +518,7 @@ Supported states:
 ```text
 Running
 Stopped
+Downloading
 Starting
 Crashed
 Unknown

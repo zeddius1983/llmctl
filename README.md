@@ -41,9 +41,10 @@ and watch them from a built-in session manager.
 - **Detached sessions** — `s` launches a server in its own process group
   (`setsid`), with stdout/stderr redirected to a per-session log file and
   automatic port-conflict resolution. Sessions are rediscovered across restarts.
-- **Session manager** (`t`) — live status (Starting / Running / Crashed), PID,
+- **Session manager** (`t`) — live status (Downloading / Starting / Running /
+  Crashed), PID,
   port, uptime, and `/proc`-sampled CPU & memory; a `/health` probe promotes
-  Starting → Running. Stop (`x`), kill (`K`), restart (`R`), copy endpoint (`c`),
+  Downloading → Starting → Running. Stop (`x`), kill (`K`), restart (`R`), copy endpoint (`c`),
   and tail logs (`L`).
 
 ## Requirements

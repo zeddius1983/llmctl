@@ -141,14 +141,15 @@ Lifecycle is hidden behind a `SessionSupervisor` trait. The MVP
 process group (survives TUI exit, ignores tty signals), redirects stdio to a
 per-session log file, and ignores `SIGCHLD` so detached children are auto-reaped.
 Each launch writes `session-<id>.json` (id, name, pid, host, port, full argv,
-model/profile, log path, start time). On startup `SessionManager::rediscover`
+model/profile, log path, optional Hub download blobs, start time). On startup `SessionManager::rediscover`
 keeps sessions whose PID is alive *and* whose `/proc/<pid>/cmdline` still
 contains the model path (PID-reuse guard), deleting the JSON for the rest.
 
-`SessionManager::refresh` (called on the ≈1 s tick) derives status — `Starting`
-until a `GET /health` returns 200, then `Running`; `Stopped` if the user asked it
-to stop and the process is gone, else `Crashed` — and samples `/proc` for RSS and
-CPU%. Launch resolves a bindable port (skipping ports held by other live
+`SessionManager::refresh` (called on the ≈1 s tick) derives status —
+`Downloading (N%)` while known Hub blobs are incomplete, `Starting` while the
+model loads, then `Running` after `GET /health` returns 200; `Stopped` if the
+user asked it to stop and the process is gone, else `Crashed` — and samples
+`/proc` for RSS and CPU%. Launch resolves a bindable port (skipping ports held by other live
 sessions) before spawning. A future `DaemonSupervisor` or `systemd-run` backend
 can implement the same trait. See ADR-005 and ADR-007.
 

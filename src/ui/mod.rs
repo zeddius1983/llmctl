@@ -431,6 +431,7 @@ fn download_size(bytes: u64) -> String {
 /// Colour for a session status indicator.
 fn status_color(status: SessionStatus) -> Color {
     match status {
+        SessionStatus::Downloading => Color::Cyan,
         SessionStatus::Running => Color::Green,
         SessionStatus::Starting => ACCENT,
         SessionStatus::Crashed => Color::Red,
@@ -536,7 +537,7 @@ fn session_detail_lines(session: &Session) -> Text<'static> {
         Line::from(vec![
             Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{} {}", session.status.glyph(), session.status.label()),
+                format!("{} {}", session.status.glyph(), session.status_label()),
                 Style::default().fg(color),
             ),
         ]),
@@ -865,6 +866,7 @@ mod tests {
             repo: "owner/repo".into(),
             revision: None,
             file: Some(model.name.clone()),
+            blobs: Vec::new(),
             downloads: 0,
             likes: 0,
             gated: false,

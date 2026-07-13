@@ -127,12 +127,13 @@ Popular, and Downloads views across text and multimodal pipelines; lazy
 repository file/metadata fetches; debounced `/` Hub search; split-shard
 grouping; remote profile identity; `HF_TOKEN`-safe `--hf-repo`/`--hf-file`
 launch; clean-layout `F5`; and automatic linking to the standard Hugging Face
-cache after download.
+cache after download. Sessions track known LFS blobs in that cache and display
+`Downloading (N%)` before the model-loading `Starting` phase.
 
 ## Next (post-v0.2.1)
 
 ### Online Hugging Face follow-ups
-- [ ] Structured download progress and a download-only action
+- [ ] Download-only action
 - [ ] Recent sorting and size/quantization filters
 
 ### Phase 4 — Log search & startup-failure classification

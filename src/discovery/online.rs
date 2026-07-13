@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{Model, RemoteModel};
+use crate::domain::{Model, RemoteBlob, RemoteModel};
 
 const API: &str = "https://huggingface.co/api/models";
 const SOURCE: [&str; 2] = ["online", "huggingface"];
@@ -116,6 +116,8 @@ struct Sibling {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Lfs {
+    #[serde(default, alias = "sha256")]
+    oid: Option<String>,
     #[serde(default)]
     size: Option<u64>,
 }
@@ -152,6 +154,7 @@ pub fn load_cached(root: &Path) -> Vec<Model> {
         models.push(repository_directory(root, &repository));
         if let Ok(bytes) = fs::read(repository_detail_path(root, &repository.id))
             && let Ok(detail) = serde_json::from_slice::<RepositoryDetail>(&bytes)
+            && detail.schema >= 2
         {
             models.extend(artifacts(root, &detail));
         }
@@ -309,7 +312,7 @@ fn fetch_repository(root: &Path, repo: &str) -> Result<()> {
         value.get("gguf").cloned().unwrap_or(serde_json::Value::Null),
     )
     .ok();
-    let detail = RepositoryDetail { schema: 1, fetched_at: now(), repository, siblings, gguf };
+    let detail = RepositoryDetail { schema: 2, fetched_at: now(), repository, siblings, gguf };
     let path = repository_detail_path(root, repo);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -335,7 +338,7 @@ fn artifacts(root: &Path, detail: &RepositoryDetail) -> Vec<Model> {
             continue;
         }
         let display = shard.replace(&file.rfilename, ".gguf").into_owned();
-        let bytes = if let Some(captures) = shard.captures(&file.rfilename) {
+        let files: Vec<&Sibling> = if let Some(captures) = shard.captures(&file.rfilename) {
             let prefix = &file.rfilename[..captures.get(1).unwrap().start()];
             let suffix = &file.rfilename[captures.get(1).unwrap().end()..];
             detail
@@ -344,11 +347,18 @@ fn artifacts(root: &Path, detail: &RepositoryDetail) -> Vec<Model> {
                 .filter(|candidate| {
                     candidate.rfilename.starts_with(prefix) && candidate.rfilename.ends_with(suffix)
                 })
-                .map(Sibling::bytes)
-                .sum()
+                .collect()
         } else {
-            file.bytes()
+            vec![file]
         };
+        let bytes = files.iter().map(|file| file.bytes()).sum();
+        let blobs = files
+            .iter()
+            .filter_map(|file| {
+                let lfs = file.lfs.as_ref()?;
+                Some(RemoteBlob { oid: lfs.oid.clone()?, size_bytes: file.bytes() })
+            })
+            .collect();
         let leaf = sanitize(&display);
         let catalog_dir = repository_dir(root, &detail.repository.id).join(&leaf);
         let _ = fs::create_dir_all(catalog_dir.join("profiles"));
@@ -395,6 +405,7 @@ fn artifacts(root: &Path, detail: &RepositoryDetail) -> Vec<Model> {
                 repo: detail.repository.id.clone(),
                 revision: detail.repository.sha.clone(),
                 file: Some(file.rfilename.clone()),
+                blobs,
                 downloads: detail.repository.downloads,
                 likes: detail.repository.likes,
                 gated: detail.repository.gated,
@@ -422,6 +433,7 @@ fn repository_directory(root: &Path, repository: &Repository) -> Model {
             repo: repository.id.clone(),
             revision: repository.sha.clone(),
             file: None,
+            blobs: Vec::new(),
             downloads: repository.downloads,
             likes: repository.likes,
             gated: repository.gated,
@@ -448,15 +460,39 @@ fn directory(path: &[&str]) -> Model {
 }
 
 fn cached_file(repo: &str, file: &str) -> Option<PathBuf> {
-    let hub = std::env::var_os("HF_HUB_CACHE").map(PathBuf::from).or_else(|| {
-        std::env::var_os("HF_HOME").map(|home| PathBuf::from(home).join("hub")).or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/huggingface/hub"))
-        })
-    })?;
+    let hub = hugging_face_cache()?;
     let repo_dir = hub.join(format!("models--{}", repo.replace('/', "--")));
     let revision = fs::read_to_string(repo_dir.join("refs/main")).ok()?;
     let path = repo_dir.join("snapshots").join(revision.trim()).join(file);
     path.is_file().then_some(path)
+}
+
+fn hugging_face_cache() -> Option<PathBuf> {
+    std::env::var_os("HF_HUB_CACHE")
+        .or_else(|| std::env::var_os("HUGGINGFACE_HUB_CACHE"))
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HF_HOME").map(|home| PathBuf::from(home).join("hub")).or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".cache/huggingface/hub"))
+            })
+        })
+}
+
+/// Paths used by the standard Hugging Face cache while a known LFS blob is
+/// transferring and after it has completed.
+pub fn cache_blob_paths(repo: &str, oid: &str) -> Option<(PathBuf, PathBuf)> {
+    cache_blob_paths_in(&hugging_face_cache()?, repo, oid)
+}
+
+fn cache_blob_paths_in(hub: &Path, repo: &str, oid: &str) -> Option<(PathBuf, PathBuf)> {
+    let oid = oid.strip_prefix("sha256:").unwrap_or(oid);
+    if oid.is_empty() || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let blob = hub.join(format!("models--{}", repo.replace('/', "--"))).join("blobs").join(oid);
+    let incomplete = blob.with_file_name(format!("{oid}.downloadInProgress"));
+    Some((incomplete, blob))
 }
 
 fn ensure_root(root: &Path) {
@@ -588,6 +624,13 @@ mod tests {
     fn cached_file_path_uses_standard_hub_layout() {
         assert_eq!(sanitize("folder/model.gguf"), "folder_model.gguf");
         assert_eq!(sanitize(".."), "_");
+        assert_eq!(
+            cache_blob_paths_in(Path::new("/cache"), "owner/repo", "aabb").unwrap(),
+            (
+                PathBuf::from("/cache/models--owner--repo/blobs/aabb.downloadInProgress"),
+                PathBuf::from("/cache/models--owner--repo/blobs/aabb")
+            )
+        );
     }
 
     #[test]
@@ -684,12 +727,12 @@ mod tests {
                 Sibling {
                     rfilename: "model-Q4_K_M-00001-of-00002.gguf".into(),
                     size: Some(10),
-                    lfs: None,
+                    lfs: Some(Lfs { oid: Some("aa".repeat(32)), size: Some(10) }),
                 },
                 Sibling {
                     rfilename: "model-Q4_K_M-00002-of-00002.gguf".into(),
                     size: Some(11),
-                    lfs: None,
+                    lfs: Some(Lfs { oid: Some("bb".repeat(32)), size: Some(11) }),
                 },
                 Sibling { rfilename: "mmproj-model.gguf".into(), size: Some(5), lfs: None },
             ],
@@ -705,6 +748,7 @@ mod tests {
         assert_eq!(repository.display_label(), "owner/repo");
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].size_bytes, 21);
+        assert_eq!(models[0].remote.as_ref().unwrap().blobs.len(), 2);
         assert_eq!(models[0].name, "model-Q4_K_M.gguf");
         assert_eq!(models[0].context_length, Some(32768));
         assert_eq!(
@@ -729,6 +773,11 @@ mod tests {
         let details = fetch(&root, &Request::Repository(repo.clone())).unwrap();
         assert!(details.iter().any(|model| {
             model.remote.as_ref().is_some_and(|remote| remote.repo == repo && remote.file.is_some())
+        }));
+        assert!(details.iter().any(|model| {
+            model.remote.as_ref().is_some_and(|remote| {
+                remote.repo == repo && remote.file.is_some() && !remote.blobs.is_empty()
+            })
         }));
         let searched = fetch(
             &root,

@@ -533,12 +533,18 @@ impl App {
                 })
             }
             discovery::online::Request::Repository(repo) => {
-                self.scanned_models.iter().any(|model| {
+                let artifacts = self.scanned_models.iter().filter(|model| {
                     model
                         .remote
                         .as_ref()
                         .is_some_and(|remote| remote.repo == *repo && remote.file.is_some())
-                })
+                });
+                let mut found = false;
+                let complete = artifacts.inspect(|_| found = true).all(|model| {
+                    !model.path.as_os_str().is_empty()
+                        || !model.remote.as_ref().unwrap().blobs.is_empty()
+                });
+                found && complete
             }
             discovery::online::Request::Search { .. } => true,
         };
@@ -1056,6 +1062,25 @@ impl App {
         let options = self.options.items.clone();
         let host = option_value(&options, "host").unwrap_or_else(|| "127.0.0.1".into());
         let port = option_value(&options, "port").and_then(|v| v.parse().ok()).unwrap_or(8000);
+        let download = remote_download
+            .then(|| {
+                let remote = model.remote.as_ref()?;
+                let blobs = remote
+                    .blobs
+                    .iter()
+                    .filter_map(|blob| {
+                        let (incomplete_file, complete_file) =
+                            discovery::online::cache_blob_paths(&remote.repo, &blob.oid)?;
+                        Some(session::record::DownloadBlob {
+                            incomplete_file,
+                            complete_file,
+                            expected_bytes: blob.size_bytes,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (!blobs.is_empty()).then_some(session::record::DownloadRecord { blobs })
+            })
+            .flatten();
         Ok(LaunchRequest {
             runtime: rt.name.clone(),
             binary,
@@ -1068,6 +1093,7 @@ impl App {
             hf_repo: remote_download
                 .then(|| model.remote.as_ref().map(|remote| remote.repo.clone()))
                 .flatten(),
+            download,
             profile: profile.name.clone(),
             host,
             port,
@@ -1122,11 +1148,12 @@ impl App {
             Ok(idx) => {
                 let endpoint = self.sessions.sessions[idx].record.endpoint();
                 let name = self.sessions.sessions[idx].record.name.clone();
+                let status = self.sessions.sessions[idx].status_label();
                 self.screen = Screen::Sessions;
                 self.session_sel.select(Some(idx));
                 self.message = Some(Message {
                     title: "Launched".into(),
-                    lines: vec![name, format!("Starting — {endpoint}")],
+                    lines: vec![name, format!("{status} — {endpoint}")],
                 });
             }
             Err(e) => {
@@ -2389,6 +2416,7 @@ mod tests {
                 repo: name.into(),
                 revision: None,
                 file: None,
+                blobs: Vec::new(),
                 downloads,
                 likes: 0,
                 gated: false,
@@ -2421,6 +2449,7 @@ mod tests {
                 repo: "owner/repo".into(),
                 revision: None,
                 file: Some(name.into()),
+                blobs: Vec::new(),
                 downloads: 0,
                 likes: 0,
                 gated: false,
