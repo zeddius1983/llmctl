@@ -8,7 +8,7 @@ The goal: **never hand-type a complex `llama-server` command again.** Browse you
 GGUF models, tune launch options with live validation, start detached servers,
 and watch them from a built-in session manager.
 
-> **Status:** v0.2.1. Targets **llama.cpp + GGUF on Linux**. Other runtimes
+> **Status:** v0.3.0. Targets **llama.cpp + GGUF on Linux**. Other runtimes
 > (vLLM, Ollama, …) are navigable stubs / future work.
 
 ## Features
