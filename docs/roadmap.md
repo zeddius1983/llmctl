@@ -41,6 +41,12 @@ scoped Hub search, remote model profiles and llama.cpp-native launch, plus
 concurrent resumable downloads that survive restart. See
 [release notes](release-notes-v0.3.0.md).
 
+**v0.3.1 — MTP and multimodal companions** — detects integrated and sidecar
+MTP models, launches them with model-aware speculative-decoding defaults, pairs
+multimodal projectors with compatible base models, and preserves companion
+relationships across Hugging Face discovery, downloads, and cached launches.
+See [release notes](release-notes-v0.3.1.md).
+
 Branching: each remaining phase is built on its own `feature/<task>` branch.
 When a batch is ready to ship, the feature branches merge into a release umbrella
 (e.g. **`feature/v0.1.0`**), which then merges to `main` and is tagged. (Early
@@ -122,7 +128,7 @@ supports selector or inline hotkey cycling. When `llama-bench` is installed,
 profile device and GPU-layer settings.
 
 ### Phase 7 — Online Hugging Face catalog
-Virtual `online ▸ huggingface` hierarchy with cached 20-model Trending,
+Virtual `online ▸ huggingface` hierarchy with cached 30-model Trending,
 Most likes, and Most downloads views across text and multimodal pipelines; lazy
 repository file/metadata fetches; debounced `/` Hub search; split-shard
 grouping; remote profile identity; `HF_TOKEN`-safe `--hf-repo`/`--hf-file`
@@ -134,7 +140,7 @@ shard progress displayed as concurrent jobs in a Downloads pane below Sessions;
 selected downloads support cancellation and resume. Incomplete download jobs
 survive restart as explicitly resumable `Interrupted` rows.
 
-### Post-v0.3.0 — Local MTP discovery and launch
+### v0.3.1 — Local MTP discovery and launch
 Integrated MTP heads are detected from GGUF `nextn_predict_layers` metadata,
 with an MTP filename-token fallback for older converters. Officially named
 `mtp-*.gguf` sidecars are hidden as standalone models and paired with their
@@ -144,7 +150,7 @@ quantization suffix. Paired and integrated models default `spec-type` to
 `--spec-draft-model` for the sidecar form. The managed manifest and model status
 preserve and display the discovered relationship.
 
-### Post-v0.3.0 — GGUF companions and online discovery follow-up
+### v0.3.1 — GGUF companions and online discovery follow-up
 Local and online `mmproj-*.gguf` files are hidden as auxiliary projector
 artifacts and associated with compatible base models. Online `mtp-*` files are
 likewise paired instead of exposed as standalone models; root publisher aliases
@@ -154,7 +160,7 @@ launches pass explicit companion paths. The default Hub repository page was
 raised from 20 to 30 models; pagination remains deferred because Hub-wide search
 already covers models outside the initial page.
 
-## Next (post-v0.3.0)
+## Next (post-v0.3.1)
 
 ### Online Hugging Face follow-ups
 - [ ] Recent sorting and size/quantization filters
