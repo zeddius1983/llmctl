@@ -20,15 +20,18 @@ and watch them from a built-in session manager.
   none are configured) well-known locations (llama.cpp cache, HuggingFace hub,
   LM Studio, `~/models`).
   Reads GGUF headers for architecture, context length, quantization, and embedded
-  chat template; dedupes multi-shard models and sums their sizes. `F5` to rescan.
+  chat template; detects integrated MTP heads and pairs `mtp-*.gguf` and
+  `mmproj-*.gguf` companions with their base models; dedupes multi-shard models
+  and sums their sizes. `F5` to rescan.
 - **Physical model catalog** — mirrors discovery below
   `~/.config/llmctl/models` using source-aware folders, safe manifests, model
   symlinks, and per-model YAML profiles. Press `/` to search recursively from
   the current local catalog directory.
 - **Online Hugging Face catalog** — browse `online ▸ huggingface` like a local
-  directory. It lazily caches trending llama.cpp-compatible GGUF repositories
-  and their artifacts; starting a remote model lets llama.cpp download it into
-  the standard Hugging Face cache.
+  directory. It lazily caches 30 trending llama.cpp-compatible GGUF repositories
+  and their artifacts; MTP/projector companions remain attributes of their base
+  model, and starting a remote model lets llama.cpp download it into the standard
+  Hugging Face cache.
 - **Profiles & options** — built-in, read-only templates (Default, Chat, Coding,
   Long Context, Server) that fork into per-model editable instances on first edit.
   Edit options with live validation, cycle enums/flags in place, and adjust
@@ -133,6 +136,13 @@ GPU layers, device selection (`--device`, with a selector populated by
 threads, batch size, flash attention, reasoning, KV cache types (`--cache-type-k`
 / `--cache-type-v`), `--no-mmap` (handy for ROCm/AMD GPUs), host/port, and
 speculative decoding (`--spec-type`, `--spec-draft-n-max`, `--spec-draft-n-min`).
+Local models with integrated MTP heads default to `draft-mtp`; a same-directory
+`mtp-<base>.gguf` sidecar is passed through `--spec-draft-model` automatically,
+including repositories that omit the base artifact's quantization suffix from
+the sidecar name. A compatible local `mmproj-*.gguf` is passed through
+`--mmproj`. For uncached Hub models, recent llama.cpp builds auto-discover root
+MTP and projector companions from `-hf`; downloaded companions become explicit
+local paths on subsequent launches.
 Any option left at its default value is omitted from the command line.
 
 ## Configuration
@@ -174,12 +184,15 @@ Your `$HOME` is never scanned wholesale.
 ### Online models
 
 Under the llama.cpp runtime, enter `online`, then `huggingface`. Selecting the
-source fetches 20 trending llama.cpp-compatible GGUF repositories. Repositories
+source fetches 30 trending llama.cpp-compatible GGUF repositories. Repositories
 appear as flat `provider/repository` rows with likes and download counts;
 entering one fetches its GGUF variants. Choose an artifact, configure a normal
 profile, and press `s`. llmctl launches llama.cpp with `--hf-repo` and
 `--hf-file`, then links the downloaded file from the standard Hugging Face
-cache into the managed catalog.
+cache into the managed catalog. `mtp-*` and `mmproj-*` files stay hidden as
+standalone artifacts; the publisher's root MTP default and a compatible
+projector are attached to each base model. Direct downloads include those
+companions, while native `-hf` launches use llama.cpp's companion auto-discovery.
 
 Press `d` on an uncached online GGUF to download it without starting a server.
 Multiple models can download concurrently in a Downloads pane below Sessions.

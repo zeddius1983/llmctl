@@ -25,8 +25,24 @@ impl Command {
     /// bare flag with no following value. Values pass through
     /// [`registry::cli_value`], which rewrites the ones whose on-disk form isn't
     /// the literal argv token (e.g. `reasoning-effort` → a JSON kwarg).
-    pub fn build(binary: &str, model_path: &str, options: &[OptionItem]) -> Self {
+    /// Build a local-model command with any selected auxiliary GGUFs.
+    pub fn build_local(
+        binary: &str,
+        model_path: &str,
+        mtp_path: Option<&str>,
+        projector_path: Option<&str>,
+        options: &[OptionItem],
+    ) -> Self {
         let mut argv = vec![binary.to_string(), "-m".to_string(), model_path.to_string()];
+
+        if let Some(mtp_path) = mtp_path {
+            argv.push("--spec-draft-model".into());
+            argv.push(mtp_path.to_string());
+        }
+        if let Some(projector_path) = projector_path {
+            argv.push("--mmproj".into());
+            argv.push(projector_path.to_string());
+        }
 
         Self::append_options(&mut argv, options);
         Self { argv }
@@ -34,7 +50,16 @@ impl Command {
 
     /// Build a command that lets llama.cpp download/cache an exact GGUF file
     /// from Hugging Face before loading it.
-    pub fn build_huggingface(binary: &str, repo: &str, file: &str, options: &[OptionItem]) -> Self {
+    pub fn build_huggingface(
+        binary: &str,
+        repo: &str,
+        file: &str,
+        mtp_path: Option<&str>,
+        draft_hf: Option<&str>,
+        projector_path: Option<&str>,
+        projector_auto: bool,
+        options: &[OptionItem],
+    ) -> Self {
         let mut argv = vec![
             binary.to_string(),
             "--hf-repo".into(),
@@ -42,6 +67,19 @@ impl Command {
             "--hf-file".into(),
             file.to_string(),
         ];
+        if let Some(mtp_path) = mtp_path {
+            argv.push("--spec-draft-model".into());
+            argv.push(mtp_path.to_string());
+        } else if let Some(draft_hf) = draft_hf {
+            argv.push("--spec-draft-hf".into());
+            argv.push(draft_hf.to_string());
+        }
+        if let Some(projector_path) = projector_path {
+            argv.push("--mmproj".into());
+            argv.push(projector_path.to_string());
+        } else if projector_auto {
+            argv.push("--mmproj-auto".into());
+        }
         Self::append_options(&mut argv, options);
         Self { argv }
     }
@@ -129,9 +167,13 @@ mod tests {
         ]
     }
 
+    fn local(model: &str, options: &[OptionItem]) -> Command {
+        Command::build_local("llama-server", model, None, None, options)
+    }
+
     #[test]
     fn builds_argv_in_order_with_model_first() {
-        let cmd = Command::build("llama-server", "/m/qwen.gguf", &sample_options());
+        let cmd = local("/m/qwen.gguf", &sample_options());
         assert_eq!(
             cmd.argv,
             vec![
@@ -160,6 +202,10 @@ mod tests {
             "llama-server",
             "owner/model-GGUF",
             "model-Q4_K_M.gguf",
+            None,
+            None,
+            None,
+            false,
             &sample_options(),
         );
         assert_eq!(
@@ -171,7 +217,7 @@ mod tests {
 
     #[test]
     fn flash_attn_emits_its_value() {
-        let cmd = Command::build("llama-server", "/m/x.gguf", &sample_options());
+        let cmd = local("/m/x.gguf", &sample_options());
         let i = cmd.argv.iter().position(|a| a == "--flash-attn").unwrap();
         assert_eq!(cmd.argv[i + 1], "on");
     }
@@ -180,13 +226,13 @@ mod tests {
     fn selected_device_is_emitted_and_default_is_omitted() {
         let mut opts = sample_options();
         opts.push(opt("device", "ROCm0", "--device"));
-        let cmd = Command::build("llama-server", "/m/x.gguf", &opts);
+        let cmd = local("/m/x.gguf", &opts);
         let i = cmd.argv.iter().position(|a| a == "--device").unwrap();
         assert_eq!(cmd.argv[i + 1], "ROCm0");
 
         opts.pop();
         opts.push(opt("device", registry::DEFAULT, "--device"));
-        let cmd = Command::build("llama-server", "/m/x.gguf", &opts);
+        let cmd = local("/m/x.gguf", &opts);
         assert!(!cmd.argv.iter().any(|a| a == "--device"));
     }
 
@@ -195,7 +241,7 @@ mod tests {
         let mut opts = sample_options();
         opts[3] = opt("flash-attn", "auto", "--flash-attn"); // enum's omit token
         opts.push(opt("batch-size", registry::DEFAULT, "--batch-size")); // numeric sentinel
-        let cmd = Command::build("llama-server", "/m/x.gguf", &opts);
+        let cmd = local("/m/x.gguf", &opts);
         // Both flags (and their values) are absent — llama.cpp uses its defaults.
         assert!(!cmd.argv.iter().any(|a| a == "--flash-attn"));
         assert!(!cmd.argv.iter().any(|a| a == "--batch-size"));
@@ -207,15 +253,90 @@ mod tests {
         let mut opts = sample_options();
         opts[2] = opt("temperature", registry::DEFAULT, "--temp");
         opts.push(opt("top-k", registry::DEFAULT, "--top-k"));
-        let cmd = Command::build("llama-server", "/m/x.gguf", &opts);
+        let cmd = local("/m/x.gguf", &opts);
         assert!(!cmd.argv.iter().any(|a| a == "--temp" || a == "--top-k"));
+    }
+
+    #[test]
+    fn local_mtp_sidecar_is_passed_as_the_draft_model() {
+        let mut opts = sample_options();
+        opts.push(opt("spec-type", "draft-mtp", "--spec-type"));
+        let cmd = Command::build_local(
+            "llama-server",
+            "/m/model.gguf",
+            Some("/m/mtp-model.gguf"),
+            Some("/m/mmproj-BF16.gguf"),
+            &opts,
+        );
+        assert_eq!(
+            &cmd.argv[..9],
+            [
+                "llama-server",
+                "-m",
+                "/m/model.gguf",
+                "--spec-draft-model",
+                "/m/mtp-model.gguf",
+                "--mmproj",
+                "/m/mmproj-BF16.gguf",
+                "--ctx-size",
+                "32768",
+            ]
+        );
+        let spec = cmd.argv.iter().position(|arg| arg == "--spec-type").unwrap();
+        assert_eq!(cmd.argv[spec + 1], "draft-mtp");
+        let projector = cmd.argv.iter().position(|arg| arg == "--mmproj").unwrap();
+        assert_eq!(cmd.argv[projector + 1], "/m/mmproj-BF16.gguf");
+    }
+
+    #[test]
+    fn remote_companions_use_draft_hf_and_projector_auto() {
+        let cmd = Command::build_huggingface(
+            "llama-server",
+            "owner/model-GGUF",
+            "model-Q4_K_M.gguf",
+            None,
+            Some("owner/model-GGUF:Q4_0"),
+            None,
+            true,
+            &sample_options(),
+        );
+        assert!(
+            cmd.argv
+                .windows(2)
+                .any(|args| { args == ["--spec-draft-hf", "owner/model-GGUF:Q4_0"] })
+        );
+        assert!(cmd.argv.iter().any(|arg| arg == "--mmproj-auto"));
+    }
+
+    #[test]
+    fn hybrid_hf_launch_prefers_cached_companion_paths() {
+        let cmd = Command::build_huggingface(
+            "llama-server",
+            "owner/model-GGUF",
+            "model-Q4_K_M.gguf",
+            Some("/cache/mtp-model.gguf"),
+            Some("owner/model-GGUF:Q4_0"),
+            Some("/cache/mmproj-BF16.gguf"),
+            true,
+            &sample_options(),
+        );
+        assert!(
+            cmd.argv
+                .windows(2)
+                .any(|args| { args == ["--spec-draft-model", "/cache/mtp-model.gguf"] })
+        );
+        assert!(
+            cmd.argv.windows(2).any(|args| { args == ["--mmproj", "/cache/mmproj-BF16.gguf"] })
+        );
+        assert!(!cmd.argv.iter().any(|arg| arg == "--spec-draft-hf"));
+        assert!(!cmd.argv.iter().any(|arg| arg == "--mmproj-auto"));
     }
 
     #[test]
     fn reasoning_effort_emits_chat_template_kwargs_json() {
         let mut opts = sample_options();
         opts.push(opt("reasoning-effort", "high", "--chat-template-kwargs"));
-        let cmd = Command::build("llama-server", "/m/x.gguf", &opts);
+        let cmd = local("/m/x.gguf", &opts);
         let i = cmd.argv.iter().position(|a| a == "--chat-template-kwargs").unwrap();
         assert_eq!(cmd.argv[i + 1], r#"{"reasoning_effort":"high"}"#);
         // The JSON is shell-quoted in the copy/paste form.
@@ -224,7 +345,7 @@ mod tests {
         // At "default" the kwarg is dropped entirely.
         opts.pop();
         opts.push(opt("reasoning-effort", "default", "--chat-template-kwargs"));
-        let cmd = Command::build("llama-server", "/m/x.gguf", &opts);
+        let cmd = local("/m/x.gguf", &opts);
         assert!(!cmd.argv.iter().any(|a| a == "--chat-template-kwargs"));
     }
 
@@ -233,7 +354,7 @@ mod tests {
         let mut opts = sample_options();
         opts.push(opt("jinja", "off", "--no-jinja"));
         opts.push(opt("chat-template", "llama3", "--chat-template"));
-        let cmd = Command::build("llama-server", "/m/x.gguf", &opts);
+        let cmd = local("/m/x.gguf", &opts);
         assert!(cmd.argv.iter().any(|a| a == "--no-jinja"));
         let i = cmd.argv.iter().position(|a| a == "--chat-template").unwrap();
         assert_eq!(cmd.argv[i + 1], "llama3");
@@ -243,7 +364,7 @@ mod tests {
             opt("jinja", "on", "--no-jinja"),
             opt("chat-template", "default", "--chat-template"),
         ];
-        let cmd = Command::build("llama-server", "/m/x.gguf", &opts);
+        let cmd = local("/m/x.gguf", &opts);
         assert_eq!(cmd.argv, vec!["llama-server", "-m", "/m/x.gguf"]);
     }
 
@@ -251,7 +372,7 @@ mod tests {
     fn mmap_off_emits_bare_no_mmap_flag_and_on_is_omitted() {
         let mut opts = sample_options();
         opts.push(opt("mmap", "off", "--no-mmap"));
-        let cmd = Command::build("llama-server", "/m/x.gguf", &opts);
+        let cmd = local("/m/x.gguf", &opts);
         let i = cmd.argv.iter().position(|a| a == "--no-mmap").unwrap();
         // The bare flag is last (or followed by another flag) — no value token,
         // so its "off" value never reaches the command line.
@@ -259,14 +380,14 @@ mod tests {
 
         opts.pop();
         opts.push(opt("mmap", "on", "--no-mmap")); // omit token: mmap on is llama default
-        let cmd = Command::build("llama-server", "/m/x.gguf", &opts);
+        let cmd = local("/m/x.gguf", &opts);
         assert!(!cmd.argv.iter().any(|a| a == "--no-mmap"));
     }
 
     #[test]
     fn display_quotes_paths_with_spaces() {
         let opts = sample_options();
-        let cmd = Command::build("llama-server", "/m/my model.gguf", &opts);
+        let cmd = local("/m/my model.gguf", &opts);
         assert!(cmd.display().contains("'/m/my model.gguf'"));
         // Ordinary tokens are left unquoted.
         assert!(cmd.display().starts_with("llama-server -m '/m/my model.gguf'"));
@@ -274,7 +395,7 @@ mod tests {
 
     #[test]
     fn pretty_groups_flag_and_value_per_line() {
-        let cmd = Command::build("llama-server", "/m/x.gguf", &sample_options());
+        let cmd = local("/m/x.gguf", &sample_options());
         let pretty = cmd.pretty();
         assert!(pretty.contains("-m /m/x.gguf")); // model flag + path grouped, not orphaned
         assert!(pretty.contains("--ctx-size 32768"));

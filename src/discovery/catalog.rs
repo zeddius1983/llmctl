@@ -40,6 +40,12 @@ struct Artifact {
     modified: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     shards: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mtp_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    projector_path: Option<PathBuf>,
+    #[serde(default)]
+    has_mtp: bool,
 }
 
 /// Assign the logical catalog path for `path` within `source`.
@@ -168,6 +174,9 @@ pub fn reconcile(root: &Path, models: &mut [Model]) {
                 size_bytes: model.size_bytes,
                 modified: model.modified,
                 shards: model.shard_paths.clone(),
+                mtp_path: model.mtp_path.clone(),
+                projector_path: model.projector_path.clone(),
+                has_mtp: model.has_mtp,
             },
             available: true,
         };
@@ -297,6 +306,9 @@ mod tests {
             name: "Test.gguf".into(),
             path: source.clone(),
             shard_paths: vec![source.clone()],
+            mtp_path: None,
+            projector_path: None,
+            has_mtp: false,
             catalog_path: vec!["local".into(), "Test".into()],
             catalog_dir: PathBuf::new(),
             size_bytes: 4,
