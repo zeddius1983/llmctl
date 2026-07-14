@@ -199,6 +199,20 @@ which avoids split-GGUF sibling lookup problems. Generated entries are only
 reconciled when marked by an llmctl manifest; user profile data is never removed
 merely because a source is temporarily unavailable.
 
+Auxiliary GGUF sidecars are attributes of that identity rather than additional
+catalog leaves. In particular, `mtp-<base filename>.gguf` is paired with its
+same-directory base model and recorded in the base manifest. The sidecar stem
+may omit a quantization suffix present on the base artifact. Integrated MTP is
+identified from GGUF metadata (with a filename fallback). Both forms make
+`draft-mtp` the model-aware profile default; only the sidecar form needs
+llama.cpp's `--spec-draft-model` argument.
+
+`mmproj-*.gguf` files follow the same companion rule. A generic projector is
+attached locally only when its directory contains one unambiguous base-model
+family, preventing a flat mixed-model directory from receiving an unrelated
+projector. Local server and chat launches pass the selected projector through
+`--mmproj`.
+
 Catalog/profile writes are change-aware and profile mutations persist only the
 affected YAML file. If a catalog leaf cannot be created or written, that
 profile remains in the legacy JSON fallback until YAML persistence succeeds.
@@ -232,7 +246,7 @@ while an llmctl downloader would duplicate revisioned cache, shard, resume,
 authentication, and projector behavior already handled by llama.cpp.
 
 **Decision:** Add `online ▸ huggingface` as a virtual source below llama.cpp.
-Selecting it fetches 20 trending compatible repositories; selecting a
+Selecting it fetches 30 trending compatible repositories; selecting a
 repository lazily fetches GGUF files and metadata. Background threads perform
 blocking HTTPS and return results to the synchronous event loop. Metadata,
 stable remote identity, and profiles live under the managed catalog. Launch
@@ -264,6 +278,16 @@ files pane uses the same `Model` title as local repositories.
 Switching views or pressing online `F5` cancels the logical generation, removes
 generated online metadata and symlinks, and fetches a clean first page. Profile
 YAML and actual Hugging Face cache files are user/model data and remain intact.
+
+Online repository parsing classifies `mtp-*` and `mmproj-*` GGUFs as companion
+artifacts and hides them as standalone model leaves. A root MTP publisher alias
+is preferred over nested precision variants; projector selection prefers an
+unqualified publisher default, then BF16/F16 and smaller quantizations. Direct
+downloads materialize the base and selected companions in the standard Hub
+cache. Native `-hf` launches use llama.cpp's automatic root-MTP/projector
+discovery, with `--spec-draft-hf` reserved for repositories that expose only a
+nested MTP quant. Once cached, launches use explicit `--spec-draft-model` and
+`--mmproj` paths.
 
 An uncached artifact can also be downloaded without launching a server by
 pressing `d`. llmctl streams every GGUF shard into the standard Hugging Face

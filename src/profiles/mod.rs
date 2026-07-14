@@ -124,6 +124,12 @@ pub fn resolved_values(
 /// model's full trained context, which can exhaust memory — and begins at the
 /// ctx/8 heuristic instead.
 fn spec_default(spec: &registry::OptionSpec, model: &Model, defaults: &Defaults) -> String {
+    // An integrated or sidecar MTP head is only useful when llama.cpp's MTP
+    // drafter is enabled. Make that the model-aware default while still
+    // allowing a saved profile value to override it.
+    if spec.key == "spec-type" && model.supports_mtp() {
+        return "draft-mtp".into();
+    }
     match registry::omit_token(spec.key) {
         Some(token) if spec.key != "ctx-size" => token.to_string(),
         _ => model_default(spec, model, defaults),
@@ -206,6 +212,9 @@ mod tests {
             name: "x.gguf".into(),
             path: "/tmp/x.gguf".into(),
             shard_paths: vec!["/tmp/x.gguf".into()],
+            mtp_path: None,
+            projector_path: None,
+            has_mtp: false,
             catalog_path: vec!["test-model".into()],
             catalog_dir: "/tmp/test-model".into(),
             size_bytes: 0,
@@ -349,6 +358,34 @@ mod tests {
         assert_eq!(value_of(&opts, "spec-type"), "none");
         assert_eq!(value_of(&opts, "spec-draft-n-max"), registry::DEFAULT);
         assert_eq!(value_of(&opts, "spec-draft-n-min"), registry::DEFAULT);
+    }
+
+    #[test]
+    fn mtp_sidecar_enables_mtp_speculation_by_default() {
+        let mut m = model();
+        m.mtp_path = Some("/tmp/mtp-x.gguf".into());
+        let opts = resolve_options(
+            &runtime(),
+            &m,
+            &profile("Default"),
+            &empty_store(),
+            &Defaults::default(),
+        );
+        assert_eq!(value_of(&opts, "spec-type"), "draft-mtp");
+    }
+
+    #[test]
+    fn integrated_mtp_head_enables_mtp_speculation_by_default() {
+        let mut m = model();
+        m.has_mtp = true;
+        let opts = resolve_options(
+            &runtime(),
+            &m,
+            &profile("Default"),
+            &empty_store(),
+            &Defaults::default(),
+        );
+        assert_eq!(value_of(&opts, "spec-type"), "draft-mtp");
     }
 
     #[test]

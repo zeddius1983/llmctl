@@ -154,7 +154,11 @@ pub struct LaunchRequest {
     pub binary: String,
     pub model: String,
     pub model_path: String,
+    pub mtp_path: Option<String>,
+    pub projector_path: Option<String>,
     pub hf_repo: Option<String>,
+    pub draft_hf: Option<String>,
+    pub projector_auto: bool,
     pub download: Option<DownloadRecord>,
     pub profile: String,
     pub host: String,
@@ -217,8 +221,23 @@ impl SessionManager {
             opt.value = port.to_string();
         }
         let command = match &req.hf_repo {
-            Some(repo) => Command::build_huggingface(&req.binary, repo, &req.model_path, &options),
-            None => Command::build(&req.binary, &req.model_path, &options),
+            Some(repo) => Command::build_huggingface(
+                &req.binary,
+                repo,
+                &req.model_path,
+                req.mtp_path.as_deref(),
+                req.draft_hf.as_deref(),
+                req.projector_path.as_deref(),
+                req.projector_auto,
+                &options,
+            ),
+            None => Command::build_local(
+                &req.binary,
+                &req.model_path,
+                req.mtp_path.as_deref(),
+                req.projector_path.as_deref(),
+                &options,
+            ),
         };
 
         let id = next_id();
@@ -594,7 +613,11 @@ mod tests {
             binary: server.display().to_string(),
             model: "fake.gguf".into(),
             model_path: "/models/fake.gguf".into(),
+            mtp_path: None,
+            projector_path: None,
             hf_repo: None,
+            draft_hf: None,
+            projector_auto: false,
             download: None,
             profile: "Default".into(),
             host: "127.0.0.1".into(),

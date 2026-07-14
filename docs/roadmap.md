@@ -134,10 +134,44 @@ shard progress displayed as concurrent jobs in a Downloads pane below Sessions;
 selected downloads support cancellation and resume. Incomplete download jobs
 survive restart as explicitly resumable `Interrupted` rows.
 
+### Post-v0.3.0 — Local MTP discovery and launch
+Integrated MTP heads are detected from GGUF `nextn_predict_layers` metadata,
+with an MTP filename-token fallback for older converters. Officially named
+`mtp-*.gguf` sidecars are hidden as standalone models and paired with their
+same-directory base GGUF, including sidecar names that omit the base artifact's
+quantization suffix. Paired and integrated models default `spec-type` to
+`draft-mtp`; local llama-server and llama-cli commands add
+`--spec-draft-model` for the sidecar form. The managed manifest and model status
+preserve and display the discovered relationship.
+
+### Post-v0.3.0 — GGUF companions and online discovery follow-up
+Local and online `mmproj-*.gguf` files are hidden as auxiliary projector
+artifacts and associated with compatible base models. Online `mtp-*` files are
+likewise paired instead of exposed as standalone models; root publisher aliases
+win over nested precision variants. Direct downloads include selected
+companions, native Hub launches use llama.cpp auto-discovery, and cached/local
+launches pass explicit companion paths. The default Hub repository page was
+raised from 20 to 30 models; pagination remains deferred because Hub-wide search
+already covers models outside the initial page.
+
 ## Next (post-v0.3.0)
 
 ### Online Hugging Face follow-ups
 - [ ] Recent sorting and size/quantization filters
+- [ ] Optional per-model MTP/projector precision selector; discovery currently
+      follows the publisher's root default and deterministic precision fallback
+
+### Diffusion model support
+- [ ] Discover `llama-diffusion-cli` beside `llama-server` and on `$PATH`,
+      including its version/help and supported launch flags.
+- [ ] Detect diffusion GGUF architectures (initially DiffusionGemma) and expose
+      them as launchable only when a compatible `llama-diffusion-cli` is found;
+      keep them out of the regular `llama-server` launch path.
+- [ ] Add a foreground diffusion chat workflow, suspending/restoring the TUI as
+      for `llama-cli`, with profile options for output length, GPU offload,
+      entropy-bounded sampling, prompt KV cache, and optional live canvas view.
+- [ ] Defer detached sessions, health checks, and OpenAI-compatible endpoints
+      until the upstream diffusion runtime provides a stable server interface.
 
 ### Phase 4 — Log search & startup-failure classification
 - [ ] Log view search / filtering (`L` already tails + scrolls)

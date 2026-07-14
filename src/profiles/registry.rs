@@ -466,7 +466,7 @@ pub static REGISTRY: &[OptionSpec] = &[
         default: "none",
         step: 1.0,
         description: "Speculative decoding type (none = disabled; draft-mtp uses the model's \
-                      built-in MTP head).",
+                      integrated or companion MTP head).",
     },
     OptionSpec {
         key: "spec-draft-n-max",

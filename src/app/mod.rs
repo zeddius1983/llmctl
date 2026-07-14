@@ -332,6 +332,8 @@ pub struct App {
     online_rx: Receiver<discovery::online::Response>,
     online_pending: Option<discovery::online::Request>,
     llama_hf_supported: bool,
+    llama_draft_hf_supported: bool,
+    llama_mmproj_auto_supported: bool,
     online_search_due: Option<(Instant, String)>,
     online_sort: discovery::online::Sort,
     online_epoch: u64,
@@ -348,9 +350,15 @@ impl App {
     pub fn new(config: Config, paths: Paths) -> Self {
         // Discover the real llama.cpp runtime; keep vLLM as a demo stub.
         let llama = discovery::discover_llama_cpp(&config.runtime.llama_cpp, &paths.cache_dir);
-        let llama_hf_supported =
-            std::fs::read_to_string(paths.cache_dir.join("llama-server.help.txt"))
-                .is_ok_and(|help| help.contains("--hf-repo") && help.contains("--hf-file"));
+        let llama_help =
+            std::fs::read_to_string(paths.cache_dir.join("llama-server.help.txt")).ok();
+        let llama_hf_supported = llama_help
+            .as_deref()
+            .is_some_and(|help| help.contains("--hf-repo") && help.contains("--hf-file"));
+        let llama_draft_hf_supported =
+            llama_help.as_deref().is_some_and(|help| help.contains("--spec-draft-hf"));
+        let llama_mmproj_auto_supported =
+            llama_help.as_deref().is_some_and(|help| help.contains("--mmproj-auto"));
         let model_sources = resolve_model_sources(&config.models.paths, &config.models.sources);
         let model_cache = paths.cache_dir.join("models.json");
         let mut scanned_models = discovery::scan_models(&model_sources, &model_cache);
@@ -399,6 +407,8 @@ impl App {
             online_rx,
             online_pending: None,
             llama_hf_supported,
+            llama_draft_hf_supported,
+            llama_mmproj_auto_supported,
             online_search_due: None,
             online_sort,
             online_epoch: 0,
@@ -463,21 +473,24 @@ impl App {
             self.sessions.sessions.iter().any(|session| {
                 session.record.command.iter().any(|argument| argument == "--hf-repo")
             });
-        let has_uncached_remote = self.scanned_models.iter().any(|model| {
-            model.remote.as_ref().and_then(|remote| remote.file.as_ref()).is_some()
-                && model.path.as_os_str().is_empty()
+        let has_incomplete_remote = self.scanned_models.iter().any(|model| {
+            model.remote.as_ref().is_some_and(|remote| {
+                remote.file.is_some()
+                    && (model.path.as_os_str().is_empty()
+                        || (remote.mtp_file.is_some() && model.mtp_path.is_none())
+                        || (remote.projector_file.is_some() && model.projector_path.is_none()))
+            })
         });
-        if !has_remote_session || !has_uncached_remote {
+        if !has_remote_session || !has_incomplete_remote {
             return;
         }
         let models = discovery::online::load_cached(&self.models_dir);
         let newly_cached = models.iter().any(|fresh| {
-            !fresh.path.as_os_str().is_empty()
-                && self
-                    .scanned_models
-                    .iter()
-                    .find(|old| old.id == fresh.id)
-                    .is_some_and(|old| old.path.as_os_str().is_empty())
+            self.scanned_models.iter().find(|old| old.id == fresh.id).is_some_and(|old| {
+                (old.path.as_os_str().is_empty() && !fresh.path.as_os_str().is_empty())
+                    || (old.mtp_path.is_none() && fresh.mtp_path.is_some())
+                    || (old.projector_path.is_none() && fresh.projector_path.is_some())
+            })
         });
         if newly_cached {
             self.scanned_models
@@ -1136,10 +1149,38 @@ impl App {
         }
         let rt = self.runtimes.selected().ok_or("no runtime selected")?;
         let model = self.selected_model().ok_or("no model selected")?;
-        let remote_download = model.remote.is_some() && model.path.as_os_str().is_empty();
-        if remote_download && !self.llama_hf_supported {
+        let options = self.options.items.clone();
+        let mtp_enabled = option_value(&options, "spec-type").as_deref() == Some("draft-mtp");
+        let remote = model.remote.as_ref();
+        let base_missing = remote.is_some() && model.path.as_os_str().is_empty();
+        let remote_mtp_missing = mtp_enabled
+            && model.mtp_path.is_none()
+            && remote.is_some_and(|remote| remote.mtp_file.is_some());
+        let remote_projector_missing = model.projector_path.is_none()
+            && remote.is_some_and(|remote| remote.projector_file.is_some());
+        let remote_draft_hf = remote_mtp_missing
+            .then(|| {
+                let remote = remote?;
+                draft_hf_repository(&remote.repo, remote.mtp_file.as_deref()?)
+            })
+            .flatten();
+        let remote_launch =
+            remote.is_some() && (base_missing || remote_mtp_missing || remote_projector_missing);
+        if remote_launch && !self.llama_hf_supported {
             return Err(
                 "this llama-server does not advertise --hf-repo/--hf-file; upgrade llama.cpp"
+                    .into(),
+            );
+        }
+        if remote_draft_hf.is_some() && !self.llama_draft_hf_supported {
+            return Err(
+                "this llama-server does not advertise --spec-draft-hf; upgrade llama.cpp or download the MTP companion first"
+                    .into(),
+            );
+        }
+        if remote_projector_missing && !self.llama_mmproj_auto_supported {
+            return Err(
+                "this llama-server does not advertise --mmproj-auto; upgrade llama.cpp or download the projector first"
                     .into(),
             );
         }
@@ -1150,15 +1191,26 @@ impl App {
             .ok_or("llama-server binary not found on PATH")?
             .display()
             .to_string();
-        let options = self.options.items.clone();
         let host = option_value(&options, "host").unwrap_or_else(|| "127.0.0.1".into());
         let port = option_value(&options, "port").and_then(|v| v.parse().ok()).unwrap_or(8000);
-        let download = remote_download
+        let mtp_path = mtp_enabled
+            .then(|| model.mtp_path.as_ref().map(|path| path.display().to_string()))
+            .flatten();
+        let projector_path = model.projector_path.as_ref().map(|path| path.display().to_string());
+        let draft_hf = remote_launch.then_some(remote_draft_hf).flatten();
+        let projector_auto = remote_launch
+            && projector_path.is_none()
+            && remote.is_some_and(|remote| remote.projector_file.is_some());
+        let download = remote_launch
             .then(|| {
-                let remote = model.remote.as_ref()?;
+                let remote = remote?;
                 let blobs = remote
                     .blobs
                     .iter()
+                    .filter(|blob| {
+                        remote.mtp_file.as_deref() != Some(blob.file.as_str())
+                            && remote.projector_file.as_deref() != Some(blob.file.as_str())
+                    })
                     .filter_map(|blob| {
                         let (incomplete_file, complete_file) =
                             discovery::online::cache_blob_paths(&remote.repo, &blob.oid)?;
@@ -1176,14 +1228,16 @@ impl App {
             runtime: rt.name.clone(),
             binary,
             model: model.name.clone(),
-            model_path: if remote_download {
-                model.remote.as_ref().and_then(|remote| remote.file.clone()).unwrap_or_default()
+            model_path: if remote_launch {
+                remote.and_then(|remote| remote.file.clone()).unwrap_or_default()
             } else {
                 model.path.display().to_string()
             },
-            hf_repo: remote_download
-                .then(|| model.remote.as_ref().map(|remote| remote.repo.clone()))
-                .flatten(),
+            mtp_path,
+            projector_path,
+            hf_repo: remote_launch.then(|| remote.map(|remote| remote.repo.clone())).flatten(),
+            draft_hf,
+            projector_auto,
             download,
             profile: profile.name.clone(),
             host,
@@ -1204,11 +1258,19 @@ impl App {
                         &req.binary,
                         repo,
                         &req.model_path,
+                        req.mtp_path.as_deref(),
+                        req.draft_hf.as_deref(),
+                        req.projector_path.as_deref(),
+                        req.projector_auto,
                         &req.options,
                     ),
-                    None => {
-                        session::command::Command::build(&req.binary, &req.model_path, &req.options)
-                    }
+                    None => session::command::Command::build_local(
+                        &req.binary,
+                        &req.model_path,
+                        req.mtp_path.as_deref(),
+                        req.projector_path.as_deref(),
+                        &req.options,
+                    ),
                 };
                 copy_to_clipboard(&cmd.display());
                 self.message = Some(Message {
@@ -1257,7 +1319,9 @@ impl App {
     fn download_selected_model(&mut self) {
         let Some(model) = self.selected_model().cloned() else { return };
         let Some(remote) = model.remote.clone() else { return };
-        if remote.file.is_none() || !model.path.as_os_str().is_empty() {
+        let total_bytes = remote.blobs.iter().map(|blob| blob.size_bytes).sum();
+        let downloaded_bytes = discovery::online::cached_downloaded_bytes(&remote);
+        if remote.file.is_none() || (total_bytes > 0 && downloaded_bytes >= total_bytes) {
             return;
         }
         if remote.gated && std::env::var_os("HF_TOKEN").is_none() {
@@ -1267,7 +1331,6 @@ impl App {
             });
             return;
         }
-        let total_bytes = remote.blobs.iter().map(|blob| blob.size_bytes).sum();
         if remote.blobs.is_empty() || total_bytes == 0 {
             self.message = Some(Message {
                 title: "Cannot download".into(),
@@ -1488,11 +1551,19 @@ impl App {
                 &cli.display().to_string(),
                 repo,
                 &req.model_path,
+                req.mtp_path.as_deref(),
+                req.draft_hf.as_deref(),
+                req.projector_path.as_deref(),
+                req.projector_auto,
                 &opts,
             ),
-            None => {
-                session::command::Command::build(&cli.display().to_string(), &req.model_path, &opts)
-            }
+            None => session::command::Command::build_local(
+                &cli.display().to_string(),
+                &req.model_path,
+                req.mtp_path.as_deref(),
+                req.projector_path.as_deref(),
+                &opts,
+            ),
         };
         let mut argv = cmd.argv;
         argv.push("-cnv".into()); // conversation/chat mode
@@ -2112,6 +2183,9 @@ impl App {
                         name,
                         path: PathBuf::new(),
                         shard_paths: Vec::new(),
+                        mtp_path: None,
+                        projector_path: None,
+                        has_mtp: false,
                         catalog_path: model.catalog_path[..=prefix.len()].to_vec(),
                         catalog_dir: PathBuf::new(),
                         size_bytes: 0,
@@ -2327,6 +2401,14 @@ impl App {
                         if let Some(quantization) = &m.quantization {
                             meta.push(quantization.clone());
                         }
+                        if remote.mtp_file.is_some() {
+                            meta.push("MTP".into());
+                        } else if m.has_mtp {
+                            meta.push("MTP integrated".into());
+                        }
+                        if m.supports_multimodal() {
+                            meta.push("multimodal".into());
+                        }
                     }
                     return (primary, meta.join(" · "));
                 }
@@ -2355,6 +2437,16 @@ impl App {
                 }
                 if m.has_chat_template {
                     meta.push("chat-template".into());
+                }
+                if let Some(mtp) = &m.mtp_path {
+                    let name = mtp.file_name().unwrap_or_default().to_string_lossy();
+                    meta.push(format!("MTP {name}"));
+                } else if m.has_mtp {
+                    meta.push("MTP integrated".into());
+                }
+                if let Some(projector) = &m.projector_path {
+                    let name = projector.file_name().unwrap_or_default().to_string_lossy();
+                    meta.push(format!("projector {name}"));
                 }
                 if let Some(secs) = m.modified {
                     meta.push(format_unix_date(secs));
@@ -2570,6 +2662,14 @@ fn option_value(options: &[OptionItem], key: &str) -> Option<String> {
     options.iter().find(|o| o.key == key).map(|o| o.value.clone())
 }
 
+fn draft_hf_repository(repo: &str, file: &str) -> Option<String> {
+    let quant = discovery::models::quant_from_filename(file);
+    if !file.contains('/') && quant.is_none() {
+        return None; // recent llama.cpp auto-discovers a root `mtp-*.gguf` beside `-hf`
+    }
+    Some(quant.map(|quant| format!("{repo}:{quant}")).unwrap_or_else(|| repo.to_string()))
+}
+
 /// Resolve the interactive `llama-cli` binary sitting next to `llama-server`.
 fn cli_binary(server_binary: &str) -> Option<PathBuf> {
     let p = std::path::Path::new(server_binary);
@@ -2705,6 +2805,15 @@ mod tests {
     }
 
     #[test]
+    fn root_mtp_uses_hf_auto_discovery_but_nested_quant_is_explicit() {
+        assert_eq!(draft_hf_repository("owner/repo", "mtp-model.gguf"), None);
+        assert_eq!(
+            draft_hf_repository("owner/repo", "MTP/mtp-model-Q8_0.gguf"),
+            Some("owner/repo:Q8_0".into())
+        );
+    }
+
+    #[test]
     fn persisted_download_is_restored_as_interrupted() {
         let stamp =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -2719,6 +2828,8 @@ mod tests {
                 size_bytes: 42,
                 file: "model.gguf".into(),
             }],
+            mtp_file: None,
+            projector_file: None,
             downloads: 0,
             likes: 0,
             gated: false,
@@ -2815,6 +2926,8 @@ mod tests {
                 revision: None,
                 file: None,
                 blobs: Vec::new(),
+                mtp_file: None,
+                projector_file: None,
                 downloads,
                 likes: 0,
                 gated: false,
@@ -2848,6 +2961,8 @@ mod tests {
                 revision: None,
                 file: Some(name.into()),
                 blobs: Vec::new(),
+                mtp_file: None,
+                projector_file: None,
                 downloads: 0,
                 likes: 0,
                 gated: false,

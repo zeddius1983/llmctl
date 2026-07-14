@@ -41,7 +41,7 @@ Everything should be available from a single terminal application.
 ## Online model catalog
 
 The llama.cpp hierarchy contains the virtual source `online ▸ huggingface`.
-Selecting it loads 20 trending models filtered for GGUF and llama.cpp
+Selecting it loads 30 trending models filtered for GGUF and llama.cpp
 compatibility, including text-only and multimodal pipelines. Repository
 contents are fetched lazily, cached into the managed catalog, and use the same
 Model → Profile → Options workflow as local models. Authentication is inherited
@@ -49,6 +49,12 @@ from `HF_TOKEN` and is never persisted by llmctl. `/` searches the Hub
 server-side when invoked from the online hierarchy. Search results are
 transient; only the repository selected with Enter is added to the persistent
 online catalogue.
+
+Repository artifacts named `mtp-*.gguf` or `mmproj-*.gguf` are companions, not
+standalone models. The preferred MTP drafter and multimodal projector are
+associated with each compatible base artifact. Native `-hf` launches use
+llama.cpp's root-MTP and projector auto-discovery; direct downloads include the
+selected companions, and cached launches pass their local paths explicitly.
 
 The online repository pane title reflects its active view: `Trending`,
 `Most likes`, or `Most downloads`. A repository's GGUF files pane uses the
@@ -180,6 +186,8 @@ The Info pane displays:
 * Quantization
 * Context length
 * Chat template information
+* Integrated or sidecar MTP availability
+* Multimodal projector availability
 * Last modified date
 
 when detectable.
@@ -629,8 +637,22 @@ Collected metadata:
 * Quantization
 * Architecture
 * Modification time
+* Integrated MTP metadata and matching `mtp-*.gguf` sidecars
+* Matching `mmproj-*.gguf` multimodal projector sidecars
 
 Results should be cached.
+
+An `mtp-<base filename>.gguf` is an auxiliary speculative-decoding model, not a
+standalone catalog entry. It is paired with the same-directory base GGUF and
+passed to llama.cpp with `--spec-draft-model` when `draft-mtp` is active.
+Pairing accepts both an exact base filename and a base filename that extends the
+sidecar stem with a quantization suffix.
+Integrated MTP heads are detected from GGUF metadata, with the filename's MTP
+token as a compatibility fallback.
+
+An `mmproj-*.gguf` is likewise an auxiliary model rather than a standalone
+catalog entry. A compatible same-directory projector is associated with an
+unambiguous local model family and passed to llama.cpp with `--mmproj`.
 
 Manual refresh must be supported.
 

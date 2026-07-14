@@ -15,6 +15,7 @@ use crate::domain::{Model, RemoteBlob, RemoteModel};
 const API: &str = "https://huggingface.co/api/models";
 const SOURCE: [&str; 2] = ["online", "huggingface"];
 const DOWNLOAD_SCHEMA: u8 = 1;
+const REPOSITORY_LIMIT: &str = "30";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -147,6 +148,8 @@ struct ArtifactManifest<'a> {
     repo: &'a str,
     revision: Option<&'a str>,
     file: &'a str,
+    mtp_file: Option<&'a str>,
+    projector_file: Option<&'a str>,
     size_bytes: u64,
     cached_path: Option<&'a Path>,
 }
@@ -255,7 +258,7 @@ fn request_repositories(
         .query("apps", "llama.cpp")
         .query("sort", sort.api_value())
         .query("direction", "-1")
-        .query("limit", "20");
+        .query("limit", REPOSITORY_LIMIT);
     if let Some(search) = search {
         request = request.query("search", search);
     }
@@ -358,13 +361,7 @@ fn artifacts_with_cache(
     let mut result = Vec::new();
     for file in &detail.siblings {
         let lower = file.rfilename.to_ascii_lowercase();
-        if !lower.ends_with(".gguf")
-            || file
-                .rfilename
-                .rsplit('/')
-                .next()
-                .is_some_and(|name| name.to_ascii_lowercase().starts_with("mmproj"))
-        {
+        if !lower.ends_with(".gguf") || is_companion(&file.rfilename) {
             continue;
         }
         if shard.captures(&file.rfilename).is_some_and(|captures| &captures[1] != "00001") {
@@ -385,17 +382,17 @@ fn artifacts_with_cache(
             vec![file]
         };
         let bytes = files.iter().map(|file| file.bytes()).sum();
-        let blobs = files
-            .iter()
-            .filter_map(|file| {
-                let lfs = file.lfs.as_ref()?;
-                Some(RemoteBlob {
-                    oid: lfs.oid.clone()?,
-                    size_bytes: file.bytes(),
-                    file: file.rfilename.clone(),
-                })
-            })
-            .collect();
+        let mut blobs: Vec<RemoteBlob> =
+            files.iter().filter_map(|file| remote_blob(file)).collect();
+        let mtp = matching_mtp_companion(&file.rfilename, &detail.siblings);
+        let projector = matching_projector_companion(&detail.siblings);
+        for companion in [mtp, projector].into_iter().flatten() {
+            if let Some(blob) = remote_blob(companion)
+                && !blobs.iter().any(|existing: &RemoteBlob| existing.file == blob.file)
+            {
+                blobs.push(blob);
+            }
+        }
         let leaf = sanitize(&display);
         let catalog_dir = repository_dir(root, &detail.repository.id).join(&leaf);
         let _ = fs::create_dir_all(catalog_dir.join("profiles"));
@@ -413,6 +410,12 @@ fn artifacts_with_cache(
             .flatten()
             .unwrap_or_default();
         let shard_paths = if local_path.as_os_str().is_empty() { Vec::new() } else { cached_paths };
+        let mtp_path = mtp.and_then(|companion| {
+            cache.and_then(|hub| cached_file_in(hub, &detail.repository.id, &companion.rfilename))
+        });
+        let projector_path = projector.and_then(|companion| {
+            cache.and_then(|hub| cached_file_in(hub, &detail.repository.id, &companion.rfilename))
+        });
         let manifest = ArtifactManifest {
             schema: 1,
             id: format!("hf:{}/{}", detail.repository.id, file.rfilename),
@@ -420,6 +423,8 @@ fn artifacts_with_cache(
             repo: &detail.repository.id,
             revision: detail.repository.sha.as_deref(),
             file: &file.rfilename,
+            mtp_file: mtp.map(|companion| companion.rfilename.as_str()),
+            projector_file: projector.map(|companion| companion.rfilename.as_str()),
             size_bytes: bytes,
             cached_path: (!local_path.as_os_str().is_empty()).then_some(local_path.as_path()),
         };
@@ -434,6 +439,9 @@ fn artifacts_with_cache(
             name: display,
             path: local_path,
             shard_paths,
+            mtp_path,
+            projector_path,
+            has_mtp: false,
             catalog_path: vec![
                 SOURCE[0].into(),
                 SOURCE[1].into(),
@@ -456,6 +464,8 @@ fn artifacts_with_cache(
                 revision: detail.repository.sha.clone(),
                 file: Some(file.rfilename.clone()),
                 blobs,
+                mtp_file: mtp.map(|companion| companion.rfilename.clone()),
+                projector_file: projector.map(|companion| companion.rfilename.clone()),
                 downloads: detail.repository.downloads,
                 likes: detail.repository.likes,
                 gated: detail.repository.gated,
@@ -471,6 +481,9 @@ fn repository_directory(root: &Path, repository: &Repository) -> Model {
         name: repository.id.clone(),
         path: PathBuf::new(),
         shard_paths: Vec::new(),
+        mtp_path: None,
+        projector_path: None,
+        has_mtp: false,
         catalog_path: vec![SOURCE[0].into(), SOURCE[1].into(), repository.id.clone()],
         catalog_dir: repository_dir(root, &repository.id),
         size_bytes: 0,
@@ -484,6 +497,8 @@ fn repository_directory(root: &Path, repository: &Repository) -> Model {
             revision: repository.sha.clone(),
             file: None,
             blobs: Vec::new(),
+            mtp_file: None,
+            projector_file: None,
             downloads: repository.downloads,
             likes: repository.likes,
             gated: repository.gated,
@@ -497,6 +512,9 @@ fn directory(path: &[&str]) -> Model {
         name: path.last().copied().unwrap_or_default().into(),
         path: PathBuf::new(),
         shard_paths: Vec::new(),
+        mtp_path: None,
+        projector_path: None,
+        has_mtp: false,
         catalog_path: path.iter().map(|part| (*part).into()).collect(),
         catalog_dir: PathBuf::new(),
         size_bytes: 0,
@@ -507,6 +525,115 @@ fn directory(path: &[&str]) -> Model {
         has_chat_template: false,
         remote: None,
     }
+}
+
+fn is_companion(file: &str) -> bool {
+    let name = file.rsplit('/').next().unwrap_or(file).to_ascii_lowercase();
+    name.starts_with("mtp-") || name.starts_with("mmproj")
+}
+
+fn is_mtp_companion(file: &str) -> bool {
+    file.rsplit('/').next().is_some_and(|name| {
+        name.to_ascii_lowercase().starts_with("mtp-")
+            && name.to_ascii_lowercase().ends_with(".gguf")
+    })
+}
+
+fn is_projector_companion(file: &str) -> bool {
+    file.rsplit('/').next().is_some_and(|name| {
+        name.to_ascii_lowercase().starts_with("mmproj")
+            && name.to_ascii_lowercase().ends_with(".gguf")
+    })
+}
+
+fn remote_blob(file: &Sibling) -> Option<RemoteBlob> {
+    let lfs = file.lfs.as_ref()?;
+    Some(RemoteBlob {
+        oid: lfs.oid.clone()?,
+        size_bytes: file.bytes(),
+        file: file.rfilename.clone(),
+    })
+}
+
+fn matching_mtp_companion<'a>(base: &str, siblings: &'a [Sibling]) -> Option<&'a Sibling> {
+    let base_name = base.rsplit('/').next()?;
+    let base_stem =
+        strip_suffix_ascii_case(base_name, ".gguf").unwrap_or(base_name).to_ascii_lowercase();
+    siblings
+        .iter()
+        .filter(|candidate| is_mtp_companion(&candidate.rfilename))
+        .filter_map(|candidate| {
+            let name = candidate.rfilename.rsplit('/').next()?;
+            let prefixed = name.get(4..)?;
+            let raw_stem = strip_suffix_ascii_case(prefixed, ".gguf").unwrap_or(prefixed);
+            let quant = super::models::quant_from_filename(raw_stem);
+            let family = quant
+                .as_deref()
+                .and_then(|quant| strip_suffix_ascii_case(raw_stem, &format!("-{quant}")))
+                .unwrap_or(raw_stem)
+                .to_ascii_lowercase();
+            let compatible = base_stem == family
+                || base_stem.strip_prefix(&family).is_some_and(|suffix| suffix.starts_with('-'));
+            if !compatible {
+                return None;
+            }
+            let same_directory = parent_path(base) == parent_path(&candidate.rfilename);
+            let exact = same_directory && raw_stem.eq_ignore_ascii_case(&base_stem);
+            let publisher_default = same_directory && quant.is_none();
+            let tier = if exact {
+                3
+            } else if publisher_default {
+                2
+            } else {
+                1
+            };
+            Some(((tier, mtp_quant_rank(quant.as_deref()), family.len()), candidate))
+        })
+        .max_by(|(rank_a, a), (rank_b, b)| {
+            rank_a.cmp(rank_b).then_with(|| b.rfilename.cmp(&a.rfilename))
+        })
+        .map(|(_, candidate)| candidate)
+}
+
+fn matching_projector_companion(siblings: &[Sibling]) -> Option<&Sibling> {
+    siblings.iter().filter(|candidate| is_projector_companion(&candidate.rfilename)).max_by(
+        |a, b| {
+            projector_quant_rank(&a.rfilename)
+                .cmp(&projector_quant_rank(&b.rfilename))
+                .then_with(|| b.rfilename.cmp(&a.rfilename))
+        },
+    )
+}
+
+fn mtp_quant_rank(quant: Option<&str>) -> u8 {
+    match quant {
+        None => 6,
+        Some(value) if value.eq_ignore_ascii_case("Q4_0") => 5,
+        Some(value) if value.eq_ignore_ascii_case("Q8_0") => 4,
+        Some(value) if value.eq_ignore_ascii_case("BF16") => 3,
+        Some(value) if value.eq_ignore_ascii_case("F16") => 2,
+        Some(_) => 1,
+    }
+}
+
+fn projector_quant_rank(file: &str) -> u8 {
+    match super::models::quant_from_filename(file) {
+        None => 6,
+        Some(value) if value.eq_ignore_ascii_case("BF16") => 5,
+        Some(value) if value.eq_ignore_ascii_case("F16") => 4,
+        Some(value) if value.eq_ignore_ascii_case("Q8_0") => 3,
+        Some(value) if value.eq_ignore_ascii_case("Q4_0") => 2,
+        Some(_) => 1,
+    }
+}
+
+fn strip_suffix_ascii_case<'a>(value: &'a str, suffix: &str) -> Option<&'a str> {
+    let start = value.len().checked_sub(suffix.len())?;
+    value[start..].eq_ignore_ascii_case(suffix).then_some(&value[..start])
+}
+
+fn parent_path(file: &str) -> &str {
+    file.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("")
 }
 
 fn cached_file(repo: &str, file: &str) -> Option<PathBuf> {
@@ -999,6 +1126,8 @@ mod tests {
                 size_bytes: 1_000,
                 file: "model.gguf".into(),
             }],
+            mtp_file: None,
+            projector_file: None,
             downloads: 0,
             likes: 0,
             gated: false,
@@ -1063,6 +1192,8 @@ mod tests {
                 size_bytes: 42,
                 file: "model-Q4_K_M.gguf".into(),
             }],
+            mtp_file: None,
+            projector_file: None,
             downloads: 10,
             likes: 2,
             gated: false,
@@ -1155,7 +1286,31 @@ mod tests {
                     size: Some(11),
                     lfs: Some(Lfs { oid: Some("bb".repeat(32)), size: Some(11) }),
                 },
-                Sibling { rfilename: "mmproj-model.gguf".into(), size: Some(5), lfs: None },
+                Sibling {
+                    rfilename: "mtp-model.gguf".into(),
+                    size: Some(4),
+                    lfs: Some(Lfs { oid: Some("cc".repeat(32)), size: Some(4) }),
+                },
+                Sibling {
+                    rfilename: "MTP/mtp-model-Q4_0.gguf".into(),
+                    size: Some(4),
+                    lfs: Some(Lfs { oid: Some("cc".repeat(32)), size: Some(4) }),
+                },
+                Sibling {
+                    rfilename: "MTP/mtp-model-F16.gguf".into(),
+                    size: Some(8),
+                    lfs: Some(Lfs { oid: Some("dd".repeat(32)), size: Some(8) }),
+                },
+                Sibling {
+                    rfilename: "mmproj-F16.gguf".into(),
+                    size: Some(5),
+                    lfs: Some(Lfs { oid: Some("ee".repeat(32)), size: Some(5) }),
+                },
+                Sibling {
+                    rfilename: "mmproj-BF16.gguf".into(),
+                    size: Some(5),
+                    lfs: Some(Lfs { oid: Some("ff".repeat(32)), size: Some(5) }),
+                },
             ],
             gguf: Some(GgufInfo {
                 architecture: Some("llama".into()),
@@ -1169,7 +1324,12 @@ mod tests {
         assert_eq!(repository.display_label(), "owner/repo");
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].size_bytes, 21);
-        assert_eq!(models[0].remote.as_ref().unwrap().blobs.len(), 2);
+        let remote = models[0].remote.as_ref().unwrap();
+        assert_eq!(remote.blobs.len(), 4);
+        assert_eq!(remote.mtp_file.as_deref(), Some("mtp-model.gguf"));
+        assert_eq!(remote.projector_file.as_deref(), Some("mmproj-BF16.gguf"));
+        assert!(models[0].supports_mtp());
+        assert!(models[0].supports_multimodal());
         assert_eq!(models[0].name, "model-Q4_K_M.gguf");
         assert_eq!(models[0].context_length, Some(32768));
         assert_eq!(
@@ -1226,6 +1386,46 @@ mod tests {
         let complete = artifacts_with_cache(&root, &detail, Some(&hub));
         assert_eq!(complete[0].path, first);
         assert_eq!(complete[0].shard_paths, vec![first, second]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cached_online_companions_become_local_launch_paths() {
+        let root = std::env::temp_dir().join(format!("llmctl-online-companions-{}", now()));
+        let hub = root.join("hub");
+        let detail = RepositoryDetail {
+            schema: 2,
+            fetched_at: 42,
+            repository: Repository {
+                id: "owner/repo".into(),
+                downloads: 0,
+                likes: 0,
+                sha: Some("abc".into()),
+                gated: false,
+            },
+            siblings: vec![
+                Sibling { rfilename: "model-Q4_K_M.gguf".into(), size: Some(10), lfs: None },
+                Sibling { rfilename: "mtp-model.gguf".into(), size: Some(4), lfs: None },
+                Sibling { rfilename: "mmproj-BF16.gguf".into(), size: Some(5), lfs: None },
+            ],
+            gguf: None,
+        };
+        let snapshot = hub.join("models--owner--repo/snapshots/abc");
+        fs::create_dir_all(hub.join("models--owner--repo/refs")).unwrap();
+        fs::write(hub.join("models--owner--repo/refs/main"), "abc").unwrap();
+        fs::create_dir_all(&snapshot).unwrap();
+        for file in ["model-Q4_K_M.gguf", "mtp-model.gguf", "mmproj-BF16.gguf"] {
+            fs::write(snapshot.join(file), b"cached").unwrap();
+        }
+
+        let models = artifacts_with_cache(&root, &detail, Some(&hub));
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].path, snapshot.join("model-Q4_K_M.gguf"));
+        assert_eq!(models[0].mtp_path.as_deref(), Some(snapshot.join("mtp-model.gguf").as_path()));
+        assert_eq!(
+            models[0].projector_path.as_deref(),
+            Some(snapshot.join("mmproj-BF16.gguf").as_path())
+        );
         let _ = fs::remove_dir_all(root);
     }
 

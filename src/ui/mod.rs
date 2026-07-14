@@ -998,6 +998,8 @@ mod tests {
             revision: None,
             file: Some(model.name.clone()),
             blobs: Vec::new(),
+            mtp_file: None,
+            projector_file: None,
             downloads: 0,
             likes: 0,
             gated: false,

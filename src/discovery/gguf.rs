@@ -44,6 +44,7 @@ pub struct GgufInfo {
     /// Quantization label derived from `general.file_type`, if present.
     pub file_type_label: Option<String>,
     pub has_chat_template: bool,
+    pub has_mtp: bool,
 }
 
 /// Scalar metadata value (arrays are skipped, not stored).
@@ -87,6 +88,7 @@ pub fn read_gguf_info(path: &Path) -> Result<GgufInfo> {
 
     let mut kv: HashMap<String, Scalar> = HashMap::new();
     let mut has_chat_template = false;
+    let mut has_mtp = false;
 
     for _ in 0..kv_count {
         let key = read_string(&mut r)?;
@@ -95,6 +97,11 @@ pub fn read_gguf_info(path: &Path) -> Result<GgufInfo> {
             Some(scalar) => {
                 if key == "tokenizer.chat_template" {
                     has_chat_template = true;
+                }
+                if key.ends_with(".nextn_predict_layers")
+                    && scalar.as_u64().is_some_and(|layers| layers > 0)
+                {
+                    has_mtp = true;
                 }
                 // Only retain keys we actually consult.
                 if key == "general.architecture"
@@ -119,7 +126,7 @@ pub fn read_gguf_info(path: &Path) -> Result<GgufInfo> {
     let file_type_label =
         kv.get("general.file_type").and_then(|v| v.as_u64()).and_then(file_type_label);
 
-    Ok(GgufInfo { architecture, context_length, file_type_label, has_chat_template })
+    Ok(GgufInfo { architecture, context_length, file_type_label, has_chat_template, has_mtp })
 }
 
 /// Read one value of the given type. Returns `None` for arrays (skipped) and
@@ -245,4 +252,35 @@ fn file_type_label(ft: u64) -> Option<String> {
         _ => return None,
     };
     Some(label.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn push_string(bytes: &mut Vec<u8>, value: &str) {
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+
+    #[test]
+    fn detects_integrated_mtp_metadata() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("llmctl-mtp-header-{nonce}.gguf"));
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes()); // tensor count
+        bytes.extend_from_slice(&1_u64.to_le_bytes()); // metadata count
+        push_string(&mut bytes, "gemma4-assistant.nextn_predict_layers");
+        bytes.extend_from_slice(&T_UINT32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let info = read_gguf_info(&path).unwrap();
+        assert!(info.has_mtp);
+
+        std::fs::remove_file(path).unwrap();
+    }
 }

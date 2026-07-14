@@ -32,6 +32,18 @@ pub struct Model {
     /// All physical shards (one entry for a non-split model).
     #[serde(default)]
     pub shard_paths: Vec<PathBuf>,
+    /// A same-directory `mtp-*.gguf` sidecar paired with this base model.
+    /// llama.cpp loads it as a speculative draft model, never as a standalone
+    /// model.
+    #[serde(default)]
+    pub mtp_path: Option<PathBuf>,
+    /// A compatible multimodal projector sidecar. The projector encodes image
+    /// or audio inputs for the base model and is never launched by itself.
+    #[serde(default)]
+    pub projector_path: Option<PathBuf>,
+    /// Whether the base GGUF itself contains Multi-Token Prediction heads.
+    #[serde(default)]
+    pub has_mtp: bool,
     /// Source/provider/repository/artifact path shown by the model browser.
     #[serde(default)]
     pub catalog_path: Vec<String>,
@@ -61,6 +73,12 @@ pub struct RemoteModel {
     /// shards), used to observe llama.cpp's native download progress.
     #[serde(default)]
     pub blobs: Vec<RemoteBlob>,
+    /// Repository-relative companion selected for speculative MTP decoding.
+    #[serde(default)]
+    pub mtp_file: Option<String>,
+    /// Repository-relative multimodal projector selected for this artifact.
+    #[serde(default)]
+    pub projector_file: Option<String>,
     #[serde(default)]
     pub downloads: u64,
     #[serde(default)]
@@ -137,6 +155,17 @@ impl Model {
     pub fn display_label(&self) -> &str {
         self.catalog_path.last().map(String::as_str).unwrap_or(&self.name)
     }
+
+    pub fn supports_mtp(&self) -> bool {
+        self.has_mtp
+            || self.mtp_path.is_some()
+            || self.remote.as_ref().is_some_and(|remote| remote.mtp_file.is_some())
+    }
+
+    pub fn supports_multimodal(&self) -> bool {
+        self.projector_path.is_some()
+            || self.remote.as_ref().is_some_and(|remote| remote.projector_file.is_some())
+    }
 }
 
 /// Format a Unix timestamp (seconds) as `YYYY-MM-DD` (UTC).
@@ -206,6 +235,9 @@ pub mod stubs {
             name: name.into(),
             path: path.into(),
             shard_paths: vec![path.into()],
+            mtp_path: None,
+            projector_path: None,
+            has_mtp: false,
             catalog_path: vec![name.into()],
             catalog_dir: PathBuf::new(),
             size_bytes: size,
