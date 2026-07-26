@@ -2314,7 +2314,11 @@ impl App {
                 }
             });
         }
-        children.into_values().collect()
+        let mut children = children.into_values().collect::<Vec<_>>();
+        if self.runtimes.selected().is_some_and(|runtime| runtime.id == RuntimeId::FastFlowLm) {
+            discovery::fastflowlm::sort_models(&mut children);
+        }
+        children
     }
 
     /// Re-scan configured model directories (the `F5` refresh).
@@ -2948,11 +2952,78 @@ fn copy_to_clipboard(text: &str) {
 /// Read up to the last `max_lines` lines of a (possibly large) log file.
 fn read_log_tail(path: &std::path::Path, max_lines: usize) -> Vec<String> {
     let content = std::fs::read_to_string(path).unwrap_or_default();
-    let mut lines: Vec<String> = content.lines().map(String::from).collect();
+    normalized_log_tail(&content, max_lines)
+}
+
+/// Convert terminal-style output into stable TUI rows. Programs such as FLM
+/// redraw progress in place with bare carriage returns and ANSI erase
+/// sequences; passing those controls to ratatui moves the real terminal cursor
+/// and corrupts the log pane alignment.
+fn normalized_log_tail(content: &str, max_lines: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut overwrite = false;
+    let mut chars = content.chars().peekable();
+
+    while let Some(character) = chars.next() {
+        match character {
+            '\r' => overwrite = true,
+            '\n' => {
+                lines.push(std::mem::take(&mut line));
+                overwrite = false;
+            }
+            '\x1b' => skip_terminal_escape(&mut chars),
+            '\x08' => {
+                line.pop();
+            }
+            '\t' => {
+                if overwrite {
+                    line.clear();
+                    overwrite = false;
+                }
+                line.push_str("    ");
+            }
+            character if !character.is_control() => {
+                if overwrite {
+                    line.clear();
+                    overwrite = false;
+                }
+                line.push(character);
+            }
+            _ => {}
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
     if lines.len() > max_lines {
         lines = lines.split_off(lines.len() - max_lines);
     }
     lines
+}
+
+fn skip_terminal_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    match chars.next() {
+        // CSI: parameters/intermediates end at the first final byte.
+        Some('[') => {
+            for character in chars.by_ref() {
+                if ('@'..='~').contains(&character) {
+                    break;
+                }
+            }
+        }
+        // OSC: terminate at BEL or ST (ESC followed by backslash).
+        Some(']') => {
+            let mut escaped = false;
+            for character in chars.by_ref() {
+                if character == '\x07' || (escaped && character == '\\') {
+                    break;
+                }
+                escaped = character == '\x1b';
+            }
+        }
+        Some(_) | None => {}
+    }
 }
 
 /// Cycle through automatic device selection and the devices discovered from
@@ -3000,6 +3071,23 @@ mod tests {
         assert_eq!(transfer_percent(0, 300), 0);
         assert_eq!(transfer_percent(201, 300), 67);
         assert_eq!(transfer_percent(400, 300), 100);
+    }
+
+    #[test]
+    fn log_tail_collapses_terminal_redraws_and_strips_ansi() {
+        let log = "[FLM]  Downloading 2/4: model.q4nx\r\x1b[K\
+                   \x1b[33m[FLM]  Downloading: 1.0%\x1b[0m\r\x1b[K\
+                   [FLM]  Downloading: 2.0%\n\
+                   [FLM]  Download completed\n";
+
+        let lines = normalized_log_tail(log, 1000);
+        assert_eq!(lines, vec!["[FLM]  Downloading: 2.0%", "[FLM]  Download completed"]);
+        assert!(lines.iter().all(|line| line.chars().all(|character| !character.is_control())));
+    }
+
+    #[test]
+    fn log_tail_preserves_crlf_line_endings() {
+        assert_eq!(normalized_log_tail("first\r\nsecond\r\n", 1000), vec!["first", "second"]);
     }
 
     #[test]

@@ -134,11 +134,7 @@ pub fn discover(
     let mut models = catalogue
         .map(|catalogue| build_models(catalogue, version.as_deref(), models_dir))
         .unwrap_or_default();
-    models.sort_by(|a, b| {
-        let ai = a.fastflow.as_ref().is_some_and(|model| model.installed);
-        let bi = b.fastflow.as_ref().is_some_and(|model| model.installed);
-        bi.cmp(&ai).then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
-    });
+    sort_models(&mut models);
 
     let description =
         if ready { "AMD Ryzen AI NPU inference (NPU ready)" } else { "AMD Ryzen AI NPU inference" };
@@ -158,6 +154,15 @@ pub fn discover(
         models,
         port,
     )
+}
+
+/// Group installed models first while keeping each group alphabetical.
+pub fn sort_models(models: &mut [Model]) {
+    models.sort_by(|a, b| {
+        let ai = a.fastflow.as_ref().is_some_and(|model| model.installed);
+        let bi = b.fastflow.as_ref().is_some_and(|model| model.installed);
+        bi.cmp(&ai).then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+    });
 }
 
 fn run_output(command: &[String], args: &[&str]) -> Option<Output> {
@@ -352,6 +357,30 @@ mod tests {
         assert!(model.is_model());
         assert!(model.fastflow.as_ref().unwrap().supported);
         assert!(model.catalog_dir.join("profiles").is_dir());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn installed_models_sort_before_available_models() {
+        let fixture = br#"{
+          "models": [
+            {"model": "available-a", "installed": false},
+            {"model": "installed-z", "installed": true},
+            {"model": "installed-b", "installed": true},
+            {"model": "available-c", "installed": false}
+          ]
+        }"#;
+        let catalogue: Catalogue = serde_json::from_slice(fixture).unwrap();
+        let root =
+            std::env::temp_dir().join(format!("llmctl-fastflow-sort-{}", std::process::id()));
+        let mut models = build_models(catalogue, None, &root);
+
+        sort_models(&mut models);
+
+        assert_eq!(
+            models.iter().map(|model| model.name.as_str()).collect::<Vec<_>>(),
+            vec!["installed-b", "installed-z", "available-a", "available-c"]
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

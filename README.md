@@ -194,7 +194,7 @@ Your `$HOME` is never scanned wholesale.
 ### FastFlowLM models
 
 Select `FastFlowLM` to browse its models directly. Installed entries are marked
-`✓`; available entries are marked `⇣`. `F5` reruns
+`✓` and grouped at the top; available entries are marked `⇣`. `F5` reruns
 `flm list --json --quiet`, and `/` searches only that catalogue. llmctl does not
 offer a separate FLM pre-download action because FLM cannot resume partial
 pulls; `d` remains reserved for managed online GGUF downloads.

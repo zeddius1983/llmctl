@@ -44,8 +44,9 @@ When FastFlowLM is installed, llmctl exposes it as a separate runtime backed
 by the authoritative catalogue returned by `flm list --json --quiet`. Only
 catalogue entries may be selected and launched; llmctl must not offer arbitrary
 Hugging Face artifacts to this runtime. Installed and available entries share
-the usual Model → Profile → Options workflow, while unsupported model families
-or entries requiring a newer FLM release remain visible but cannot be launched.
+the usual Model → Profile → Options workflow, with installed entries listed
+first. Unsupported model families or entries requiring a newer FLM release
+remain visible but cannot be launched.
 
 Runtime discovery collects `flm version --json`, `flm validate --json`, the
 configured server port from `flm port`, and the model list. A failed refresh
