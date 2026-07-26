@@ -1,6 +1,6 @@
-//! Static registry of launch options: the source of truth for which options
-//! exist and their type, default, range, step, CLI flag, and description. Used
-//! to render the Options pane, validate edits, and drive inline adjustment.
+//! The generic option model: the value kinds, the per-option metadata, and the
+//! [`OptionSchema`] that binds a runtime's option table to its CLI-encoding
+//! rules. The tables themselves live with their backends in `crate::runtime`.
 
 /// The kind/domain of an option value, used for validation and adjustment.
 #[derive(Debug, Clone, Copy)]
@@ -117,72 +117,72 @@ impl OptionKind {
 }
 
 /// Sentinel value (for options with no in-band "auto") meaning "leave this flag
-/// off the command line and rely on llama.cpp's own built-in default".
+/// off the command line and rely on the runtime's own built-in default".
 pub const DEFAULT: &str = "default";
 
-/// The value at which an option is dropped from the launch command, because it
-/// equals what llama.cpp would do anyway. For on/off/auto enums that's `"auto"`
-/// (llama's own default); enums that carry an explicit `"default"` variant
-/// (e.g. the cache types) omit at that variant; for numeric options with no
-/// in-band sentinel it's the [`DEFAULT`] sentinel. `None` means always emitted.
-pub fn omit_token(key: &str) -> Option<&'static str> {
-    match key {
-        "flash-attn" | "reasoning" => Some("auto"),
-        // `mmap=on` is llama.cpp's default (omitted); `off` adds the bare
-        // `--no-mmap` flag (see [`is_flag`]).
-        "mmap" => Some("on"),
-        // Speculative decoding is off by default.
-        "spec-type" => Some("none"),
-        // `jinja=on` is llama.cpp's default (omitted); `off` adds the bare
-        // `--no-jinja` flag (see [`is_flag`]).
-        "jinja" => Some("on"),
-        "batch-size" | "device" | "gpu-layers" | "threads" | "cache-type-k" | "cache-type-v"
-        | "spec-draft-n-max" | "spec-draft-n-min" | "reasoning-effort" | "chat-template"
-        | "ctx-size" | "temperature" | "top-p" | "top-k" | "min-p" | "repeat-penalty" => {
-            Some(DEFAULT)
-        }
-        // host/port are never omitted: llmctl itself needs the concrete
-        // endpoint for health checks and the Session Manager display.
-        _ => None,
+/// A runtime's option vocabulary plus the CLI-encoding rules that go with it.
+///
+/// Each runtime speaks a different dialect: llama.cpp has valueless `--no-*`
+/// inversions and one option that is delivered as a JSON kwarg, while
+/// FastFlowLM takes an explicit value for every flag. Bundling the table with
+/// its rules keeps that knowledge next to the backend that owns it, and keeps
+/// this type `Copy`-cheap so it can be threaded through resolution and command
+/// building without borrowing the backend itself.
+#[derive(Debug, Clone, Copy)]
+pub struct OptionSchema {
+    /// Every option this runtime exposes, in display order.
+    pub specs: &'static [OptionSpec],
+    /// The value at which an option is dropped from the launch command, because
+    /// it equals what the runtime would do anyway. `None` means always emitted.
+    pub omit_token: fn(&str) -> Option<&'static str>,
+    /// Whether the option is a valueless boolean flag (e.g. `--no-mmap`).
+    pub is_flag: fn(&str) -> bool,
+    /// The value token actually emitted on the command line.
+    pub cli_value: fn(&str, &str) -> String,
+}
+
+impl OptionSchema {
+    /// Look up an option spec by key.
+    pub fn spec(&self, key: &str) -> Option<&'static OptionSpec> {
+        self.specs.iter().find(|s| s.key == key)
     }
-}
 
-/// Whether the option is a valueless boolean flag (e.g. `mmap` → `--no-mmap`):
-/// when not at its [`omit_token`] it emits the bare flag with no value token.
-pub fn is_flag(key: &str) -> bool {
-    matches!(key, "mmap" | "jinja")
-}
-
-/// The value token actually emitted on the command line. Most options pass
-/// their value through verbatim; `reasoning-effort` has no native llama-server
-/// flag and is delivered to the chat template as a JSON kwarg via
-/// `--chat-template-kwargs` (how GPT-OSS-style templates receive it).
-pub fn cli_value(key: &str, value: &str) -> String {
-    match key {
-        "reasoning-effort" => format!(r#"{{"reasoning_effort":"{value}"}}"#),
-        _ => value.to_string(),
+    pub fn omit_token(&self, key: &str) -> Option<&'static str> {
+        (self.omit_token)(key)
     }
-}
 
-/// Whether the option's omitted state is the [`DEFAULT`] sentinel (vs an in-band
-/// enum variant like `"auto"` or an enum's own `"default"` choice). Only these
-/// get the sentinel editing affordances (the `default` text entry); enums cycle
-/// through their variants instead.
-pub fn uses_sentinel(key: &str) -> bool {
-    omit_token(key) == Some(DEFAULT)
-        && !matches!(spec(key).map(|s| s.kind), Some(OptionKind::Enum(_)))
-}
+    pub fn is_flag(&self, key: &str) -> bool {
+        (self.is_flag)(key)
+    }
 
-impl OptionSpec {
+    pub fn cli_value(&self, key: &str, value: &str) -> String {
+        (self.cli_value)(key, value)
+    }
+
+    /// Whether the option's omitted state is the [`DEFAULT`] sentinel (vs an
+    /// in-band enum variant like `"auto"` or an enum's own `"default"` choice).
+    /// Only these get the sentinel editing affordances (the `default` text
+    /// entry); enums cycle through their variants instead.
+    pub fn uses_sentinel(&self, key: &str) -> bool {
+        self.omit_token(key) == Some(DEFAULT)
+            && !matches!(self.spec(key).map(|s| s.kind), Some(OptionKind::Enum(_)))
+    }
+
     /// Step the value by one increment (`dir = ±1`) for `+`/`-` and the `e`
-    /// cycle. For sentinel options [`DEFAULT`] sits just below the numeric range:
-    /// stepping up from it enters the concrete default; enums (whose omitted
-    /// state is an ordinary `"auto"` variant) just cycle normally.
-    pub fn bump(&self, kind: &OptionKind, current: &str, dir: i32) -> Option<String> {
-        if uses_sentinel(self.key) && current == DEFAULT {
-            return Some(if dir > 0 { self.default.to_string() } else { DEFAULT.to_string() });
+    /// cycle. For sentinel options [`DEFAULT`] sits just below the numeric
+    /// range: stepping up from it enters the concrete default; enums (whose
+    /// omitted state is an ordinary variant) just cycle normally.
+    pub fn bump(
+        &self,
+        spec: &OptionSpec,
+        kind: &OptionKind,
+        current: &str,
+        dir: i32,
+    ) -> Option<String> {
+        if self.uses_sentinel(spec.key) && current == DEFAULT {
+            return Some(if dir > 0 { spec.default.to_string() } else { DEFAULT.to_string() });
         }
-        kind.adjust(current, dir, self.step)
+        kind.adjust(current, dir, spec.step)
     }
 }
 
@@ -223,444 +223,4 @@ fn fmt_float(v: f64) -> String {
     let s = format!("{v:.3}");
     let trimmed = s.trim_end_matches('0').trim_end_matches('.');
     trimmed.to_string()
-}
-
-use OptionKind::{Enum, Float, Int, Str};
-
-/// Built-in chat template names accepted by `--chat-template` (from
-/// `llama-server --help`), with a leading `"default"` omit variant meaning
-/// "use the template from the model's GGUF metadata".
-static CHAT_TEMPLATES: &[&str] = &[
-    "default",
-    "bailing",
-    "bailing-think",
-    "bailing2",
-    "chatglm3",
-    "chatglm4",
-    "chatml",
-    "command-r",
-    "deepseek",
-    "deepseek-ocr",
-    "deepseek2",
-    "deepseek3",
-    "exaone-moe",
-    "exaone3",
-    "exaone4",
-    "falcon3",
-    "gemma",
-    "gigachat",
-    "glmedge",
-    "gpt-oss",
-    "granite",
-    "granite-4.0",
-    "granite-4.1",
-    "grok-2",
-    "hunyuan-dense",
-    "hunyuan-moe",
-    "hunyuan-vl",
-    "kimi-k2",
-    "llama2",
-    "llama2-sys",
-    "llama2-sys-bos",
-    "llama2-sys-strip",
-    "llama3",
-    "llama4",
-    "megrez",
-    "minicpm",
-    "mistral-v1",
-    "mistral-v3",
-    "mistral-v3-tekken",
-    "mistral-v7",
-    "mistral-v7-tekken",
-    "monarch",
-    "openchat",
-    "orion",
-    "pangu-embedded",
-    "phi3",
-    "phi4",
-    "rwkv-world",
-    "seed_oss",
-    "smolvlm",
-    "solar-open",
-    "vicuna",
-    "vicuna-orca",
-    "yandex",
-    "zephyr",
-];
-
-/// The MVP option set for llama-server.
-pub static REGISTRY: &[OptionSpec] = &[
-    OptionSpec {
-        key: "ctx-size",
-        cli: "--ctx-size",
-        kind: Int { min: Some(0), max: None },
-        default: "4096",
-        step: 1024.0,
-        description: "Maximum context window size in tokens (0 or 'default' = the model's \
-                      full trained context — watch your memory).",
-    },
-    OptionSpec {
-        key: "gpu-layers",
-        cli: "-ngl",
-        kind: Int { min: Some(0), max: Some(999) },
-        default: "999",
-        step: 1.0,
-        description: "Layers to offload to the GPU (999 = all; 'default' lets llama.cpp decide).",
-    },
-    OptionSpec {
-        key: "device",
-        cli: "--device",
-        kind: Str,
-        default: "default",
-        step: 0.0,
-        description: "Device to use for offloading, selected from llama-server --list-devices \
-                      ('default' lets llama.cpp choose).",
-    },
-    OptionSpec {
-        key: "temperature",
-        cli: "--temp",
-        kind: Float { min: Some(0.0), max: Some(2.0) },
-        default: "0.8",
-        step: 0.05,
-        description: "Sampling temperature; lower is more deterministic \
-                      ('default' = llama.cpp's 0.8).",
-    },
-    OptionSpec {
-        key: "top-p",
-        cli: "--top-p",
-        kind: Float { min: Some(0.0), max: Some(1.0) },
-        default: "0.95",
-        step: 0.05,
-        description: "Nucleus sampling: keep tokens within this cumulative probability \
-                      ('default' = llama.cpp's 0.95).",
-    },
-    OptionSpec {
-        key: "top-k",
-        cli: "--top-k",
-        kind: Int { min: Some(0), max: None },
-        default: "40",
-        step: 1.0,
-        description: "Keep only the top-K most likely tokens \
-                      (0 = disabled; 'default' = llama.cpp's 40).",
-    },
-    OptionSpec {
-        key: "min-p",
-        cli: "--min-p",
-        kind: Float { min: Some(0.0), max: Some(1.0) },
-        default: "0.05",
-        step: 0.01,
-        description: "Minimum token probability relative to the most likely token \
-                      ('default' = llama.cpp's 0.05).",
-    },
-    OptionSpec {
-        key: "repeat-penalty",
-        cli: "--repeat-penalty",
-        kind: Float { min: Some(0.0), max: Some(2.0) },
-        default: "1.0",
-        step: 0.05,
-        description: "Penalty applied to repeated tokens \
-                      (1.0 = disabled; 'default' = llama.cpp's 1.0).",
-    },
-    OptionSpec {
-        key: "threads",
-        cli: "--threads",
-        kind: Int { min: Some(0), max: None },
-        default: "0",
-        step: 1.0,
-        description: "CPU threads for generation ('default' lets llama.cpp auto-detect, i.e. -1).",
-    },
-    OptionSpec {
-        key: "batch-size",
-        cli: "--batch-size",
-        kind: Int { min: Some(1), max: None },
-        default: "2048",
-        step: 256.0,
-        description: "Logical batch size for prompt processing ('default' = llama.cpp's 2048).",
-    },
-    OptionSpec {
-        key: "flash-attn",
-        cli: "--flash-attn",
-        kind: Enum(&["auto", "on", "off"]),
-        default: "auto",
-        step: 1.0,
-        description: "Flash attention (auto = llama.cpp default; omitted from command).",
-    },
-    OptionSpec {
-        key: "reasoning",
-        cli: "--reasoning",
-        kind: Enum(&["auto", "on", "off"]),
-        default: "auto",
-        step: 1.0,
-        description: "Reasoning/thinking in chat (auto = llama.cpp default; omitted from command).",
-    },
-    OptionSpec {
-        key: "reasoning-effort",
-        cli: "--chat-template-kwargs",
-        kind: Enum(&["default", "low", "medium", "high"]),
-        default: "default",
-        step: 1.0,
-        description: "Reasoning effort passed to the chat template as \
-                      {\"reasoning_effort\": …} (GPT-OSS-style models; \
-                      default = omitted).",
-    },
-    OptionSpec {
-        key: "chat-template",
-        cli: "--chat-template",
-        kind: Enum(CHAT_TEMPLATES),
-        default: "default",
-        step: 1.0,
-        description: "Override the chat template with a llama.cpp built-in \
-                      (default = use the template from the model's GGUF metadata).",
-    },
-    OptionSpec {
-        key: "jinja",
-        cli: "--no-jinja",
-        kind: Enum(&["on", "off"]),
-        default: "on",
-        step: 1.0,
-        description: "Jinja chat template engine (on = llama.cpp default; turn off to \
-                      add --no-jinja for legacy formatting — disables tool calls and \
-                      reasoning-effort).",
-    },
-    OptionSpec {
-        key: "mmap",
-        cli: "--no-mmap",
-        kind: Enum(&["on", "off"]),
-        default: "on",
-        step: 1.0,
-        description: "Memory-map the model (on = llama.cpp default; turn off to add \
-                      --no-mmap for ROCm/AMD GPU compatibility).",
-    },
-    OptionSpec {
-        key: "cache-type-k",
-        cli: "--cache-type-k",
-        kind: Enum(&["default", "f16", "q8_0", "q4_0"]),
-        default: "default",
-        step: 1.0,
-        description: "KV cache data type for keys (default = llama.cpp default; \
-                      lower precision = less memory).",
-    },
-    OptionSpec {
-        key: "cache-type-v",
-        cli: "--cache-type-v",
-        kind: Enum(&["default", "f16", "q8_0", "q4_0"]),
-        default: "default",
-        step: 1.0,
-        description: "KV cache data type for values (default = llama.cpp default; \
-                      lower precision = less memory).",
-    },
-    OptionSpec {
-        key: "spec-type",
-        cli: "--spec-type",
-        kind: Enum(&[
-            "none",
-            "draft-simple",
-            "draft-eagle3",
-            "draft-mtp",
-            "ngram-simple",
-            "ngram-map-k",
-            "ngram-map-k4v",
-            "ngram-mod",
-            "ngram-cache",
-        ]),
-        default: "none",
-        step: 1.0,
-        description: "Speculative decoding type (none = disabled; draft-mtp uses the model's \
-                      integrated or companion MTP head).",
-    },
-    OptionSpec {
-        key: "spec-draft-n-max",
-        cli: "--spec-draft-n-max",
-        kind: Int { min: Some(0), max: None },
-        default: "3",
-        step: 1.0,
-        description: "Max tokens to draft per step for speculative decoding \
-                      ('default' = llama.cpp's 3).",
-    },
-    OptionSpec {
-        key: "spec-draft-n-min",
-        cli: "--spec-draft-n-min",
-        kind: Int { min: Some(0), max: None },
-        default: "0",
-        step: 1.0,
-        description: "Min draft tokens for speculative decoding ('default' = llama.cpp's 0).",
-    },
-    OptionSpec {
-        key: "host",
-        cli: "--host",
-        kind: Str,
-        default: "127.0.0.1",
-        step: 0.0,
-        description: "Network interface to bind the server to.",
-    },
-    OptionSpec {
-        key: "port",
-        cli: "--port",
-        kind: Int { min: Some(1), max: Some(65535) },
-        default: "8000",
-        step: 1.0,
-        description: "TCP port the server listens on.",
-    },
-];
-
-/// Look up an option spec by key.
-pub fn spec(key: &str) -> Option<&'static OptionSpec> {
-    REGISTRY.iter().find(|s| s.key == key)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn int_range_is_enforced() {
-        let kind = spec("gpu-layers").unwrap().kind;
-        assert_eq!(kind.validate("50").unwrap(), "50");
-        assert!(kind.validate("1000").is_err()); // > 999
-        assert!(kind.validate("-1").is_err()); // < 0
-        assert!(kind.validate("abc").is_err());
-    }
-
-    #[test]
-    fn float_range_is_enforced() {
-        let kind = spec("temperature").unwrap().kind;
-        assert_eq!(kind.validate("0.7").unwrap(), "0.7");
-        assert!(kind.validate("3.0").is_err()); // > 2.0
-    }
-
-    #[test]
-    fn flash_attn_is_an_enum_dropped_when_auto() {
-        let spec = spec("flash-attn").unwrap();
-        assert_eq!(spec.kind.validate("OFF").unwrap(), "off");
-        assert!(spec.kind.validate("true").is_err()); // legacy bool is not a variant
-        // "auto" is the omitted state; it cycles like any variant (no sentinel).
-        assert_eq!(omit_token("flash-attn"), Some("auto"));
-        assert_eq!(spec.bump(&spec.kind, "auto", 1), Some("on".into()));
-        assert_eq!(spec.kind.extreme(-1), Some("auto".into())); // Home → first variant
-    }
-
-    #[test]
-    fn numeric_omittables_fold_the_default_sentinel() {
-        assert_eq!(omit_token("batch-size"), Some(DEFAULT));
-        assert_eq!(omit_token("threads"), Some(DEFAULT));
-        // The sampling params and ctx-size are omittable too.
-        for key in ["ctx-size", "temperature", "top-p", "top-k", "min-p", "repeat-penalty"] {
-            assert_eq!(omit_token(key), Some(DEFAULT), "{key} should fold the sentinel");
-            assert!(uses_sentinel(key), "{key} should get sentinel affordances");
-        }
-        // host/port stay on the command line: llmctl needs the endpoint.
-        assert_eq!(omit_token("host"), None);
-        assert_eq!(omit_token("port"), None);
-
-        // Stepping up from DEFAULT enters the concrete base; stepping down stays.
-        let ngl = spec("gpu-layers").unwrap();
-        assert_eq!(ngl.bump(&ngl.kind, DEFAULT, 1), Some("999".into()));
-        assert_eq!(ngl.bump(&ngl.kind, DEFAULT, -1), Some(DEFAULT.into()));
-        // Home/End are pure min/max jumps; resetting to DEFAULT is `d` (app-level).
-        assert_eq!(ngl.kind.extreme(-1), Some("0".into())); // Home → min
-        assert_eq!(ngl.kind.extreme(1), Some("999".into())); // End → max
-    }
-
-    #[test]
-    fn device_uses_runtime_selector_and_is_omitted_at_default() {
-        let device = spec("device").unwrap();
-        assert_eq!(device.cli, "--device");
-        assert_eq!(omit_token("device"), Some(DEFAULT));
-        assert!(uses_sentinel("device"));
-    }
-
-    #[test]
-    fn adjust_clamps_numeric_and_cycles_enum() {
-        let temp = spec("temperature").unwrap();
-        assert_eq!(temp.kind.adjust("1.95", 1, temp.step), Some("2".into())); // clamp at 2.0
-        assert_eq!(temp.kind.adjust("0.8", -1, temp.step), Some("0.75".into()));
-
-        let cache = spec("cache-type-k").unwrap().kind;
-        assert_eq!(cache.adjust("f16", 1, 1.0), Some("q8_0".into()));
-        assert_eq!(cache.adjust("f16", -1, 1.0), Some("default".into())); // back toward "default"
-    }
-
-    #[test]
-    fn cache_types_omit_at_their_default_variant_without_sentinel_affordances() {
-        for key in ["cache-type-k", "cache-type-v"] {
-            // "default" is the omitted state, but it's an in-band enum variant —
-            // not the numeric sentinel — so it cycles like any other choice.
-            assert_eq!(omit_token(key), Some(DEFAULT));
-            assert!(!uses_sentinel(key));
-            let s = spec(key).unwrap();
-            assert_eq!(s.bump(&s.kind, "default", 1), Some("f16".into()));
-            assert_eq!(s.kind.extreme(-1), Some("default".into())); // Home → first variant
-            assert_eq!(s.kind.extreme(1), Some("q4_0".into())); // End → last
-        }
-    }
-
-    #[test]
-    fn speculative_options_have_proper_omit_tokens() {
-        // spec-type omits at its in-band "none" variant (cycles like an enum).
-        assert_eq!(omit_token("spec-type"), Some("none"));
-        assert!(!uses_sentinel("spec-type"));
-        let st = spec("spec-type").unwrap();
-        assert_eq!(st.bump(&st.kind, "none", 1), Some("draft-simple".into()));
-
-        // The draft-count ints fold the numeric "default" sentinel.
-        let n_max = spec("spec-draft-n-max").unwrap();
-        assert_eq!(omit_token("spec-draft-n-max"), Some(DEFAULT));
-        assert!(uses_sentinel("spec-draft-n-max"));
-        assert_eq!(n_max.bump(&n_max.kind, DEFAULT, 1), Some("3".into())); // step up enters base
-        assert_eq!(spec("spec-draft-n-min").unwrap().default, "0");
-    }
-
-    #[test]
-    fn reasoning_effort_is_a_json_kwarg_enum_omitted_at_default() {
-        // "default" is the omitted state, an in-band enum variant (no sentinel
-        // affordances) — it cycles like the cache types.
-        assert_eq!(omit_token("reasoning-effort"), Some(DEFAULT));
-        assert!(!uses_sentinel("reasoning-effort"));
-        let s = spec("reasoning-effort").unwrap();
-        assert_eq!(s.bump(&s.kind, "default", 1), Some("low".into()));
-        assert_eq!(s.kind.extreme(1), Some("high".into())); // End → high
-
-        // The emitted argv token is the chat-template kwargs JSON, not the raw value.
-        assert_eq!(cli_value("reasoning-effort", "high"), r#"{"reasoning_effort":"high"}"#);
-        assert_eq!(cli_value("temperature", "0.7"), "0.7"); // everything else passes through
-    }
-
-    #[test]
-    fn mmap_is_a_flag_omitted_when_on() {
-        assert!(is_flag("mmap"));
-        assert_eq!(omit_token("mmap"), Some("on")); // on = llama default, omitted
-        let s = spec("mmap").unwrap();
-        assert_eq!(s.bump(&s.kind, "on", 1), Some("off".into())); // `e` toggles
-    }
-
-    #[test]
-    fn jinja_is_a_flag_omitted_when_on() {
-        // Same shape as mmap: on = llama.cpp's default (omitted); off emits
-        // the bare --no-jinja flag.
-        assert!(is_flag("jinja"));
-        assert_eq!(omit_token("jinja"), Some("on"));
-        let s = spec("jinja").unwrap();
-        assert_eq!(s.cli, "--no-jinja");
-        assert_eq!(s.bump(&s.kind, "on", 1), Some("off".into())); // `e` toggles
-    }
-
-    #[test]
-    fn chat_template_is_an_enum_of_builtins_omitted_at_default() {
-        assert_eq!(omit_token("chat-template"), Some(DEFAULT));
-        assert!(!uses_sentinel("chat-template")); // in-band variant, cycles
-        let s = spec("chat-template").unwrap();
-        assert_eq!(s.kind.extreme(-1), Some("default".into())); // Home → default
-        assert_eq!(s.bump(&s.kind, "default", 1), Some("bailing".into()));
-        assert_eq!(s.kind.validate("LLAMA3").unwrap(), "llama3"); // case-folded
-        assert!(s.kind.validate("not-a-template").is_err());
-    }
-
-    #[test]
-    fn extreme_jumps_to_bounds() {
-        let port = spec("port").unwrap().kind;
-        assert_eq!(port.extreme(-1), Some("1".into()));
-        assert_eq!(port.extreme(1), Some("65535".into()));
-        let cache = spec("cache-type-k").unwrap().kind;
-        assert_eq!(cache.extreme(1), Some("q4_0".into()));
-    }
 }

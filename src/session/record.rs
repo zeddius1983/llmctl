@@ -32,12 +32,23 @@ pub struct SessionRecord {
     pub host: String,
     pub port: u16,
     pub command: Vec<String>,
+    /// HTTP path whose `200` means "ready" for the runtime that owns this
+    /// session. Persisted so a rediscovered session probes the right endpoint
+    /// without llmctl having to re-resolve its backend.
+    #[serde(default = "default_health_path")]
+    pub health_path: String,
     pub log_file: PathBuf,
     /// Cache blobs observed while llama.cpp downloads a remote Hub artifact.
     #[serde(default)]
     pub download: Option<DownloadRecord>,
     /// Process start time, seconds since the Unix epoch (for uptime).
     pub started_unix: u64,
+}
+
+/// Records written before llmctl knew about multiple runtimes are all
+/// llama.cpp sessions.
+fn default_health_path() -> String {
+    "/health".to_string()
 }
 
 impl SessionRecord {

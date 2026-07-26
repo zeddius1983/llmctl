@@ -1,11 +1,13 @@
-//! Pure construction of the `llama-server` launch command from resolved options.
+//! Pure construction of a launch command from resolved options.
 //!
-//! No I/O: takes the runtime binary, the model file, and the resolved option
-//! values, and produces an argv plus shell-quoted display strings. This is the
-//! "never hand-type a complex command again" core, and is unit-tested.
+//! No I/O: takes the runtime binary, the model, and the resolved option values,
+//! and produces an argv plus shell-quoted display strings. This is the "never
+//! hand-type a complex command again" core, and is unit-tested. The
+//! llama.cpp-shaped builders live here; each backend assembles its own prefix
+//! and shares [`Command::append_options`] for the option tail.
 
 use crate::domain::OptionItem;
-use crate::profiles::registry;
+use crate::profiles::registry::OptionSchema;
 
 /// A built launch command: program + arguments, ready to spawn or display.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,23 +16,14 @@ pub struct Command {
 }
 
 impl Command {
-    /// Build from the runtime binary, the model file path, and resolved options.
-    ///
-    /// Every option is emitted as `--flag value`, in registry order (current
-    /// llama-server flags all take an explicit value, including
-    /// `--flash-attn on|off|auto`). The model is passed via `-m`. An option left
-    /// at its [`registry::omit_token`] (e.g. `flash-attn=auto`, or a numeric at
-    /// the `default` sentinel) is skipped so llama.cpp applies its own default.
-    /// Valueless boolean flags ([`registry::is_flag`], e.g. `--no-mmap`) emit the
-    /// bare flag with no following value. Values pass through
-    /// [`registry::cli_value`], which rewrites the ones whose on-disk form isn't
-    /// the literal argv token (e.g. `reasoning-effort` → a JSON kwarg).
-    /// Build a local-model command with any selected auxiliary GGUFs.
+    /// Build a local-model command with any selected auxiliary GGUFs. The model
+    /// is passed via `-m`; options follow per [`Command::append_options`].
     pub fn build_local(
         binary: &str,
         model_path: &str,
         mtp_path: Option<&str>,
         projector_path: Option<&str>,
+        schema: &OptionSchema,
         options: &[OptionItem],
     ) -> Self {
         let mut argv = vec![binary.to_string(), "-m".to_string(), model_path.to_string()];
@@ -44,7 +37,7 @@ impl Command {
             argv.push(projector_path.to_string());
         }
 
-        Self::append_options(&mut argv, options);
+        Self::append_options(&mut argv, schema, options);
         Self { argv }
     }
 
@@ -58,6 +51,7 @@ impl Command {
         draft_hf: Option<&str>,
         projector_path: Option<&str>,
         projector_auto: bool,
+        schema: &OptionSchema,
         options: &[OptionItem],
     ) -> Self {
         let mut argv = vec![
@@ -80,18 +74,29 @@ impl Command {
         } else if projector_auto {
             argv.push("--mmproj-auto".into());
         }
-        Self::append_options(&mut argv, options);
+        Self::append_options(&mut argv, schema, options);
         Self { argv }
     }
 
-    fn append_options(argv: &mut Vec<String>, options: &[OptionItem]) {
+    /// Append the resolved options to `argv`, in schema order.
+    ///
+    /// Every option is emitted as `--flag value` unless the schema says
+    /// otherwise. An option sitting at its
+    /// [`OptionSchema::omit_token`](crate::profiles::registry::OptionSchema::omit_token)
+    /// — `flash-attn=auto`, or a numeric at the `default` sentinel — is skipped
+    /// so the runtime applies its own default. Valueless boolean flags
+    /// (`--no-mmap`) emit the bare flag, and values pass through
+    /// [`OptionSchema::cli_value`](crate::profiles::registry::OptionSchema::cli_value),
+    /// which rewrites the ones whose on-disk form isn't the literal argv token
+    /// (llama.cpp's `reasoning-effort` becomes a JSON kwarg).
+    pub fn append_options(argv: &mut Vec<String>, schema: &OptionSchema, options: &[OptionItem]) {
         for opt in options {
-            if registry::omit_token(&opt.key) == Some(opt.value.as_str()) {
+            if schema.omit_token(&opt.key) == Some(opt.value.as_str()) {
                 continue;
             }
             argv.push(opt.cli.clone());
-            if !registry::is_flag(&opt.key) {
-                argv.push(registry::cli_value(&opt.key, &opt.value));
+            if !schema.is_flag(&opt.key) {
+                argv.push(schema.cli_value(&opt.key, &opt.value));
             }
         }
     }
@@ -144,6 +149,8 @@ fn shell_quote(arg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profiles::registry;
+    use crate::runtime::llama_cpp::SCHEMA;
 
     fn opt(key: &str, value: &str, cli: &str) -> OptionItem {
         OptionItem {
@@ -168,7 +175,7 @@ mod tests {
     }
 
     fn local(model: &str, options: &[OptionItem]) -> Command {
-        Command::build_local("llama-server", model, None, None, options)
+        Command::build_local("llama-server", model, None, None, &SCHEMA, options)
     }
 
     #[test]
@@ -206,6 +213,7 @@ mod tests {
             None,
             None,
             false,
+            &SCHEMA,
             &sample_options(),
         );
         assert_eq!(
@@ -266,6 +274,7 @@ mod tests {
             "/m/model.gguf",
             Some("/m/mtp-model.gguf"),
             Some("/m/mmproj-BF16.gguf"),
+            &SCHEMA,
             &opts,
         );
         assert_eq!(
@@ -298,6 +307,7 @@ mod tests {
             Some("owner/model-GGUF:Q4_0"),
             None,
             true,
+            &SCHEMA,
             &sample_options(),
         );
         assert!(
@@ -318,6 +328,7 @@ mod tests {
             Some("owner/model-GGUF:Q4_0"),
             Some("/cache/mmproj-BF16.gguf"),
             true,
+            &SCHEMA,
             &sample_options(),
         );
         assert!(

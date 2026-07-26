@@ -134,7 +134,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
             .runtimes
             .items
             .iter()
-            .map(|r| ListItem::new(format!("{icon}  {}", r.name)))
+            .map(|r| ListItem::new(format!("{icon}  {}", r.descriptor().name)))
             .collect(),
         Pane::Model => app
             .models
@@ -427,10 +427,15 @@ fn model_artifact_columns(model: &crate::domain::Model) -> Option<(String, Strin
     }
     let quantization = model.quantization.as_deref().unwrap_or("-");
     Some((
-        format!("{quantization:<12}{:>7}  ", download_size(model.size_bytes)),
+        format!("{quantization:<12}{:>SIZE_WIDTH$}  ", download_size(model.size_bytes)),
         model.display_label().into(),
     ))
 }
+
+/// Width of the size column. `download_size` is widest at three mantissa digits
+/// plus a two-letter unit ("960.0 MB"), so anything narrower lets a sub-gigabyte
+/// model overflow and push the name column out of alignment.
+const SIZE_WIDTH: usize = 8;
 
 fn download_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -750,7 +755,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         help_row("g / G", "first / last item"),
         help_row("/", "search models"),
         help_row("s", "sort online models"),
-        help_row("d", "download selected online file"),
+        help_row("d", "download the selected model"),
         Line::raw(""),
         Line::from("Profiles".bold()),
         help_row("a", "create profile"),
@@ -768,8 +773,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::raw(""),
         Line::from("Launch & sessions".bold()),
         help_row("s", "start server (profile/options)"),
-        help_row("C", "chat in terminal (llama-cli)"),
-        help_row("b", "benchmark selected model (llama-bench)"),
+        help_row("C", "chat in terminal (the runtime's interactive client)"),
+        help_row("b", "benchmark selected model (runtimes that ship one)"),
         help_row("y", "yank command"),
         help_row("t", "session manager"),
         help_row("x / K", "stop / kill / cancel"),
@@ -986,9 +991,34 @@ mod tests {
         assert!(truncated.chars().count() + metadata.chars().count() <= 72);
     }
 
+    /// A minimal local model leaf that tests reshape as they need.
+    fn sample_model() -> crate::domain::Model {
+        crate::domain::Model {
+            id: String::new(),
+            name: String::new(),
+            // Non-empty so this reads as a model leaf, not a catalog folder.
+            path: std::path::PathBuf::from("/models/sample.gguf"),
+            shard_paths: Vec::new(),
+            mtp_path: None,
+            projector_path: None,
+            has_mtp: false,
+            catalog_path: Vec::new(),
+            catalog_dir: std::path::PathBuf::new(),
+            size_bytes: 0,
+            quantization: None,
+            architecture: None,
+            context_length: None,
+            modified: None,
+            has_chat_template: false,
+            remote: None,
+            flm: None,
+            runtime: crate::runtime::llama_cpp::NAME.into(),
+        }
+    }
+
     #[test]
     fn artifact_columns_show_quant_size_and_filename() {
-        let mut model = crate::domain::stubs::vllm_models().remove(0);
+        let mut model = sample_model();
         model.name = "Qwen-AgentWorld-35B-A3B-UD-Q4_K_M.gguf".into();
         model.catalog_path = vec![model.name.clone()];
         model.size_bytes = 20_600_000_000;
@@ -1007,19 +1037,47 @@ mod tests {
 
         assert_eq!(
             model_artifact_columns(&model).unwrap(),
-            ("Q4_K_M      20.6 GB  ".into(), "Qwen-AgentWorld-35B-A3B-UD-Q4_K_M.gguf".into())
+            ("Q4_K_M       20.6 GB  ".into(), "Qwen-AgentWorld-35B-A3B-UD-Q4_K_M.gguf".into())
         );
 
         model.remote = None;
         assert_eq!(
             model_artifact_columns(&model).unwrap(),
-            ("Q4_K_M      20.6 GB  ".into(), "Qwen-AgentWorld-35B-A3B-UD-Q4_K_M.gguf".into())
+            ("Q4_K_M       20.6 GB  ".into(), "Qwen-AgentWorld-35B-A3B-UD-Q4_K_M.gguf".into())
         );
+    }
+
+    /// Regression: a megabyte-scale size is one character wider than a
+    /// gigabyte-scale one, so too narrow a size column pushed the name of any
+    /// sub-gigabyte model out of alignment with its neighbours.
+    #[test]
+    fn model_names_stay_aligned_across_size_units() {
+        let row = |bytes: u64, name: &str| {
+            let mut model = sample_model();
+            model.name = name.into();
+            model.catalog_path = vec![name.into()];
+            model.size_bytes = bytes;
+            model.quantization = Some("Q4_1".into());
+            model_artifact_columns(&model).unwrap()
+        };
+
+        let rows = [
+            row(14_000_000_000, "gpt-oss:20b"),
+            row(960_000_000, "lfm2.5-tk:1.2b"),
+            row(3_100_000_000, "nanbeige4.1:3b"),
+            row(999, "tiny.gguf"),
+        ];
+
+        // Every name starts at the same column, whatever the unit.
+        let widths: Vec<usize> = rows.iter().map(|(meta, _)| meta.chars().count()).collect();
+        assert!(widths.windows(2).all(|w| w[0] == w[1]), "size column widths disagree: {widths:?}");
+        assert_eq!(rows[1].0, "Q4_1        960.0 MB  ");
+        assert_eq!(rows[0].0, "Q4_1         14.0 GB  ");
     }
 
     #[test]
     fn online_catalog_nodes_use_cloud_icons() {
-        let mut model = crate::domain::stubs::vllm_models().remove(0);
+        let mut model = sample_model();
         model.path = std::path::PathBuf::new();
 
         model.catalog_path = vec!["online".into()];

@@ -1,7 +1,6 @@
 //! Lazy Hugging Face catalog discovery backed by the managed model tree.
 
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,6 +9,7 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::discovery::hf;
 use crate::domain::{Model, RemoteBlob, RemoteModel};
 
 const API: &str = "https://huggingface.co/api/models";
@@ -252,7 +252,7 @@ fn request_repositories(
     sort: Sort,
 ) -> Result<Vec<Repository>> {
     ensure_root(root);
-    let mut request = agent()
+    let mut request = hf::agent()
         .get(API)
         .query("filter", "gguf")
         .query("apps", "llama.cpp")
@@ -320,7 +320,7 @@ pub fn save_selected_repository(root: &Path, model: &Model, sort: Sort) -> Resul
 }
 
 fn fetch_repository(root: &Path, repo: &str) -> Result<()> {
-    let mut request = agent().get(&format!("{API}/{repo}")).query("blobs", "true");
+    let mut request = hf::agent().get(&format!("{API}/{repo}")).query("blobs", "true");
     if let Ok(token) = std::env::var("HF_TOKEN") {
         request = request.set("Authorization", &format!("Bearer {token}"));
     }
@@ -459,6 +459,8 @@ fn artifacts_with_cache(
                 .as_ref()
                 .and_then(|gguf| gguf.chat_template.as_ref())
                 .is_some(),
+            flm: None,
+            runtime: crate::runtime::llama_cpp::NAME.into(),
             remote: Some(RemoteModel {
                 repo: detail.repository.id.clone(),
                 revision: detail.repository.sha.clone(),
@@ -492,6 +494,8 @@ fn repository_directory(root: &Path, repository: &Repository) -> Model {
         context_length: None,
         modified: None,
         has_chat_template: false,
+        flm: None,
+        runtime: crate::runtime::llama_cpp::NAME.into(),
         remote: Some(RemoteModel {
             repo: repository.id.clone(),
             revision: repository.sha.clone(),
@@ -523,6 +527,8 @@ fn directory(path: &[&str]) -> Model {
         context_length: None,
         modified: None,
         has_chat_template: false,
+        flm: None,
+        runtime: crate::runtime::llama_cpp::NAME.into(),
         remote: None,
     }
 }
@@ -786,71 +792,25 @@ pub fn download_model(
         .context("download completed but cache link is unavailable")
 }
 
+/// Fetch one Hub blob into its `.downloadInProgress` scratch file. The caller
+/// renames it into the blob cache once this returns `Ok(true)`.
 fn download_blob(
     remote: &RemoteModel,
     blob: &RemoteBlob,
     incomplete: &Path,
     cancelled: &AtomicBool,
-    mut progress: impl FnMut(u64, u64),
+    progress: impl FnMut(u64, u64),
 ) -> Result<bool> {
-    if cancelled.load(Ordering::Relaxed) {
-        return Ok(false);
-    }
-    let existing = incomplete.metadata().map(|metadata| metadata.len()).unwrap_or(0);
     let revision = remote.revision.as_deref().unwrap_or("main");
-    let url = resolve_url(&remote.repo, revision, &blob.file);
-    let mut request = agent().get(&url);
-    if existing > 0 {
-        request = request.set("Range", &format!("bytes={existing}-"));
-    }
-    if let Ok(token) = std::env::var("HF_TOKEN") {
-        request = request.set("Authorization", &format!("Bearer {token}"));
-    }
-    let response = request
-        .call()
-        .with_context(|| format!("downloading hf://{}/{}", remote.repo, blob.file))?;
-    let resumed = existing > 0 && response.status() == 206;
-    let mut options = OpenOptions::new();
-    options.create(true).write(true);
-    if resumed {
-        options.append(true);
-    } else {
-        options.truncate(true);
-    }
-    let mut output = options
-        .open(incomplete)
-        .with_context(|| format!("opening partial download {}", incomplete.display()))?;
-    let mut reader = response.into_reader();
-    let mut downloaded = if resumed { existing } else { 0 };
-    let mut reported = downloaded;
-    let mut buffer = [0_u8; 256 * 1024];
-    loop {
-        if cancelled.load(Ordering::Relaxed) {
-            output.flush().context("flushing cancelled Hugging Face download")?;
-            return Ok(false);
-        }
-        let read = reader.read(&mut buffer).context("reading Hugging Face response")?;
-        if read == 0 {
-            break;
-        }
-        output.write_all(&buffer[..read]).context("writing Hugging Face cache blob")?;
-        downloaded = downloaded.saturating_add(read as u64);
-        if downloaded.saturating_sub(reported) >= 8 * 1024 * 1024 {
-            progress(downloaded.min(blob.size_bytes), blob.size_bytes);
-            reported = downloaded;
-        }
-    }
-    output.flush().context("flushing Hugging Face cache blob")?;
-    if downloaded != blob.size_bytes {
-        anyhow::bail!(
-            "incomplete Hugging Face download for {}: received {} of {} bytes",
-            blob.file,
-            downloaded,
-            blob.size_bytes
-        );
-    }
-    progress(downloaded, blob.size_bytes);
-    Ok(true)
+    hf::download_file(
+        &remote.repo,
+        revision,
+        &blob.file,
+        incomplete,
+        blob.size_bytes,
+        cancelled,
+        progress,
+    )
 }
 
 pub fn cached_downloaded_bytes(remote: &RemoteModel) -> u64 {
@@ -938,27 +898,6 @@ fn reconcile_cache_link(link: &Path, target: &Path) -> Result<()> {
         .with_context(|| format!("copying cached model {}", link.display()))
 }
 
-fn resolve_url(repo: &str, revision: &str, file: &str) -> String {
-    format!(
-        "https://huggingface.co/{}/resolve/{}/{}",
-        encode_url_path(repo),
-        encode_url_path(revision),
-        encode_url_path(file)
-    )
-}
-
-fn encode_url_path(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
-            encoded.push(byte as char);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
-}
-
 fn cache_blob_paths_in(hub: &Path, repo: &str, oid: &str) -> Option<(PathBuf, PathBuf)> {
     let oid = oid.strip_prefix("sha256:").unwrap_or(oid);
     if oid.is_empty() || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -1040,13 +979,6 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|duration| duration.as_secs()).unwrap_or(0)
 }
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(10))
-        .timeout_read(std::time::Duration::from_secs(30))
-        .build()
-}
-
 pub fn repository_for_path(path: &[String]) -> Option<String> {
     let tail = path.strip_prefix(&[SOURCE[0].to_string(), SOURCE[1].to_string()])?;
     tail.first().cloned()
@@ -1104,14 +1036,6 @@ mod tests {
                 PathBuf::from("/cache/models--owner--repo/blobs/aabb.downloadInProgress"),
                 PathBuf::from("/cache/models--owner--repo/blobs/aabb")
             )
-        );
-    }
-
-    #[test]
-    fn resolve_url_preserves_paths_and_encodes_unsafe_bytes() {
-        assert_eq!(
-            resolve_url("owner/model", "main", "nested/model Q4_K_M.gguf"),
-            "https://huggingface.co/owner/model/resolve/main/nested/model%20Q4_K_M.gguf"
         );
     }
 

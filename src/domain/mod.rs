@@ -62,6 +62,56 @@ pub struct Model {
     /// launchable remote GGUF leaf even before it has a local cache path.
     #[serde(default)]
     pub remote: Option<RemoteModel>,
+    /// FastFlowLM catalog identity. Present for every entry the `flm` catalog
+    /// knows about, installed or not.
+    #[serde(default)]
+    pub flm: Option<FlmModel>,
+    /// Which runtime owns this model. Determines the profile-store namespace,
+    /// so profiles never leak between runtimes.
+    #[serde(default = "default_runtime")]
+    pub runtime: String,
+}
+
+fn default_runtime() -> String {
+    crate::runtime::llama_cpp::NAME.to_string()
+}
+
+fn main_revision() -> String {
+    "main".to_string()
+}
+
+/// A model in FastFlowLM's curated NPU catalog, as reported by `flm list`.
+///
+/// Unlike a GGUF file, this is a tag in a fixed catalog: it exists (and is
+/// browsable, with full metadata) whether or not it has been downloaded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlmModel {
+    /// The `name:size` tag — the model's identity everywhere in `flm`.
+    pub tag: String,
+    /// Whether the model files are present locally.
+    pub installed: bool,
+    /// Hugging Face repository name, which is also the on-disk directory name
+    /// under `flm`'s model root.
+    pub repo: String,
+    /// Repository revision this model is pinned to. Several FastFlowLM models
+    /// live on a tag rather than `main`, so downloading the wrong revision
+    /// yields weights the installed `flm` cannot load.
+    #[serde(default = "main_revision")]
+    pub revision: String,
+    /// The files a model directory must contain — exactly what llmctl
+    /// downloads. Deliberately narrower than the repository, which also carries
+    /// a README and the `.xclbin` NPU kernels that ship with `flm` itself.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// Capability labels (`vision`, `reasoning`, `tool-calling`, …). Drives the
+    /// browser's grouping; may be empty.
+    pub labels: Vec<String>,
+    /// Accepts image input, so `--img-pre-resize` is meaningful.
+    pub vlm: bool,
+    /// Provides speech recognition, so `--asr` is meaningful.
+    pub asr: bool,
+    /// Upper bound for `--prefill-chunk-len`.
+    pub max_prefill_len: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,9 +181,14 @@ impl Runtime {
 
 impl Model {
     /// Synthetic catalog directories have no launchable source path.
+    ///
+    /// A not-yet-downloaded model has no local path either, so the remote and
+    /// FastFlowLM identities are what distinguish "a real model you don't have
+    /// yet" from "a folder".
     pub fn is_catalog_dir(&self) -> bool {
         self.path.as_os_str().is_empty()
             && self.remote.as_ref().and_then(|remote| remote.file.as_ref()).is_none()
+            && self.flm.is_none()
     }
 
     pub fn is_model(&self) -> bool {
@@ -142,7 +197,13 @@ impl Model {
 
     /// Stable persistence identity used before and after an online model is
     /// downloaded into the Hugging Face cache.
+    /// For FastFlowLM the key is the tag, which is deliberately independent of
+    /// `catalog_path`: the same model is rendered under every capability label
+    /// it carries, and all of those views must share one set of profiles.
     pub fn profile_key(&self) -> String {
+        if let Some(flm) = &self.flm {
+            return format!("flm:{}", flm.tag);
+        }
         match &self.remote {
             Some(remote) => match &remote.file {
                 Some(file) => format!("hf:{}/{}", remote.repo, file),
@@ -194,107 +255,4 @@ pub fn human_size(bytes: u64) -> String {
         unit += 1;
     }
     if unit == 0 { format!("{bytes} B") } else { format!("{size:.1} {}", UNITS[unit]) }
-}
-
-/// Static stub data for Phase 0 so the UI has something to render.
-///
-/// Child builders take their parent so the cascading dependency is real even
-/// though the stub data doesn't yet vary by parent. Phases 1–2 swap these for
-/// discovery (`models_for` scans the runtime's paths) and the profile store.
-pub mod stubs {
-    use super::*;
-
-    /// The vLLM runtime — a stub for now (real support is a future phase), kept
-    /// so multi-runtime navigation is exercisable alongside discovered llama.cpp.
-    pub fn vllm_runtime() -> Runtime {
-        Runtime {
-            name: "vLLM".into(),
-            description: "High-throughput serving with PagedAttention".into(),
-            version: None,
-            binary_path: None,
-            bench_path: None,
-            formats: vec!["Safetensors".into(), "HF".into()],
-            devices: vec![],
-        }
-    }
-
-    /// Profiles available for the given model.
-    pub fn profiles_for(_model: &Model) -> Vec<Profile> {
-        profiles()
-    }
-
-    /// Options resolved for the given profile.
-    pub fn options_for(_profile: &Profile) -> Vec<OptionItem> {
-        options()
-    }
-
-    /// Stub models for the vLLM runtime (HF/safetensors style names).
-    pub fn vllm_models() -> Vec<Model> {
-        let model = |name: &str, path: &str, size: u64, quant: &str, arch: &str| Model {
-            id: path.into(),
-            name: name.into(),
-            path: path.into(),
-            shard_paths: vec![path.into()],
-            mtp_path: None,
-            projector_path: None,
-            has_mtp: false,
-            catalog_path: vec![name.into()],
-            catalog_dir: PathBuf::new(),
-            size_bytes: size,
-            quantization: Some(quant.into()),
-            architecture: Some(arch.into()),
-            context_length: None,
-            modified: None,
-            has_chat_template: true,
-            remote: None,
-        };
-        vec![
-            model(
-                "meta-llama/Llama-3.1-8B-Instruct",
-                "/models/hf/Llama-3.1-8B-Instruct",
-                16_100_000_000,
-                "FP16",
-                "llama",
-            ),
-            model(
-                "Qwen/Qwen2.5-32B-Instruct-AWQ",
-                "/models/hf/Qwen2.5-32B-Instruct-AWQ",
-                19_400_000_000,
-                "AWQ",
-                "qwen2",
-            ),
-            model(
-                "mistralai/Mistral-7B-Instruct-v0.3",
-                "/models/hf/Mistral-7B-Instruct-v0.3",
-                14_500_000_000,
-                "FP16",
-                "mistral",
-            ),
-        ]
-    }
-
-    fn profiles() -> Vec<Profile> {
-        ["Default", "Chat", "Coding", "Long Context", "Server"]
-            .into_iter()
-            .map(|name| Profile { name: name.into(), builtin: true, favorite: false })
-            .collect()
-    }
-
-    fn options() -> Vec<OptionItem> {
-        let opt = |key: &str, value: &str, default: &str, cli: &str, desc: &str| OptionItem {
-            key: key.into(),
-            value: value.into(),
-            default: default.into(),
-            range: None,
-            cli: cli.into(),
-            description: desc.into(),
-        };
-        vec![
-            opt("ctx-size", "32768", "4096", "--ctx-size", "Maximum context window size."),
-            opt("gpu-layers", "999", "0", "-ngl", "Number of layers offloaded to the GPU."),
-            opt("temperature", "0.7", "0.8", "--temp", "Sampling temperature."),
-            opt("top-p", "0.95", "0.95", "--top-p", "Nucleus sampling probability."),
-            opt("flash-attn", "on", "off", "--flash-attn", "Flash attention on/off/auto."),
-        ]
-    }
 }

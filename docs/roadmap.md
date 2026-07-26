@@ -15,6 +15,7 @@ Living status of the build. Update this when phases complete or scope shifts
 | 5 | Search/filter & polish | ◻ Post-v0.1.0 |
 | 6 | Source-aware model catalog | ✅ Done |
 | 7 | Online Hugging Face catalog | ✅ Done |
+| 8 | Runtime backends + FastFlowLM (AMD NPU) | ✅ Done |
 
 **v0.1.0 released** — Phases 0–3 (the MVP), plus extra launch options
 (`--no-mmap`, `--cache-type-k`/`-v`, speculative decoding) and a README, were
@@ -46,6 +47,14 @@ MTP models, launches them with model-aware speculative-decoding defaults, pairs
 multimodal projectors with compatible base models, and preserves companion
 relationships across Hugging Face discovery, downloads, and cached launches.
 See [release notes](release-notes-v0.3.1.md).
+
+**v0.4.0 (unreleased) — runtime backends and FastFlowLM** — replaces the
+string-literal runtime dispatch with a `RuntimeBackend` trait (ADR-011), deletes
+the vLLM navigation stub, and adds FastFlowLM as a real second runtime running
+models on an AMD XDNA2 NPU (ADR-012): curated `flm list` catalog grouped by
+capability label, NPU-specific option set and templates, `flm serve` sessions
+with `/v1/models` readiness, resumable llmctl-owned downloads on `d`, and
+`flm run` chat.
 
 Branching: each remaining phase is built on its own `feature/<task>` branch.
 When a batch is ready to ship, the feature branches merge into a release umbrella
@@ -160,6 +169,31 @@ launches pass explicit companion paths. The default Hub repository page was
 raised from 20 to 30 models; pagination remains deferred because Hub-wide search
 already covers models outside the initial page.
 
+### Phase 8 — Runtime backends and FastFlowLM
+Runtime-specific behavior moved behind a `RuntimeBackend` trait in
+`src/runtime/` (ADR-011): binary discovery, option schema, templates, model
+enumeration, command/chat/benchmark argv, readiness path, `/proc` identity, and
+per-launch capability checks. The option tables moved from `profiles/` to their
+backends, leaving `profiles/registry.rs` as the generic option model plus the
+`OptionSchema` that binds a table to its CLI dialect. `LaunchRequest` now
+carries a finished command and health path, so `SessionManager` no longer knows
+any runtime's flags. The vLLM navigation stub and every `"llama.cpp"`/`"vLLM"`
+string branch are gone; `Model` carries its runtime, which also fixed profiles
+being attributed to llama.cpp regardless of origin.
+
+FastFlowLM (`flm`) is the first backend added through that seam (ADR-012),
+running models on an AMD XDNA2 NPU. Its curated `flm list --json` catalog covers
+installed and available models in one call and is grouped by capability label
+(`reasoning`, `vision`, `tool-calling`, `audio`, `embeddings`) with `chat` and
+`installed` groups; because labels overlap, identity is the tag rather than the
+tree position. NPU-specific options (`--ctx-len`, `--pmode`, `--prefill-chunk-len`,
+`--q-len`, `--socket`, `--preemption`, …) and templates including Low Power;
+`flm serve` sessions with `/v1/models` readiness on port 52625; `flm run` chat
+on `C`. `flm
+validate` gates launching and explains an unready NPU stack in the status line.
+Sessions survive `flm` being a launcher wrapper (a distrobox entry point, for
+instance) via the existing `/proc` re-acquisition.
+
 ## Next (post-v0.3.1)
 
 ### Online Hugging Face follow-ups
@@ -179,6 +213,15 @@ already covers models outside the initial page.
 - [ ] Defer detached sessions, health checks, and OpenAI-compatible endpoints
       until the upstream diffusion runtime provides a stable server interface.
 
+### FastFlowLM follow-ups
+- [ ] `DownloadRecord::Directory` variant, replacing the sentinel `complete_file`
+      used to track `flm serve`'s own native downloads (ADR-013)
+- [ ] `flm remove` for installed models (the CLI supports it; no llmctl binding yet)
+- [ ] Surface `think` / `think_toggleable` from the catalog as a profile option
+- [ ] Revisit `flm bench` if a future release ships the documented subcommand
+- [ ] Per-model gating of `--asr` / `--embed` / `--img-pre-resize` by the
+      catalog's `asr` / `vlm` flags, rather than offering them for every model
+
 ### Phase 4 — Log search & startup-failure classification
 - [ ] Log view search / filtering (`L` already tails + scrolls)
 - [ ] Startup-failure classification (port in use, model missing, OOM, GPU/Vulkan/
@@ -196,8 +239,9 @@ already covers models outside the initial page.
 
 ## Deferred / out of MVP scope
 
-- Additional runtimes (vLLM, Ollama, LM Studio, SGLang, ExLlamaV2) — currently
-  vLLM is a navigation-only stub.
+- Additional runtimes (vLLM, Ollama, LM Studio, SGLang, ExLlamaV2). The
+  `RuntimeBackend` trait (ADR-011) is the extension point: add a module under
+  `src/runtime/` and one entry in `runtime::discover`.
 - macOS / Windows support.
 - Supervisor daemon / auto-restart-on-crash (see ADR-005).
 - Chat mode (server mode only for now).

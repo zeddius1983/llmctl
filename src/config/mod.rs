@@ -41,6 +41,11 @@ layout = "directory"
 [runtime.llama_cpp]
 binary = "llama-server"
 
+# FastFlowLM runs models on an AMD XDNA2 NPU. Its catalog comes from `flm`
+# itself, so the model sources above do not apply to it.
+[runtime.fastflowlm]
+binary = "flm"
+
 [defaults]
 host = "127.0.0.1"
 port = 8000
@@ -90,6 +95,7 @@ pub enum ModelLayout {
 #[serde(default)]
 pub struct RuntimeConfig {
     pub llama_cpp: LlamaCppConfig,
+    pub fastflowlm: FastFlowLmConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -102,6 +108,22 @@ pub struct LlamaCppConfig {
 impl Default for LlamaCppConfig {
     fn default() -> Self {
         Self { binary: "llama-server".to_string() }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct FastFlowLmConfig {
+    /// FastFlowLM CLI name or absolute path. Resolved on `$PATH` if not
+    /// absolute. This may legitimately be a wrapper script (a container entry
+    /// point, for instance) rather than the server itself — llmctl re-acquires
+    /// the real process from `/proc` after launch.
+    pub binary: String,
+}
+
+impl Default for FastFlowLmConfig {
+    fn default() -> Self {
+        Self { binary: "flm".to_string() }
     }
 }
 

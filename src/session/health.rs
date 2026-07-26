@@ -1,8 +1,11 @@
-//! Minimal, dependency-free HTTP `/health` probe for llama-server.
+//! Minimal, dependency-free HTTP readiness probe.
 //!
-//! llama-server returns `200` on `GET /health` once the model is loaded and
-//! `503` while still loading, so this lets us move a session from `Starting`
-//! to `Running` without pulling in an HTTP client crate.
+//! Runtimes disagree on which path answers "am I ready?" — llama-server has a
+//! dedicated `/health`, while FastFlowLM has none and its `/v1/models` serves
+//! the same purpose — so the path is the caller's (that is, the backend's)
+//! choice. What they share is the contract: `200` means loaded and ready,
+//! anything else on an open port means still starting. Keeping this hand-rolled
+//! avoids pulling an HTTP client into the tick loop.
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -11,7 +14,7 @@ use std::time::Duration;
 /// The outcome of a single health probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Health {
-    /// `GET /health` returned `200` — the server is ready.
+    /// The probe returned `200` — the server is ready.
     Ready,
     /// The port accepted a connection but the server isn't ready yet
     /// (e.g. `503` while the model loads).
@@ -20,11 +23,11 @@ pub enum Health {
     Down,
 }
 
-/// Probe `http://{host}:{port}/health` with a short timeout.
+/// Probe `http://{host}:{port}{path}` with a short timeout.
 ///
 /// `host` may be a bind address like `0.0.0.0`; we probe `127.0.0.1` in that
 /// case since the wildcard address isn't directly connectable.
-pub fn probe(host: &str, port: u16) -> Health {
+pub fn probe(host: &str, port: u16, path: &str) -> Health {
     let connect_host = match host {
         "0.0.0.0" | "::" | "" => "127.0.0.1",
         other => other,
@@ -40,7 +43,7 @@ pub fn probe(host: &str, port: u16) -> Health {
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
 
-    let req = format!("GET /health HTTP/1.0\r\nHost: {connect_host}\r\nConnection: close\r\n\r\n");
+    let req = format!("GET {path} HTTP/1.0\r\nHost: {connect_host}\r\nConnection: close\r\n\r\n");
     if stream.write_all(req.as_bytes()).is_err() {
         return Health::Loading; // connected but couldn't speak; treat as not-ready
     }

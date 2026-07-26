@@ -17,7 +17,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 
-use crate::domain::OptionItem;
 use command::Command;
 use health::Health;
 use proc::CpuSample;
@@ -149,21 +148,25 @@ fn download_record_percent(download: &DownloadRecord) -> Option<u8> {
 
 /// Everything the manager needs to launch a server. Built by the app from the
 /// current runtime/model/profile selection and resolved options.
+///
+/// The argv is assembled by the runtime backend before it gets here — the
+/// manager stays out of the business of knowing anyone's flags; it only patches
+/// the `--port` value if the preferred port turns out to be taken.
 pub struct LaunchRequest {
     pub runtime: String,
-    pub binary: String,
     pub model: String,
+    /// The token that identifies this model in the server's own command line: a
+    /// GGUF path for llama.cpp, a `name:size` tag for FastFlowLM. Used to
+    /// re-acquire the process from `/proc`, so it must appear in the argv.
     pub model_path: String,
-    pub mtp_path: Option<String>,
-    pub projector_path: Option<String>,
-    pub hf_repo: Option<String>,
-    pub draft_hf: Option<String>,
-    pub projector_auto: bool,
+    /// The launch command, already built by the backend.
+    pub command: Command,
+    /// HTTP path whose `200` means "ready" for this runtime.
+    pub health_path: String,
     pub download: Option<DownloadRecord>,
     pub profile: String,
     pub host: String,
     pub port: u16,
-    pub options: Vec<OptionItem>,
 }
 
 /// Owns the supervisor and the set of tracked sessions.
@@ -198,7 +201,7 @@ impl SessionManager {
             let alive =
                 proc::is_alive(record.pid) && proc::cmdline_matches(record.pid, &record.model_path);
             if alive {
-                let status = match health::probe(&record.host, record.port) {
+                let status = match health::probe(&record.host, record.port, &record.health_path) {
                     Health::Ready => SessionStatus::Running,
                     _ if download_percent(&record).is_some() => SessionStatus::Downloading,
                     _ => SessionStatus::Starting,
@@ -210,35 +213,15 @@ impl SessionManager {
         }
     }
 
-    /// Launch a server from `req`, resolving a free port if the preferred one is
-    /// taken. Returns the index of the new session.
+    /// Launch the already-built command in `req`, moving to a free port if the
+    /// preferred one is taken. Returns the index of the new session.
     pub fn launch(&mut self, req: LaunchRequest) -> Result<usize> {
         let port = self.resolve_port(req.port, None);
 
-        // Reflect the resolved port in the options we render into the command.
-        let mut options = req.options;
-        if let Some(opt) = options.iter_mut().find(|o| o.key == "port") {
-            opt.value = port.to_string();
-        }
-        let command = match &req.hf_repo {
-            Some(repo) => Command::build_huggingface(
-                &req.binary,
-                repo,
-                &req.model_path,
-                req.mtp_path.as_deref(),
-                req.draft_hf.as_deref(),
-                req.projector_path.as_deref(),
-                req.projector_auto,
-                &options,
-            ),
-            None => Command::build_local(
-                &req.binary,
-                &req.model_path,
-                req.mtp_path.as_deref(),
-                req.projector_path.as_deref(),
-                &options,
-            ),
-        };
+        // Every backend emits an explicit `--port`, so the resolved port can be
+        // patched into the finished argv rather than rebuilding it.
+        let mut command = req.command;
+        set_port_arg(&mut command.argv, port);
 
         let id = next_id();
         let log_file = supervisor::log_path(&self.log_dir, &id);
@@ -256,6 +239,7 @@ impl SessionManager {
             host: req.host,
             port,
             command: command.argv,
+            health_path: req.health_path,
             log_file,
             download: req.download,
             started_unix: now_unix(),
@@ -331,10 +315,18 @@ impl SessionManager {
             let prev = self.sessions[idx].last_cpu;
             let was_running = self.sessions[idx].status == SessionStatus::Running;
             let progress = download_percent(&self.sessions[idx].record);
+            let health_path = self.sessions[idx].record.health_path.clone();
 
             let rss = proc::rss_bytes(pid);
             let sample = proc::cpu_sample(pid);
-            let health = health::probe(&host, port);
+            // Once a session is Running its status no longer depends on the
+            // probe — the `was_running` arm below keeps it Running for as long
+            // as the process lives — so re-probing every tick buys nothing. It
+            // does cost something: servers that log each connection (FastFlowLM
+            // logs four lines per request) fill their own log with llmctl's
+            // health checks. Probe only while readiness is still in question.
+            let health =
+                if was_running { Health::Ready } else { health::probe(&host, port, &health_path) };
 
             let s = &mut self.sessions[idx];
             s.rss_bytes = rss;
@@ -560,8 +552,8 @@ mod tests {
         assert_eq!(session_status_label(SessionStatus::Starting, None), "Starting");
     }
 
-    fn opt(key: &str, value: &str, cli: &str) -> OptionItem {
-        OptionItem {
+    fn opt(key: &str, value: &str, cli: &str) -> crate::domain::OptionItem {
+        crate::domain::OptionItem {
             key: key.into(),
             value: value.into(),
             default: String::new(),
@@ -608,21 +600,24 @@ mod tests {
         std::fs::set_permissions(&server, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
 
+        let command = Command::build_local(
+            &server.display().to_string(),
+            "/models/fake.gguf",
+            None,
+            None,
+            &crate::runtime::llama_cpp::SCHEMA,
+            &[opt("host", "127.0.0.1", "--host"), opt("port", "18900", "--port")],
+        );
         let req = LaunchRequest {
             runtime: "llama.cpp".into(),
-            binary: server.display().to_string(),
             model: "fake.gguf".into(),
             model_path: "/models/fake.gguf".into(),
-            mtp_path: None,
-            projector_path: None,
-            hf_repo: None,
-            draft_hf: None,
-            projector_auto: false,
+            command,
+            health_path: "/health".into(),
             download: None,
             profile: "Default".into(),
             host: "127.0.0.1".into(),
             port: 18900,
-            options: vec![opt("host", "127.0.0.1", "--host"), opt("port", "18900", "--port")],
         };
 
         let mut mgr = SessionManager::new(sess_dir.clone(), log_dir.clone());

@@ -302,3 +302,178 @@ cleanup explicitly skip that directory. On restart, llmctl reconstructs byte
 progress from the Hub blobs and presents the job as `Interrupted`; it does not
 resume network activity until the user presses `R` or selects the model with
 `d`. Completed or explicitly removed jobs delete their record.
+
+## ADR-011: Runtimes behind a `RuntimeBackend` trait
+
+**Status:** Accepted (2026-07-26).
+
+**Context:** llmctl shipped as a single-runtime tool wearing a multi-runtime
+interface. The Runtime column existed, but its second row was `domain::stubs`,
+a fabricated non-launchable "vLLM" node whose only job was to make the
+navigation exercisable. Everything below that column — the option registry, the
+command builder, the health probe, model discovery, the profile store — was one
+hardcoded llama.cpp implementation, and `app/mod.rs` dispatched by comparing
+`runtime.name` against the string literals `"llama.cpp"` and `"vLLM"` in about
+a dozen places. Adding a real second runtime by extending that pattern would
+have multiplied the string branches with no compiler help for the sites missed.
+
+**Decision:** Introduce `src/runtime/` with a `RuntimeBackend` trait and hold
+backends as `PaneList<Box<dyn RuntimeBackend>>`. The trait owns everything that
+differs: binary discovery, the option schema, built-in templates, model
+enumeration, model-aware defaults and clamping, command/chat/benchmark argv, the
+readiness path, the `/proc` identity token, and per-launch capability checks.
+
+Two supporting types make this work without threading `&dyn RuntimeBackend`
+into deep call sites:
+
+* `OptionSchema` (in `profiles/registry.rs`) bundles a runtime's `&'static
+  [OptionSpec]` table with its CLI-encoding rules (`omit_token`, `is_flag`,
+  `cli_value`) as function pointers. It is `Copy`, so resolution and command
+  building pass it around freely. The option *tables* moved out of
+  `profiles/registry.rs` and `profiles/templates.rs` into the backends; what
+  remains in `profiles/` is the generic option model.
+* `LaunchRequest` now carries a finished `Command` plus a `health_path`, built
+  by the backend before it reaches `SessionManager`. The manager keeps port
+  resolution — it patches the resolved `--port` into the finished argv, which
+  every backend emits explicitly — but no longer knows anyone's flags.
+
+`domain::stubs` and every `"vLLM"` / `"llama.cpp"` string branch are deleted.
+`Model` gains a `runtime` field, which also fixes a latent bug: the profile
+store previously attributed *every* loaded profile to `"llama.cpp"` regardless
+of origin.
+
+**Alternatives considered:** A `RuntimeKind` enum with exhaustive `match`
+dispatch would have been a smaller change and would still have let the compiler
+find every site needing a new arm, but it keeps per-runtime knowledge spread
+across the modules that match on it. A minimal string branch mirroring the vLLM
+stub was rejected outright: it scales worst and the compiler cannot check it.
+
+**Consequences:** Adding a runtime means adding a module under `src/runtime/`
+and one entry in `runtime::discover`, not another branch in the app. One place
+still resolves a runtime by *name* rather than through the trait —
+`runtime::templates_for`, used by the profile store, which reads runtime names
+off disk long before any backend has been probed. Session records gained a
+`health_path` field defaulting to `/health`, so records written by older
+versions still rediscover correctly.
+
+## ADR-012: FastFlowLM as a curated, virtual, tag-addressed catalog
+
+**Status:** Accepted (2026-07-26).
+
+**Context:** FastFlowLM (`flm`) runs models on an AMD XDNA2 NPU — hardware
+llama.cpp cannot target — making it complementary rather than redundant. It
+differs from llama.cpp in ways that resist the existing model plumbing: its
+catalog is curated rather than scanned, its models are tags rather than file
+paths, and it exposes no `/health`. The published documentation also disagrees
+with the shipping CLI in several places, so this design was derived by probing
+`flm` v0.9.45 directly.
+
+**Decision:**
+
+*Catalog.* `flm list --json` returns the entire catalog — installed and not — in
+one call, with context length, quantization, disk footprint, and capability
+labels. There is no filesystem scan and no separate "online" subtree; a
+not-yet-downloaded model is fully browsable and directly launchable, because
+`flm serve` fetches it on demand. Every `flm` invocation prints a
+`[FLM] Fetching models from: …` banner before its JSON, which is stripped
+before parsing.
+
+*Tree shape.* Models split into `local` and `online` at the top, mirroring
+llama.cpp's catalog, then group by capability label (`reasoning`, `vision`,
+`tool-calling`, `audio`, `embeddings`) with a `chat` fallback for the unlabeled.
+Labels overlap, so a model is emitted once per group it belongs to. This makes
+the FastFlowLM tree **virtual**, unlike the local GGUF catalog that
+`discovery::catalog::reconcile` materializes as real directories: identity must
+not derive from `catalog_path`. `Model::profile_key` therefore returns
+`flm:<tag>`, and the managed catalog leaf is keyed by tag alone, so a model
+rendered under three labels still has exactly one set of profiles.
+`Model::is_catalog_dir` additionally consults the new `flm` field, because a
+not-installed model has an empty path and would otherwise read as a folder.
+
+*Sessions.* The `--port` flag is always emitted explicitly. `flm`'s own default
+is the sentinel `-1`, and llmctl needs a concrete port both for health checks
+and to re-acquire the server process by command line. Readiness is `GET
+/v1/models` returning 200; FastFlowLM has no `/health`. The process token
+recorded for `/proc` matching is the tag, since that is what appears in argv.
+
+*Downloads.* llmctl fetches the model's files from Hugging Face itself — see
+the amendment below.
+
+**Consequences:** FastFlowLM is listed even when absent or unusable, with the
+reason (missing binary, or an NPU stack that `flm validate` reports as not
+ready) surfaced in the status line rather than at launch time. `flm bench` is
+documented upstream but absent from v0.9.45, so `bench_argv` returns `None` and
+the `b` key is inert for this runtime.
+
+A practical note that shaped the session design: `flm` may legitimately be a
+*wrapper* rather than the server binary — on the development machine it is a
+distrobox entry point, so the process llmctl spawns has `comm` `podman` and the
+real server lives inside a container. This works without special-casing because
+`session::proc::find_server` already re-acquires the real process by `comm` plus
+argv match, and the container shares the host PID and network namespaces. Any
+runtime fronted by a launcher script benefits from the same mechanism.
+
+## ADR-013: llmctl downloads FastFlowLM models, not `flm pull`
+
+**Status:** Accepted (2026-07-27). Amends the *Downloads* section of ADR-012.
+
+**Context:** ADR-012 built downloading on `flm pull`, tracking progress by
+watching the model directory grow. In use that proved unreliable: `flm pull`
+cannot resume, and `flm` does not correctly recognize a partially-downloaded
+model — an interrupted pull leaves a directory that reads as installed but is
+not. A multi-gigabyte transfer with no resume and a failure mode that
+misrepresents itself as success is not something to build a download UX on.
+
+llmctl already had the right machinery for llama.cpp's Hugging Face downloads:
+`Range` resume, cancellation, per-file size verification, and progress into the
+Session Manager. FastFlowLM's models *are* Hugging Face repositories under
+<https://huggingface.co/FastFlowLM>, so it applies directly.
+
+**Decision:** llmctl performs the download itself.
+
+The transfer core was extracted from `discovery::online`'s blob downloader into
+`discovery::hf` and is now shared by both runtimes. `runtime::flm::download`
+resolves per-file sizes from `GET /api/models/<repo>/tree/<revision>`, then
+fetches each file the catalog lists into `~/.config/flm/models/<Repo>/`, writing
+to a `<file>.llmctl-part` scratch name and renaming only once the file is
+byte-complete.
+
+That gives resume at two levels — a half-written file continues via `Range`, and
+a file already present at its expected size is skipped on a later attempt — and,
+because nothing appears under its real name until it is whole, `flm` can never
+mistake a partial download for an installed model. The failure mode that
+prompted this ADR is structurally impossible.
+
+Three facts made this viable, all verified against `flm` v0.9.45 rather than
+taken from documentation:
+
+* Placing the files is sufficient. A directory populated by llmctl makes
+  `flm list` report `installed: true` and `flm check` pass.
+* `flm list`'s `files[]` is exactly a model directory's contents — confirmed
+  against an installed model. The repository also holds a README and `.xclbin`
+  NPU kernels, which are **not** part of it; they ship with `flm`.
+* Revisions matter. Several models are pinned to a tag
+  (`v0.9.22-faster-q4-1`), so `FlmModel` carries a `revision` and the downloader
+  honors it. Fetching `main` for those would produce weights the installed `flm`
+  cannot load. This is also why the `online` catalog is driven by `flm list`
+  rather than by browsing the Hub organization: only `flm list` knows the right
+  revision, the right file set, and `flm_min_version`.
+
+Note that the repository *id* (`FastFlowLM/Qwen3-0.6B-NPU2`) and the directory
+name `flm` stores it under (`Qwen3-0.6B-NPU2`) differ; conflating them yields a
+404 from the Hub.
+
+**Consequences:** `flm pull` is no longer used anywhere. Downloading needs
+neither the `flm` binary nor a ready NPU — it is a plain Hugging Face fetch — so
+a model can be staged on a machine whose NPU stack is not yet configured. No
+resume record is persisted, because none is needed: the partial files on disk
+*are* the resume state, which also means resume survives an llmctl restart.
+
+Launching a model that is not downloaded still falls through to `flm serve`,
+which fetches it natively — deliberately the same shape as llama.cpp's `-hf`
+launch. `FlmBackend::launch_download` reports progress for that path too. Since
+`flm` writes straight to final filenames there is no rename to observe, so the
+tracking record points at a sentinel `complete_file` that never exists, keeping
+progress tied to byte growth; the `Downloading` state ends when the health probe
+reports ready. A `DownloadRecord::Directory` variant would express this more
+honestly and is noted as a follow-up.
