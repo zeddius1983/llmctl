@@ -640,6 +640,12 @@ impl App {
     }
 
     fn maybe_fetch_online(&mut self, force: bool) {
+        // FastFlowLM names its remote group `online` too, and `request_for_path`
+        // only inspects the path — without this, browsing its catalog would fire
+        // Hugging Face requests for repositories that do not exist.
+        if !self.runtimes.selected().is_some_and(|backend| backend.supports_online_browse()) {
+            return;
+        }
         let Some(selected) = self.models.selected() else { return };
         let Some(request) =
             discovery::online::request_for_path(&selected.catalog_path, self.online_sort)
@@ -742,11 +748,18 @@ impl App {
         if count < 2 {
             return;
         }
+        // Remember the selection so the new arrangement can restore it.
+        let anchor = self.models.selected().map(|m| (m.id.clone(), m.catalog_path.clone()));
+
         self.catalog_view = (self.catalog_view + 1) % count;
         self.catalog_history.clear();
         self.catalog_prefix.clear();
         self.refresh_flm_models();
         self.rebuild_below(Pane::Runtime);
+
+        if let Some((id, path)) = anchor {
+            self.restore_catalog_position(&id, &path);
+        }
     }
 
     fn cycle_online_sort(&mut self) {
@@ -1041,23 +1054,48 @@ impl App {
         rank_models(self.catalog_source(), raw_query, scope, online_only)
     }
 
-    /// Navigate to a model found by search, within the selected runtime.
-    fn jump_to_model(&mut self, id: &str) {
+    /// Navigate to a model by id, within the selected runtime. Returns whether
+    /// the model was found and the browser moved.
+    fn jump_to_model(&mut self, id: &str) -> bool {
         let Some(path) =
             self.catalog_source().iter().find(|m| m.id == id).map(|m| m.catalog_path.clone())
         else {
-            return;
+            return false;
         };
-        let Some(route) = self.catalog_route(&path) else { return };
-
-        // Commit only once the complete route exists.
+        let Some(route) = self.catalog_route(&path) else { return false };
         self.focus = Pane::Model;
+        self.apply_catalog_route(route);
+        true
+    }
+
+    /// Commit a resolved route — only ever called once the whole route exists,
+    /// so the browser never lands half-way.
+    fn apply_catalog_route(&mut self, route: CatalogRoute) {
         self.catalog_prefix = route.prefix;
         self.catalog_history = route.history;
         self.models.items = route.items;
         self.models.state.select(Some(route.selected));
         self.rebuild_below(Pane::Model);
         self.maybe_fetch_online(false);
+    }
+
+    /// Re-select what the user was looking at after the catalog was rebuilt in
+    /// a different arrangement.
+    ///
+    /// A model is found by id, which is the tag and so survives regrouping. A
+    /// folder — or a model the new arrangement places elsewhere — falls back to
+    /// the deepest part of its old path that still exists, so switching keeps
+    /// you as close as the new shape allows rather than dropping you at the top.
+    fn restore_catalog_position(&mut self, id: &str, path: &[String]) {
+        if !id.is_empty() && self.jump_to_model(id) {
+            return;
+        }
+        for depth in (1..path.len()).rev() {
+            if let Some(route) = self.catalog_route(&path[..depth]) {
+                self.apply_catalog_route(route);
+                return;
+            }
+        }
     }
 
     fn catalog_route(&self, path: &[String]) -> Option<CatalogRoute> {
@@ -3175,10 +3213,11 @@ mod tests {
     }
 
     /// Drives the real app: selecting FastFlowLM and pressing `s` must leave a
-    /// populated Model pane in every arrangement, not an empty one.
+    /// populated Model pane in every arrangement, and must keep the user on the
+    /// model they were looking at rather than resetting to the group list.
     #[test]
     #[ignore = "needs a real flm install; run with --ignored --test-threads=1"]
-    fn cycling_the_catalog_view_keeps_the_model_pane_populated() {
+    fn cycling_the_catalog_view_keeps_the_pane_populated_and_the_selection() {
         let stamp =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let root = std::env::temp_dir().join(format!("llmctl-view-{stamp}"));
@@ -3217,6 +3256,33 @@ mod tests {
         // And drilling into a group reaches the models themselves.
         app.enter();
         assert!(app.models.items.iter().any(|m| m.is_model()), "no models under the group");
+
+        // Select a model, then switch arrangement: the browser must stay on it
+        // rather than dropping back to the group list.
+        let index = app.models.items.iter().position(|m| m.is_model()).unwrap();
+        app.models.state.select(Some(index));
+        app.rebuild_below(Pane::Model);
+        let tag = app.selected_model().unwrap().flm.as_ref().unwrap().tag.clone();
+
+        app.on_key(KeyEvent::from(KeyCode::Char('s')));
+        assert_eq!(app.catalog_view_label(), Some("Categories"));
+        assert_eq!(app.focus, Pane::Model, "arrangement switch moved the focus");
+        assert_eq!(
+            app.selected_model().and_then(|m| m.flm.as_ref()).map(|f| f.tag.clone()),
+            Some(tag.clone()),
+            "arrangement switch lost the selected model"
+        );
+        // Still inside a group, not back at the top of the tree.
+        assert!(!app.catalog_prefix.is_empty(), "arrangement switch reset to the group list");
+
+        // And back again, from the deeper arrangement to the flatter one.
+        app.on_key(KeyEvent::from(KeyCode::Char('s')));
+        assert_eq!(app.catalog_view_label(), Some("Flat"));
+        assert_eq!(
+            app.selected_model().and_then(|m| m.flm.as_ref()).map(|f| f.tag.clone()),
+            Some(tag),
+            "switching back lost the selected model"
+        );
 
         // F5 re-reads the catalog through the same subprocess path, so it fails
         // the same way if the SIGCHLD disposition is not handled.
