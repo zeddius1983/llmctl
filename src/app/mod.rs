@@ -379,6 +379,8 @@ impl App {
             cache_path: &model_cache,
             models_dir: &paths.models_dir,
             view: 0,
+            // Nothing is memoized yet, so this reads from `flm` either way.
+            reload: false,
         };
         let flm_models = runtimes
             .iter()
@@ -766,7 +768,8 @@ impl App {
         self.catalog_view = (self.catalog_view + 1) % count;
         self.catalog_history.clear();
         self.catalog_prefix.clear();
-        self.refresh_flm_models();
+        // Same catalog, arranged differently — no reason to ask `flm` again.
+        self.refresh_flm_models(false);
         self.rebuild_below(Pane::Runtime);
 
         self.restore_catalog_position(selection.as_deref(), &prefix);
@@ -1586,7 +1589,9 @@ impl App {
             }
         }
         if refresh_flm {
-            self.refresh_flm_models();
+            // A download just finished: `flm` now reports the model installed,
+            // which is exactly the change the cached catalog cannot know about.
+            self.refresh_flm_models(true);
             self.reselect_current_catalog();
         }
         if refresh_models {
@@ -2323,9 +2328,13 @@ impl App {
         catalog_children_of(source, prefix)
     }
 
-    /// Re-read the FastFlowLM catalog (`flm list`), which is also how a freshly
-    /// pulled model moves into the `installed` group.
-    fn refresh_flm_models(&mut self) {
+    /// Rebuild the FastFlowLM model list for the current arrangement.
+    ///
+    /// `reload` decides whether `flm list` runs again or the backend serves the
+    /// catalog it already has. Pass it when the catalog itself may have changed
+    /// — a manual refresh, or a download that just installed a model — and not
+    /// when only the arrangement did.
+    fn refresh_flm_models(&mut self, reload: bool) {
         let Some(backend) = self.runtimes.items.iter().find(|b| !b.supports_online_browse()) else {
             return;
         };
@@ -2334,6 +2343,7 @@ impl App {
             cache_path: &self.model_cache,
             models_dir: &self.models_dir,
             view: self.catalog_view,
+            reload,
         };
         self.flm_models = backend.models(&ctx);
         self.store.sync_models(&self.flm_models);
@@ -2345,7 +2355,9 @@ impl App {
             self.reload_online_layout();
             return;
         }
-        self.refresh_flm_models();
+        // The user asked for fresh data, so go back to `flm` — this is how a
+        // model installed outside llmctl shows up.
+        self.refresh_flm_models(true);
         self.scanned_models = discovery::scan_models(&self.model_sources, &self.model_cache);
         discovery::reconcile(&self.models_dir, &mut self.scanned_models);
         self.scanned_models.extend(discovery::online::load_cached(&self.models_dir));

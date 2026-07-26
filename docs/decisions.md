@@ -418,6 +418,17 @@ wait would freeze the TUI for the whole of a large model's teardown. This also
 fixes a smaller pre-existing race for every runtime: respawning while the old
 server still held its socket could push a restart onto a different port.
 
+*Catalog caching.* `flm list --json` is memoized on the backend. Measured at
+~150 ms on the development machine, because `flm` is frequently a launcher
+script and every call pays a container hop — and cycling the arrangement with
+`s` used to re-read it purely to regroup identical entries. `CatalogCtx.reload`
+is how a caller says it has reason to believe the catalog changed: the `F5`
+refresh, and a download finishing. Rearranging does not set it, and drops from
+~155 ms to ~60 µs. Materializing the managed profile directories moved into the
+same cache-fill path, so that write happens once per catalog read rather than
+once per regroup. The trade is that a model installed by another process is
+invisible until `F5` — which is what `F5` is for.
+
 *Downloads.* llmctl fetches the model's files from Hugging Face itself — see
 the amendment below.
 

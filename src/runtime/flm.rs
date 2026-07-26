@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Deserialize;
@@ -207,6 +208,9 @@ pub struct FlmBackend {
     npu_ready: bool,
     /// Why the stack is not ready, when it isn't.
     npu_problem: Option<String>,
+    /// The last catalog read from `flm`, held so re-grouping does not re-read
+    /// it. See [`FlmBackend::cached_catalog`].
+    catalog_cache: Mutex<Option<Vec<Entry>>>,
 }
 
 impl FlmBackend {
@@ -241,10 +245,12 @@ impl FlmBackend {
             },
             npu_ready,
             npu_problem,
+            catalog_cache: Mutex::new(None),
         }
     }
 
-    /// The `flm` catalog, or an empty list if it can't be read.
+    /// The `flm` catalog, read fresh from the binary, or an empty list if it
+    /// can't be read.
     fn catalog(&self) -> Vec<Entry> {
         let Some(binary) = &self.runtime.binary_path else { return Vec::new() };
         match list_models(binary) {
@@ -254,6 +260,46 @@ impl FlmBackend {
                 Vec::new()
             }
         }
+    }
+
+    /// The catalog, served from memory unless `ctx.reload` asks for a fresh read.
+    ///
+    /// `flm list --json` costs ~150 ms here: `flm` is frequently a launcher
+    /// script (a distrobox entry point on this machine), so every call pays a
+    /// container hop. The result is pure data that changes only when a model is
+    /// installed or removed — yet cycling the catalog arrangement with `s` used
+    /// to re-read it just to regroup identical entries, turning an in-memory
+    /// transform into a visible hitch. Callers that *can* have missed a change
+    /// — the `F5` refresh, and finishing a download — pass `reload`.
+    ///
+    /// Materializing the managed profile directories belongs here rather than in
+    /// [`RuntimeBackend::models`] for the same reason: it is a write that has to
+    /// happen once per catalog read, not once per regroup.
+    fn cached_catalog(&self, ctx: &CatalogCtx) -> Vec<Entry> {
+        if !ctx.reload
+            && let Ok(cache) = self.catalog_cache.lock()
+            && let Some(entries) = cache.as_ref()
+        {
+            return entries.clone();
+        }
+
+        let entries = self.catalog();
+        for entry in &entries {
+            // One managed leaf per tag, however many groups the model shows up
+            // in. Creating it is what makes profiles persist as per-model YAML:
+            // the store only adopts a model whose `profiles/` directory exists.
+            // llama.cpp gets the equivalent from `catalog::reconcile`, which
+            // also symlinks the artifact — meaningless for FastFlowLM, whose
+            // models are multi-file directories owned by `flm`.
+            let leaf = ctx.models_dir.join(CATALOG_ROOT).join(sanitize(&entry.name));
+            if let Err(err) = std::fs::create_dir_all(leaf.join("profiles")) {
+                debug!(%err, path = %leaf.display(), "could not create the managed profile directory");
+            }
+        }
+        if let Ok(mut cache) = self.catalog_cache.lock() {
+            *cache = Some(entries.clone());
+        }
+        entries
     }
 }
 
@@ -277,21 +323,13 @@ impl RuntimeBackend for FlmBackend {
         VIEWS
     }
 
+    /// A pure regroup of the cached catalog: switching arrangement costs the
+    /// transform and nothing else.
     fn models(&self, ctx: &CatalogCtx) -> Vec<Model> {
         let root = model_root();
         let flat = ctx.view == FLAT_VIEW;
         let mut models = Vec::new();
-        for entry in self.catalog() {
-            // One managed leaf per tag, however many groups the model shows up
-            // in. Creating it here is what makes profiles persist as per-model
-            // YAML: the store only adopts a model whose `profiles/` directory
-            // exists. llama.cpp gets the equivalent from `catalog::reconcile`,
-            // which also symlinks the artifact — meaningless for FastFlowLM,
-            // whose models are multi-file directories owned by `flm`.
-            let leaf = ctx.models_dir.join(CATALOG_ROOT).join(sanitize(&entry.name));
-            if let Err(err) = std::fs::create_dir_all(leaf.join("profiles")) {
-                debug!(%err, path = %leaf.display(), "could not create the managed profile directory");
-            }
+        for entry in self.cached_catalog(ctx) {
             for group in entry.groups(flat) {
                 models.push(entry.to_model(&group, &root, ctx.models_dir));
             }
@@ -879,6 +917,84 @@ mod tests {
         assert_eq!(entries[0].details.quantization_level.as_deref(), Some("Q4_1"));
     }
 
+    /// Switching arrangement must regroup the catalog it already has: `flm list`
+    /// costs ~150 ms through a launcher script, and re-running it to reshape
+    /// identical data is what made `s` hitch. A reload must still reach `flm`.
+    #[test]
+    #[ignore = "needs a real flm install; run with --ignored --test-threads=1"]
+    fn rearranging_the_catalog_does_not_re_read_it() {
+        use std::time::Instant;
+
+        let backend = FlmBackend::discover(&FastFlowLmConfig::default());
+        let dir = std::env::temp_dir().join(format!("llmctl-flm-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = |view, reload| CatalogCtx {
+            sources: &[],
+            cache_path: Path::new("/nonexistent"),
+            models_dir: &dir,
+            view,
+            reload,
+        };
+
+        // First read populates the cache and pays for the subprocess.
+        let start = Instant::now();
+        let categories = backend.models(&ctx(0, false));
+        let cold = start.elapsed();
+        assert!(!categories.is_empty(), "the catalog should not be empty");
+
+        // Rearranging must not go near `flm` again.
+        let start = Instant::now();
+        let flat = backend.models(&ctx(FLAT_VIEW, false));
+        let warm = start.elapsed();
+        assert!(!flat.is_empty());
+        assert!(
+            warm * 10 < cold,
+            "rearranging cost {warm:?} against a cold read of {cold:?} — the catalog was re-read"
+        );
+
+        // ...but the two arrangements still describe the same set of models.
+        let tags = |models: &[Model]| -> std::collections::BTreeSet<String> {
+            models.iter().filter_map(|m| m.flm.as_ref()).map(|f| f.tag.clone()).collect()
+        };
+        assert_eq!(tags(&categories), tags(&flat), "an arrangement lost models");
+
+        // A reload goes back to the binary, so it costs like the first read.
+        let start = Instant::now();
+        let reloaded = backend.models(&ctx(0, true));
+        let refreshed = start.elapsed();
+        assert_eq!(tags(&reloaded), tags(&categories));
+        assert!(refreshed > warm * 10, "a reload should have re-read the catalog");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The profile directories are what make FastFlowLM profiles persist as
+    /// per-model YAML, so moving that write out of `models` must not lose it.
+    #[test]
+    #[ignore = "needs a real flm install; run with --ignored --test-threads=1"]
+    fn a_cached_read_still_materializes_the_profile_directories() {
+        let backend = FlmBackend::discover(&FastFlowLmConfig::default());
+        let dir = std::env::temp_dir().join(format!("llmctl-flm-leaf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = CatalogCtx {
+            sources: &[],
+            cache_path: Path::new("/nonexistent"),
+            models_dir: &dir,
+            view: 0,
+            reload: false,
+        };
+
+        let models = backend.models(&ctx);
+        let model = models.iter().find(|m| m.is_model()).expect("a model leaf");
+        assert!(
+            model.catalog_dir.join("profiles").is_dir(),
+            "the managed profile directory was not created"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// FastFlowLM is exclusive (one NPU hardware context) where llama.cpp is
     /// not — the distinction the launch guard rests on.
     #[test]
@@ -1013,6 +1129,7 @@ mod tests {
             },
             npu_ready: true,
             npu_problem: None,
+            catalog_cache: Mutex::new(None),
         };
         let model =
             entries()[0].to_model(&local("reasoning"), Path::new("/models"), Path::new("/cfg"));
@@ -1049,6 +1166,7 @@ mod tests {
             },
             npu_ready: true,
             npu_problem: None,
+            catalog_cache: Mutex::new(None),
         };
         let model =
             entries()[0].to_model(&local("reasoning"), Path::new("/models"), Path::new("/cfg"));
@@ -1199,6 +1317,7 @@ mod tests {
             cache_path: Path::new("/nonexistent"),
             models_dir: &models_dir,
             view: 0,
+            reload: false,
         };
         let models = backend.models(&ctx);
         assert!(!models.is_empty());
@@ -1332,6 +1451,8 @@ mod tests {
             cache_path: Path::new("/nonexistent"),
             models_dir: &dir,
             view,
+            // The second arrangement must come from the memoized catalog.
+            reload: false,
         };
 
         let tags = |models: &[Model]| -> std::collections::BTreeSet<String> {

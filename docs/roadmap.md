@@ -203,6 +203,11 @@ spawns the replacement from the poll loop once the old one has actually exited
 (escalating to SIGKILL after five seconds) — so the replacement inherits a free
 port and a free device rather than racing the process it replaced.
 
+The `flm list --json` catalog is memoized on the backend, since it costs ~150 ms
+through the launcher script. `CatalogCtx.reload` marks the callers that need
+fresh data (`F5`, and a finished download); switching arrangement does not, and
+went from ~155 ms to ~60 µs (ADR-012).
+
 ## Next (post-v0.3.1)
 
 ### Online Hugging Face follow-ups

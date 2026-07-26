@@ -38,6 +38,14 @@ pub struct CatalogCtx<'a> {
     /// Which of the runtime's [`RuntimeBackend::catalog_views`] to build, as an
     /// index into that list. Runtimes offering a single arrangement ignore it.
     pub view: usize,
+    /// Discard any memoized enumeration and read the source again.
+    ///
+    /// Enumeration can be expensive — FastFlowLM shells out to `flm list`, which
+    /// costs ~150 ms through a launcher script — so a backend is free to serve
+    /// repeat calls from memory. This is how a caller says it has reason to
+    /// believe the source changed: the `F5` refresh, or a download finishing.
+    /// Rearranging the same catalog does not set it.
+    pub reload: bool,
 }
 
 /// Everything needed to build a launch/chat command for a selected model.
