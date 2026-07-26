@@ -189,7 +189,8 @@ installed and available models in one call and is grouped by capability label
 tree position. NPU-specific options (`--ctx-len`, `--pmode`, `--prefill-chunk-len`,
 `--q-len`, `--socket`, `--preemption`, …) and templates including Low Power;
 `flm serve` sessions with `/v1/models` readiness on port 52625; `flm run` chat
-on `C`. `flm
+on `C`; `/` filtering the catalog in place and `s` switching between the
+Categories and Flat arrangements. `flm
 validate` gates launching and explains an unready NPU stack in the status line.
 Sessions survive `flm` being a launcher wrapper (a distrobox entry point, for
 instance) via the existing `/proc` re-acquisition.

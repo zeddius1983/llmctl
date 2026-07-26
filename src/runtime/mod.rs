@@ -35,6 +35,9 @@ pub struct CatalogCtx<'a> {
     /// `~/.config/llmctl/models/` — the managed catalog root holding per-model
     /// profiles.
     pub models_dir: &'a Path,
+    /// Which of the runtime's [`RuntimeBackend::catalog_views`] to build, as an
+    /// index into that list. Runtimes offering a single arrangement ignore it.
+    pub view: usize,
 }
 
 /// Everything needed to build a launch/chat command for a selected model.
@@ -123,8 +126,23 @@ pub trait RuntimeBackend: Send + Sync {
         None
     }
 
+    /// Alternative arrangements of this runtime's catalog, cycled with `s` and
+    /// named in the pane title. Empty when the catalog has only one shape.
+    ///
+    /// This is the counterpart to the Hub's sort orders, which only mean
+    /// something for a runtime whose catalog is fetched from Hugging Face —
+    /// hence [`RuntimeBackend::supports_online_browse`] governing that instead.
+    fn catalog_views(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Whether this runtime offers the lazy online (Hugging Face) subtree with
-    /// its repository/artifact drill-down and llmctl-managed blob downloads.
+    /// its repository/artifact drill-down, Hub-wide search, and sort orders.
+    ///
+    /// This is what separates llama.cpp's `online` subtree — a live view of the
+    /// whole Hub — from FastFlowLM's, which is a fixed catalog that happens to
+    /// be hosted there. Both use the name `online`, so the path alone cannot
+    /// tell them apart.
     fn supports_online_browse(&self) -> bool {
         false
     }

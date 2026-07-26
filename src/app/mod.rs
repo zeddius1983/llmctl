@@ -350,6 +350,9 @@ pub struct App {
     online_pending: Option<discovery::online::Request>,
     online_search_due: Option<(Instant, String)>,
     online_sort: discovery::online::Sort,
+    /// Which of the selected runtime's `catalog_views` is active (cycled with
+    /// `s`). Runtimes offering a single arrangement ignore it.
+    catalog_view: usize,
     online_epoch: u64,
     online_reload_deferred: bool,
     online_restore_models: bool,
@@ -375,6 +378,7 @@ impl App {
             sources: &model_sources,
             cache_path: &model_cache,
             models_dir: &paths.models_dir,
+            view: 0,
         };
         let flm_models = runtimes
             .iter()
@@ -427,6 +431,7 @@ impl App {
             online_pending: None,
             online_search_due: None,
             online_sort,
+            catalog_view: 0,
             online_epoch: 0,
             online_reload_deferred: false,
             online_restore_models: false,
@@ -671,8 +676,15 @@ impl App {
         }
     }
 
+    /// Is the Hugging Face browsing surface — Hub-wide search, sort orders,
+    /// lazy repository fetches — active right now?
+    ///
+    /// The path alone is not enough: FastFlowLM also names its remote group
+    /// `online`, but that is a fixed catalog rather than a live view of the Hub,
+    /// so the runtime has to agree.
     pub fn online_view_active(&self) -> bool {
-        self.focus >= Pane::Model
+        self.runtimes.selected().is_some_and(|backend| backend.supports_online_browse())
+            && self.focus >= Pane::Model
             && (discovery::online::is_online_path(&self.catalog_prefix)
                 || self
                     .models
@@ -680,23 +692,61 @@ impl App {
                     .is_some_and(|model| discovery::online::is_online_path(&model.catalog_path)))
     }
 
+    /// Title for a catalog pane showing `prefix`.
+    ///
+    /// A runtime with alternative arrangements names the active one; otherwise
+    /// the Hub subtree names its sort order, and everything else is "Model".
+    fn catalog_title(&self, prefix: &[String]) -> String {
+        match self.catalog_view_label() {
+            Some(view) => view.to_string(),
+            None => model_catalog_title(prefix, self.online_sort),
+        }
+    }
+
     pub fn model_pane_title(&self) -> String {
-        model_catalog_title(&self.catalog_prefix, self.online_sort)
+        self.catalog_title(&self.catalog_prefix)
     }
 
     pub fn catalog_parent_title(&self) -> String {
-        self.catalog_history
-            .last()
-            .map(|(_, _, prefix)| model_catalog_title(prefix, self.online_sort))
-            .unwrap_or_else(|| "Model".into())
+        match self.catalog_history.last() {
+            Some((_, _, prefix)) => self.catalog_title(prefix),
+            None => "Model".into(),
+        }
     }
 
     pub fn catalog_preview_title(&self) -> String {
         self.models
             .selected()
             .filter(|model| model.is_catalog_dir())
-            .map(|model| model_catalog_title(&model.catalog_path, self.online_sort))
+            .map(|model| self.catalog_title(&model.catalog_path))
             .unwrap_or_else(|| self.model_pane_title())
+    }
+
+    /// How many arrangements the selected runtime offers for its catalog.
+    fn catalog_view_count(&self) -> usize {
+        self.runtimes.selected().map(|backend| backend.catalog_views().len()).unwrap_or(0)
+    }
+
+    /// The name of the active arrangement, for the pane title.
+    pub fn catalog_view_label(&self) -> Option<&'static str> {
+        let views = self.runtimes.selected()?.catalog_views();
+        if views.len() < 2 {
+            return None;
+        }
+        views.get(self.catalog_view % views.len()).copied()
+    }
+
+    /// Switch to the next catalog arrangement (`s`), rebuilding the tree.
+    fn cycle_catalog_view(&mut self) {
+        let count = self.catalog_view_count();
+        if count < 2 {
+            return;
+        }
+        self.catalog_view = (self.catalog_view + 1) % count;
+        self.catalog_history.clear();
+        self.catalog_prefix.clear();
+        self.refresh_flm_models();
+        self.rebuild_below(Pane::Runtime);
     }
 
     fn cycle_online_sort(&mut self) {
@@ -819,8 +869,15 @@ impl App {
                     .selected()
                     .filter(|model| model.is_catalog_dir())
                     .map(|model| model.catalog_path.as_slice());
-                let scope = normalized_search_scope(self.focus, selected_dir, &self.catalog_prefix);
-                let online = discovery::online::is_online_path(&scope);
+                let hub = self
+                    .runtimes
+                    .selected()
+                    .is_some_and(|backend| backend.supports_online_browse());
+                let scope =
+                    normalized_search_scope(self.focus, selected_dir, &self.catalog_prefix, hub);
+                // FastFlowLM's `online` group is a local catalog, so `/` filters
+                // it in place rather than querying the Hub.
+                let online = hub && discovery::online::is_online_path(&scope);
                 self.model_search = Some(ModelSearch {
                     query: String::new(),
                     cursor: 0,
@@ -833,6 +890,9 @@ impl App {
             KeyCode::Char('y') => self.yank_command(),
             KeyCode::Char('s') if self.focus == Pane::Model && self.online_view_active() => {
                 self.cycle_online_sort()
+            }
+            KeyCode::Char('s') if self.focus == Pane::Model && self.catalog_view_count() > 1 => {
+                self.cycle_catalog_view()
             }
             KeyCode::Char('s') => self.start_session(),
             KeyCode::Char('C') => self.start_chat(),
@@ -894,7 +954,7 @@ impl App {
                     .model_search
                     .as_ref()
                     .and_then(|s| s.result_indices.get(s.cursor))
-                    .and_then(|i| self.scanned_models.get(*i))
+                    .and_then(|i| self.catalog_source().get(*i))
                     .cloned();
                 let promote = self.model_search.as_ref().is_some_and(|search| search.online)
                     && target.as_ref().is_some_and(|model| {
@@ -949,7 +1009,7 @@ impl App {
 
     pub fn search_results(&self) -> Vec<&Model> {
         let Some(search) = &self.model_search else { return Vec::new() };
-        search.result_indices.iter().filter_map(|i| self.scanned_models.get(*i)).collect()
+        search.result_indices.iter().filter_map(|i| self.catalog_source().get(*i)).collect()
     }
 
     fn refresh_model_search(&mut self) {
@@ -981,7 +1041,7 @@ impl App {
         let query = raw_query.to_lowercase();
         let tokens: Vec<&str> = query.split_whitespace().collect();
         let mut matches: Vec<(i32, usize)> = self
-            .scanned_models
+            .catalog_source()
             .iter()
             .enumerate()
             .filter_map(|(index, m)| {
@@ -2254,6 +2314,7 @@ impl App {
             sources: &self.model_sources,
             cache_path: &self.model_cache,
             models_dir: &self.models_dir,
+            view: self.catalog_view,
         };
         self.flm_models = backend.models(&ctx);
         self.store.sync_models(&self.flm_models);
@@ -2614,18 +2675,24 @@ fn model_catalog_title(prefix: &[String], sort: discovery::online::Sort) -> Stri
 /// sources. Hovering the virtual `online` source from the runtime root enters
 /// the Hugging Face search scope; entering a flat repository row narrows the
 /// scope to its cached artifacts.
+///
+/// `hub` says whether the selected runtime's `online` group really is the
+/// Hugging Face browser. FastFlowLM uses the same group name for a fixed local
+/// catalog, and expanding its scope to `online/huggingface` would search a
+/// subtree it does not have.
 fn normalized_search_scope(
     focus: Pane,
     selected_dir: Option<&[String]>,
     catalog_prefix: &[String],
+    hub: bool,
 ) -> Vec<String> {
     if discovery::online::is_online_path(catalog_prefix) {
-        if catalog_prefix == ["online"] {
+        if hub && catalog_prefix == ["online"] {
             return vec!["online".into(), "huggingface".into()];
         }
         return catalog_prefix.to_vec();
     }
-    if selected_dir.is_some_and(discovery::online::is_online_path) {
+    if hub && selected_dir.is_some_and(discovery::online::is_online_path) {
         return vec!["online".into(), "huggingface".into()];
     }
     match focus {
@@ -3062,20 +3129,30 @@ mod tests {
     fn local_search_scope_is_the_current_directory_not_the_hovered_child() {
         let prefix = vec!["models".into(), "team".into()];
         let hovered = vec!["models".into(), "team".into(), "project".into()];
-        assert_eq!(normalized_search_scope(Pane::Model, Some(&hovered), &prefix), prefix);
-        assert!(normalized_search_scope(Pane::Runtime, Some(&hovered), &prefix).is_empty());
+        assert_eq!(normalized_search_scope(Pane::Model, Some(&hovered), &prefix, true), prefix);
+        assert!(normalized_search_scope(Pane::Runtime, Some(&hovered), &prefix, true).is_empty());
     }
 
     #[test]
     fn online_search_scope_tracks_the_flat_repository_folder() {
         let online = vec!["online".into()];
         assert_eq!(
-            normalized_search_scope(Pane::Model, Some(&online), &[]),
+            normalized_search_scope(Pane::Model, Some(&online), &[], true),
             vec!["online", "huggingface"]
         );
 
+        // FastFlowLM names its remote group `online` too, but it is a fixed
+        // local catalog — the scope must stay put rather than expanding into a
+        // Hugging Face subtree it does not have.
+        assert_eq!(
+            normalized_search_scope(Pane::Model, Some(&online), &[], false),
+            Vec::<String>::new()
+        );
+        let flm = vec!["online".into(), "reasoning".into()];
+        assert_eq!(normalized_search_scope(Pane::Model, None, &flm, false), flm);
+
         let repository = vec!["online".into(), "huggingface".into(), "unsloth/model".into()];
-        assert_eq!(normalized_search_scope(Pane::Profile, None, &repository), repository);
+        assert_eq!(normalized_search_scope(Pane::Profile, None, &repository, true), repository);
     }
 
     #[test]

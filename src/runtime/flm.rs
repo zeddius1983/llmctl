@@ -38,6 +38,13 @@ const CHAT_GROUP: &str = "chat";
 /// per-model profile directories.
 const CATALOG_ROOT: &str = "fastflowlm";
 
+/// How the catalog is arranged, cycled with `s`. Hugging Face sort orders mean
+/// nothing here — the catalog is a fixed list, not a ranked feed — so the choice
+/// on offer is how to group it.
+pub static VIEWS: &[&str] = &["Categories", "Flat"];
+/// Index into [`VIEWS`] for the ungrouped arrangement.
+const FLAT_VIEW: usize = 1;
+
 use OptionKind::{Enum, Int, Str};
 
 /// FastFlowLM's option set, from `flm help` (v0.9.45).
@@ -265,8 +272,13 @@ impl RuntimeBackend for FlmBackend {
     /// One `Model` per (group, tag) pair. A model carrying three labels is
     /// emitted three times so it appears under each; they share a
     /// `profile_key`, so they are one model as far as profiles are concerned.
+    fn catalog_views(&self) -> &'static [&'static str] {
+        VIEWS
+    }
+
     fn models(&self, ctx: &CatalogCtx) -> Vec<Model> {
         let root = model_root();
+        let flat = ctx.view == FLAT_VIEW;
         let mut models = Vec::new();
         for entry in self.catalog() {
             // One managed leaf per tag, however many groups the model shows up
@@ -279,7 +291,7 @@ impl RuntimeBackend for FlmBackend {
             if let Err(err) = std::fs::create_dir_all(leaf.join("profiles")) {
                 debug!(%err, path = %leaf.display(), "could not create the managed profile directory");
             }
-            for group in entry.groups() {
+            for group in entry.groups(flat) {
                 models.push(entry.to_model(&group, &root, ctx.models_dir));
             }
         }
@@ -580,13 +592,18 @@ struct Details {
 }
 
 impl Entry {
-    /// Where this model sits in the browser: `local` or `online`, then each
-    /// capability label it carries (or `chat` if it has none).
+    /// Where this model sits in the browser: `local` or `online`, then — in the
+    /// Categories view — each capability label it carries (`chat` if it has
+    /// none).
     ///
-    /// A model with three labels yields three positions. They share a tag, and
-    /// identity is the tag — see [`Model::profile_key`].
-    fn groups(&self) -> Vec<Vec<String>> {
+    /// Under Categories a model with three labels yields three positions; under
+    /// Flat it yields exactly one. Either way they share a tag, and identity is
+    /// the tag — see [`Model::profile_key`].
+    fn groups(&self, flat: bool) -> Vec<Vec<String>> {
         let top = if self.installed { LOCAL_GROUP } else { ONLINE_GROUP };
+        if flat {
+            return vec![vec![top.to_string()]];
+        }
         let labels: Vec<&str> = if self.label.is_empty() {
             vec![CHAT_GROUP]
         } else {
@@ -852,9 +869,29 @@ mod tests {
     fn local_and_online_split_by_installed_then_group_by_label() {
         let entries = entries();
         // Installed, so `local`, once per capability label.
-        assert_eq!(entries[0].groups(), [["local", "reasoning"], ["local", "tool-calling"]]);
+        assert_eq!(entries[0].groups(false), [["local", "reasoning"], ["local", "tool-calling"]]);
         // Not installed and unlabeled: `online`, under the chat fallback.
-        assert_eq!(entries[1].groups(), [["online", "chat"]]);
+        assert_eq!(entries[1].groups(false), [["online", "chat"]]);
+    }
+
+    #[test]
+    fn the_flat_view_places_each_model_exactly_once() {
+        let entries = entries();
+        // Categories fans a multi-label model out across its labels...
+        assert_eq!(entries[0].groups(false).len(), 2);
+        // ...while Flat lists it once, directly under local/online.
+        assert_eq!(entries[0].groups(true), [["local"]]);
+        assert_eq!(entries[1].groups(true), [["online"]]);
+
+        let flat = entries[0].to_model(
+            &entries[0].groups(true)[0],
+            Path::new("/models"),
+            Path::new("/cfg"),
+        );
+        assert_eq!(flat.catalog_path, ["local", "qwen3:4b"]);
+        // The arrangement is a view: identity and profiles are unaffected.
+        assert_eq!(flat.profile_key(), "flm:qwen3:4b");
+        assert_eq!(flat.catalog_dir, Path::new("/cfg/fastflowlm/qwen3_4b"));
     }
 
     #[test]
@@ -876,7 +913,7 @@ mod tests {
     fn a_multi_group_model_keeps_one_profile_identity() {
         let entry = &entries()[0];
         let models: Vec<Model> = entry
-            .groups()
+            .groups(false)
             .iter()
             .map(|g| entry.to_model(g, Path::new("/models"), Path::new("/cfg")))
             .collect();
@@ -1020,7 +1057,7 @@ mod tests {
         // Every entry must yield a tag and at least one browser group.
         for entry in &catalog {
             assert!(entry.name.contains(':'), "{} is not a name:size tag", entry.name);
-            assert!(!entry.groups().is_empty(), "{} landed in no group", entry.name);
+            assert!(!entry.groups(false).is_empty(), "{} landed in no group", entry.name);
         }
     }
 
@@ -1134,6 +1171,7 @@ mod tests {
             sources: &[],
             cache_path: Path::new("/nonexistent"),
             models_dir: &models_dir,
+            view: 0,
         };
         let models = backend.models(&ctx);
         assert!(!models.is_empty());
@@ -1227,6 +1265,39 @@ mod tests {
         assert_eq!(repo_dir_name(&entry.repo()), "Qwen3-4B-NPU2");
         let model = entry.to_model(&local("reasoning"), Path::new("/models"), Path::new("/cfg"));
         assert_eq!(model.path, Path::new("/models/Qwen3-4B-NPU2"));
+    }
+
+    /// The two arrangements must cover the same models: Flat lists each once,
+    /// Categories fans multi-label models across their labels.
+    #[test]
+    #[ignore = "needs a real flm install; run with --ignored --test-threads=1"]
+    fn both_catalog_views_cover_the_whole_catalog() {
+        let backend = FlmBackend::discover(&FastFlowLmConfig::default());
+        let dir = std::env::temp_dir().join(format!("llmctl-flm-views-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = |view| CatalogCtx {
+            sources: &[],
+            cache_path: Path::new("/nonexistent"),
+            models_dir: &dir,
+            view,
+        };
+
+        let tags = |models: &[Model]| -> std::collections::BTreeSet<String> {
+            models.iter().map(|m| m.flm.as_ref().unwrap().tag.clone()).collect()
+        };
+        let categories = backend.models(&ctx(0));
+        let flat = backend.models(&ctx(FLAT_VIEW));
+
+        assert_eq!(tags(&categories), tags(&flat), "the views disagree about the catalog");
+        // Flat is one row per model; Categories repeats the multi-label ones.
+        assert_eq!(flat.len(), tags(&flat).len());
+        assert!(categories.len() > flat.len());
+        // Flat sits directly under local/online, with no capability level.
+        assert!(flat.iter().all(|m| m.catalog_path.len() == 2));
+        assert!(categories.iter().all(|m| m.catalog_path.len() == 3));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

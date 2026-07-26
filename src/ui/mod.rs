@@ -341,6 +341,8 @@ fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
             keys.push(("F5", "rescan"));
             if app.online_view_active() {
                 keys.push(("s", "sort"));
+            } else if app.catalog_view_label().is_some() {
+                keys.push(("s", "group"));
             }
             if app.download_available() {
                 keys.push(("d", "download"));
@@ -754,7 +756,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         help_row("h / ←", "back up a level"),
         help_row("g / G", "first / last item"),
         help_row("/", "search models"),
-        help_row("s", "sort online models"),
+        help_row("s", "sort online models / switch catalog grouping"),
         help_row("d", "download the selected model"),
         Line::raw(""),
         Line::from("Profiles".bold()),

@@ -399,6 +399,17 @@ recorded for `/proc` matching is the tag, since that is what appears in argv.
 *Downloads.* llmctl fetches the model's files from Hugging Face itself — see
 the amendment below.
 
+*Browsing.* `local`/`online` reuses llama.cpp's group names but not its Hugging
+Face browser, and `discovery::online::is_online_path` tests only the first path
+segment — so the runtime, not the path, decides which surface is active.
+`RuntimeBackend::supports_online_browse` gates that: `/` filters FastFlowLM's
+catalog in place rather than querying the Hub, and `s` does not offer Hub sort
+orders for a catalog that is a fixed list rather than a ranked feed. In their
+place `RuntimeBackend::catalog_views` lets a runtime offer arrangements of its
+own catalog; FastFlowLM offers Categories (grouped by capability label) and Flat
+(one row per model). An arrangement is a view only — identity stays the tag, so
+profiles are unaffected by switching.
+
 **Consequences:** FastFlowLM is listed even when absent or unusable, with the
 reason (missing binary, or an NPU stack that `flm validate` reports as not
 ready) surfaced in the status line rather than at launch time. `flm bench` is
