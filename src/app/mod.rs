@@ -2226,42 +2226,7 @@ impl App {
         if let Some(artifacts) = online_artifact_children(source, prefix) {
             return artifacts;
         }
-        use std::collections::BTreeMap;
-        let mut children: BTreeMap<String, Model> = BTreeMap::new();
-        for model in source {
-            if !model.catalog_path.starts_with(prefix) || model.catalog_path.len() <= prefix.len() {
-                continue;
-            }
-            let name = model.catalog_path[prefix.len()].clone();
-            let is_leaf = model.catalog_path.len() == prefix.len() + 1;
-            children.entry(name.clone()).or_insert_with(|| {
-                if is_leaf {
-                    model.clone()
-                } else {
-                    Model {
-                        id: String::new(),
-                        name,
-                        path: PathBuf::new(),
-                        shard_paths: Vec::new(),
-                        mtp_path: None,
-                        projector_path: None,
-                        has_mtp: false,
-                        catalog_path: model.catalog_path[..=prefix.len()].to_vec(),
-                        catalog_dir: PathBuf::new(),
-                        size_bytes: 0,
-                        quantization: None,
-                        architecture: None,
-                        context_length: None,
-                        modified: None,
-                        has_chat_template: false,
-                        remote: None,
-                        flm: None,
-                        runtime: model.runtime.clone(),
-                    }
-                }
-            });
-        }
-        children.into_values().collect()
+        catalog_children_of(source, prefix)
     }
 
     /// Re-read the FastFlowLM catalog (`flm list`), which is also how a freshly
@@ -2659,6 +2624,47 @@ fn normalized_search_scope(
         Pane::Runtime => Vec::new(),
         Pane::Model | Pane::Profile | Pane::Options => catalog_prefix.to_vec(),
     }
+}
+
+/// Direct children of `prefix` in a flat model list: leaves are the models
+/// themselves, and deeper paths collapse into one synthetic folder each.
+fn catalog_children_of(source: &[Model], prefix: &[String]) -> Vec<Model> {
+    use std::collections::BTreeMap;
+    let mut children: BTreeMap<String, Model> = BTreeMap::new();
+    for model in source {
+        if !model.catalog_path.starts_with(prefix) || model.catalog_path.len() <= prefix.len() {
+            continue;
+        }
+        let name = model.catalog_path[prefix.len()].clone();
+        let is_leaf = model.catalog_path.len() == prefix.len() + 1;
+        children.entry(name.clone()).or_insert_with(|| {
+            if is_leaf {
+                model.clone()
+            } else {
+                Model {
+                    id: String::new(),
+                    name,
+                    path: PathBuf::new(),
+                    shard_paths: Vec::new(),
+                    mtp_path: None,
+                    projector_path: None,
+                    has_mtp: false,
+                    catalog_path: model.catalog_path[..=prefix.len()].to_vec(),
+                    catalog_dir: PathBuf::new(),
+                    size_bytes: 0,
+                    quantization: None,
+                    architecture: None,
+                    context_length: None,
+                    modified: None,
+                    has_chat_template: false,
+                    remote: None,
+                    flm: None,
+                    runtime: model.runtime.clone(),
+                }
+            }
+        });
+    }
+    children.into_values().collect()
 }
 
 /// Rank `models` against a search query, returning indices **into `models`**.
@@ -3166,6 +3172,81 @@ mod tests {
             max_prefill_len: None,
         });
         model
+    }
+
+    /// Drives the real app: selecting FastFlowLM and pressing `s` must leave a
+    /// populated Model pane in every arrangement, not an empty one.
+    #[test]
+    #[ignore = "needs a real flm install; run with --ignored --test-threads=1"]
+    fn cycling_the_catalog_view_keeps_the_model_pane_populated() {
+        let stamp =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("llmctl-view-{stamp}"));
+        let paths = Paths {
+            config_file: root.join("config.toml"),
+            models_dir: root.join("models"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+            sessions_dir: root.join("sessions"),
+        };
+        paths.ensure_dirs().unwrap();
+
+        let mut app = App::new(Config::default(), paths);
+        let flm = app
+            .runtimes
+            .items
+            .iter()
+            .position(|b| !b.supports_online_browse())
+            .expect("FastFlowLM backend");
+        app.runtimes.state.select(Some(flm));
+        app.rebuild_below(Pane::Runtime);
+        app.focus = Pane::Model;
+
+        assert_eq!(app.catalog_view_label(), Some("Categories"));
+        let categories = app.models.items.len();
+        assert!(categories > 0, "Categories view showed nothing");
+
+        app.on_key(KeyEvent::from(KeyCode::Char('s')));
+
+        assert_eq!(app.catalog_view_label(), Some("Flat"));
+        assert!(!app.models.items.is_empty(), "Flat view showed nothing");
+        // Both arrangements start at the same local/online groups.
+        assert_eq!(app.models.items.len(), categories);
+
+        // And drilling into a group reaches the models themselves.
+        app.enter();
+        assert!(app.models.items.iter().any(|m| m.is_model()), "no models under the group");
+
+        // F5 re-reads the catalog through the same subprocess path, so it fails
+        // the same way if the SIGCHLD disposition is not handled.
+        app.refresh_models();
+        assert!(!app.flm_models.is_empty(), "F5 emptied the FastFlowLM catalog");
+        assert!(!app.models.items.is_empty(), "F5 emptied the model pane");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn flat_catalog_walks_from_the_group_straight_to_the_models() {
+        let mut flat = flm_catalog_entry("qwen3:4b", "reasoning");
+        flat.catalog_path = vec!["online".into(), "qwen3:4b".into()];
+        let mut other = flm_catalog_entry("gpt-oss:20b", "chat");
+        other.catalog_path = vec!["online".into(), "gpt-oss:20b".into()];
+        let mut local = flm_catalog_entry("qwen3:0.6b", "chat");
+        local.catalog_path = vec!["local".into(), "qwen3:0.6b".into()];
+        let source = vec![flat, other, local];
+
+        // Top level: the two groups, as folders.
+        let top = catalog_children_of(&source, &[]);
+        assert_eq!(top.iter().map(|m| m.name.clone()).collect::<Vec<_>>(), ["local", "online"]);
+        assert!(top.iter().all(|m| m.is_catalog_dir()));
+
+        // Entering a group lists the models directly — no capability level.
+        let online = catalog_children_of(&source, &["online".into()]);
+        assert_eq!(online.len(), 2);
+        assert!(online.iter().all(|m| m.is_model()), "flat entries must be leaves");
+        assert!(online.iter().any(|m| m.name == "qwen3:4b"));
     }
 
     /// Regression: search ranked one runtime's catalog and then resolved the

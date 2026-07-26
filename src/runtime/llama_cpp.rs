@@ -13,6 +13,7 @@ use crate::profiles::templates::Template;
 use crate::runtime::{CatalogCtx, LaunchContext, RuntimeBackend};
 use crate::session::command::Command;
 use crate::session::record::{DownloadBlob, DownloadRecord};
+use crate::session::supervisor;
 
 use OptionKind::{Enum, Float, Int, Str};
 
@@ -684,7 +685,7 @@ fn cli_binary(server: &str) -> Option<String> {
 /// Run `--version` and return a short version string. llama.cpp prints version
 /// info to stderr, so both streams are considered.
 fn query_version(path: &Path) -> Option<String> {
-    let output = ProcCommand::new(path).arg("--version").output().ok()?;
+    let output = supervisor::output(ProcCommand::new(path).arg("--version")).ok()?;
     let text = if output.stderr.is_empty() { &output.stdout } else { &output.stderr };
     let text = String::from_utf8_lossy(text);
     text.lines().map(str::trim).find(|l| !l.is_empty()).map(|l| l.to_string())
@@ -694,7 +695,7 @@ fn query_version(path: &Path) -> Option<String> {
 /// `ROCm0: AMD Radeon ...`. Both streams are considered because llama.cpp's
 /// informational output has moved between stdout and stderr across versions.
 fn query_devices(path: &Path) -> Vec<String> {
-    let Ok(output) = ProcCommand::new(path).arg("--list-devices").output() else {
+    let Ok(output) = supervisor::output(ProcCommand::new(path).arg("--list-devices")) else {
         return Vec::new();
     };
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -733,7 +734,7 @@ fn parse_devices(output: &str) -> Vec<String> {
 
 /// Capture `--help` to `<cache_dir>/llama-server.help.txt`.
 fn cache_help(path: &Path, cache_dir: &Path) -> std::io::Result<()> {
-    let output = ProcCommand::new(path).arg("--help").output()?;
+    let output = supervisor::output(ProcCommand::new(path).arg("--help"))?;
     let body = if output.stdout.is_empty() { output.stderr } else { output.stdout };
     std::fs::write(cache_dir.join(HELP_CACHE), body)
 }

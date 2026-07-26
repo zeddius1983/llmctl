@@ -49,6 +49,30 @@ impl DetachedSupervisor {
     }
 }
 
+/// Run `command` to completion and capture its output, whatever `SIGCHLD`
+/// disposition is currently installed.
+///
+/// [`DetachedSupervisor::new`] sets `SIGCHLD` to `SIG_IGN` so detached servers
+/// are reaped without llmctl ever waiting on them. That also makes `wait()` fail
+/// with `ECHILD`, so a plain `Command::output()` reports an error for a process
+/// that ran perfectly well — silently, if the caller treats failure as "no
+/// output". Any code that reads a subprocess's output *after* the manager exists
+/// must go through here.
+///
+/// The previous disposition is restored rather than assumed, and restoring
+/// `SIG_IGN` also reaps anything that exited during the call.
+pub fn output(command: &mut std::process::Command) -> std::io::Result<std::process::Output> {
+    // SAFETY: setting a signal disposition is async-signal-safe and has no
+    // preconditions. llmctl spawns processes only from the main thread, so
+    // there is no window where another thread relies on the disposition.
+    let previous = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
+    let result = command.output();
+    if previous != libc::SIG_ERR {
+        unsafe { libc::signal(libc::SIGCHLD, previous) };
+    }
+    result
+}
+
 impl SessionSupervisor for DetachedSupervisor {
     fn spawn(&self, spec: &LaunchSpec) -> Result<Spawned> {
         let (program, args) = spec.argv.split_first().context("empty command")?;

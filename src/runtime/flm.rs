@@ -26,6 +26,7 @@ use crate::profiles::templates::Template;
 use crate::runtime::{CatalogCtx, LaunchContext, RuntimeBackend};
 use crate::session::command::Command;
 use crate::session::record::{DownloadBlob, DownloadRecord};
+use crate::session::supervisor;
 
 pub const NAME: &str = "FastFlowLM";
 
@@ -461,8 +462,13 @@ fn strip_preamble(output: &str) -> &str {
 }
 
 /// Run `flm <args…>` and return stdout with the banner stripped.
+///
+/// Goes through [`supervisor::output`] because the catalog is re-read while
+/// llmctl is running — after the session supervisor has set `SIGCHLD` to
+/// `SIG_IGN`, which would otherwise make every one of these calls fail to reap
+/// and come back empty.
 fn run(binary: &Path, args: &[&str]) -> Option<String> {
-    let output = ProcCommand::new(binary).args(args).output().ok()?;
+    let output = supervisor::output(ProcCommand::new(binary).args(args)).ok()?;
     if !output.status.success() {
         debug!(?args, status = ?output.status, "flm invocation failed");
         return None;

@@ -110,6 +110,10 @@ legacy profile migration), `~/.cache/llmctl/` (models.json, llama-server.help.tx
   `SIG_IGN` process-wide, which makes any concurrent `Command::output()` fail to
   reap its child. The same ordering constraint is why `App::new` discovers
   runtimes before constructing the manager.
+- Reading a subprocess's output at runtime must go through
+  `session::supervisor::output`. The supervisor sets `SIGCHLD` to `SIG_IGN` so
+  detached servers self-reap, which makes a plain `Command::output()` fail to
+  `wait()` — silently, if the caller treats an error as "no output".
 - Logs go to a **file** under the state dir, never stderr (it corrupts the TUI).
 - Keep `domain/` IO-free. Discovery/process/IO lives in `discovery/`, `runtime/`,
   `profiles/`, and `session/`.
