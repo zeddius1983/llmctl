@@ -748,8 +748,10 @@ impl App {
         if count < 2 {
             return;
         }
-        // Remember the selection so the new arrangement can restore it.
-        let anchor = self.models.selected().map(|m| (m.id.clone(), m.catalog_path.clone()));
+        // Remember where we are browsing, and what is selected if it is a
+        // model, so the new arrangement can restore both.
+        let prefix = self.catalog_prefix.clone();
+        let selection = self.selected_model().map(|model| model.id.clone());
 
         self.catalog_view = (self.catalog_view + 1) % count;
         self.catalog_history.clear();
@@ -757,9 +759,7 @@ impl App {
         self.refresh_flm_models();
         self.rebuild_below(Pane::Runtime);
 
-        if let Some((id, path)) = anchor {
-            self.restore_catalog_position(&id, &path);
-        }
+        self.restore_catalog_position(selection.as_deref(), &prefix);
     }
 
     fn cycle_online_sort(&mut self) {
@@ -1079,22 +1079,38 @@ impl App {
         self.maybe_fetch_online(false);
     }
 
-    /// Re-select what the user was looking at after the catalog was rebuilt in
-    /// a different arrangement.
+    /// Put the browser back where it was after the catalog was rebuilt in a
+    /// different arrangement.
     ///
-    /// A model is found by id, which is the tag and so survives regrouping. A
-    /// folder — or a model the new arrangement places elsewhere — falls back to
-    /// the deepest part of its old path that still exists, so switching keeps
-    /// you as close as the new shape allows rather than dropping you at the top.
-    fn restore_catalog_position(&mut self, id: &str, path: &[String]) {
-        if !id.is_empty() && self.jump_to_model(id) {
+    /// The anchor is the directory being browsed, not the highlighted row: a
+    /// row may be a folder that the new arrangement does not have, and landing
+    /// *on* a folder is not the same as being *inside* one. Browsing
+    /// `online ▸ chat` in Categories should leave you inside `online` in Flat,
+    /// looking at models — not back at the group list with `online` highlighted.
+    ///
+    /// A selected model takes precedence, since it is identified by tag and so
+    /// survives regrouping wherever it lands.
+    fn restore_catalog_position(&mut self, selection: Option<&str>, prefix: &[String]) {
+        if let Some(id) = selection
+            && self.jump_to_model(id)
+        {
             return;
         }
-        for depth in (1..path.len()).rev() {
-            if let Some(route) = self.catalog_route(&path[..depth]) {
-                self.apply_catalog_route(route);
-                return;
+        self.descend_to_prefix(prefix);
+    }
+
+    /// Move the browser inside `prefix`, or the deepest part of it that still
+    /// exists, listing that directory's contents.
+    fn descend_to_prefix(&mut self, prefix: &[String]) {
+        for depth in (1..=prefix.len()).rev() {
+            let Some(route) = self.catalog_route(&prefix[..depth]) else { continue };
+            self.apply_catalog_route(route);
+            // `catalog_route` lands *on* the directory; step into it so the
+            // pane shows its contents.
+            if self.models.selected().is_some_and(|model| model.is_catalog_dir()) {
+                self.enter();
             }
+            return;
         }
     }
 
@@ -3289,6 +3305,61 @@ mod tests {
         app.refresh_models();
         assert!(!app.flm_models.is_empty(), "F5 emptied the FastFlowLM catalog");
         assert!(!app.models.items.is_empty(), "F5 emptied the model pane");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Browsing a capability folder in Categories and switching to Flat must
+    /// land inside the group, looking at models — not back at the group list.
+    #[test]
+    #[ignore = "needs a real flm install; run with --ignored --test-threads=1"]
+    fn switching_arrangement_from_a_capability_folder_lands_on_models() {
+        let stamp =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("llmctl-view-folder-{stamp}"));
+        let paths = Paths {
+            config_file: root.join("config.toml"),
+            models_dir: root.join("models"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+            sessions_dir: root.join("sessions"),
+        };
+        paths.ensure_dirs().unwrap();
+
+        let mut app = App::new(Config::default(), paths);
+        let flm = app.runtimes.items.iter().position(|b| !b.supports_online_browse()).unwrap();
+        app.runtimes.state.select(Some(flm));
+        app.rebuild_below(Pane::Runtime);
+        app.focus = Pane::Model;
+        assert_eq!(app.catalog_view_label(), Some("Categories"));
+
+        // Enter `online`, then the `chat` capability folder inside it.
+        let online = app.models.items.iter().position(|m| m.name == "online").unwrap();
+        app.models.state.select(Some(online));
+        app.rebuild_below(Pane::Model);
+        app.enter();
+        let chat = app.models.items.iter().position(|m| m.name == "chat").unwrap();
+        app.models.state.select(Some(chat));
+        app.rebuild_below(Pane::Model);
+        app.enter();
+        assert_eq!(app.catalog_prefix, ["online", "chat"]);
+
+        // Deselect, so the anchor is the directory rather than a model.
+        app.models.state.select(None);
+        app.rebuild_below(Pane::Model);
+        assert!(app.selected_model().is_none());
+
+        app.on_key(KeyEvent::from(KeyCode::Char('s')));
+
+        assert_eq!(app.catalog_view_label(), Some("Flat"));
+        // Inside `online`, showing models — not back at the group list.
+        assert_eq!(app.catalog_prefix, ["online"]);
+        assert!(
+            app.models.items.iter().all(|m| m.is_model()),
+            "expected the flat model list, got folders"
+        );
+        assert!(app.models.items.len() > 1);
 
         let _ = std::fs::remove_dir_all(&root);
     }
