@@ -1038,59 +1038,19 @@ impl App {
         scope: &[String],
         online_only: bool,
     ) -> Vec<usize> {
-        let query = raw_query.to_lowercase();
-        let tokens: Vec<&str> = query.split_whitespace().collect();
-        let mut matches: Vec<(i32, usize)> = self
-            .catalog_source()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, m)| {
-                if !catalog_entry_in_search_scope(
-                    &m.catalog_path,
-                    m.remote.is_some(),
-                    scope,
-                    online_only,
-                ) {
-                    return None;
-                }
-                let artifact = m.name.to_lowercase();
-                let path = m.catalog_path.join(" ").to_lowercase();
-                if !tokens.iter().all(|t| artifact.contains(t) || path.contains(t)) {
-                    return None;
-                }
-                let mut score = 0;
-                if artifact == query || artifact.trim_end_matches(".gguf") == query {
-                    score += 1000;
-                } else if artifact.starts_with(&query) {
-                    score += 500;
-                }
-                score += tokens.iter().filter(|t| artifact.contains(**t)).count() as i32 * 100;
-                Some((score, index))
-            })
-            .collect();
-        matches.sort_by(|(sa, a), (sb, b)| {
-            sb.cmp(sa).then_with(|| {
-                self.scanned_models[*a].catalog_path.cmp(&self.scanned_models[*b].catalog_path)
-            })
-        });
-        matches.into_iter().map(|(_, index)| index).collect()
+        rank_models(self.catalog_source(), raw_query, scope, online_only)
     }
 
+    /// Navigate to a model found by search, within the selected runtime.
     fn jump_to_model(&mut self, id: &str) {
         let Some(path) =
-            self.scanned_models.iter().find(|m| m.id == id).map(|m| m.catalog_path.clone())
+            self.catalog_source().iter().find(|m| m.id == id).map(|m| m.catalog_path.clone())
         else {
             return;
         };
         let Some(route) = self.catalog_route(&path) else { return };
-        let Some(runtime) =
-            self.runtimes.items.iter().position(|backend| backend.supports_online_browse())
-        else {
-            return;
-        };
 
-        // Commit only after the complete route and compatible runtime exist.
-        self.runtimes.state.select(Some(runtime));
+        // Commit only once the complete route exists.
         self.focus = Pane::Model;
         self.catalog_prefix = route.prefix;
         self.catalog_history = route.history;
@@ -2701,6 +2661,54 @@ fn normalized_search_scope(
     }
 }
 
+/// Rank `models` against a search query, returning indices **into `models`**.
+///
+/// Taking the slice rather than reading it from `App` is deliberate: the
+/// returned indices are only meaningful against the list they came from, and
+/// llmctl has more than one (llama.cpp's scanned catalog and FastFlowLM's).
+/// Ranking against one list and resolving against another panicked; a single
+/// slice parameter makes that mismatch unrepresentable.
+fn rank_models(
+    models: &[Model],
+    raw_query: &str,
+    scope: &[String],
+    online_only: bool,
+) -> Vec<usize> {
+    let query = raw_query.to_lowercase();
+    let tokens: Vec<&str> = query.split_whitespace().collect();
+    let mut matches: Vec<(i32, usize)> = models
+        .iter()
+        .enumerate()
+        .filter_map(|(index, m)| {
+            if !catalog_entry_in_search_scope(
+                &m.catalog_path,
+                m.remote.is_some(),
+                scope,
+                online_only,
+            ) {
+                return None;
+            }
+            let artifact = m.name.to_lowercase();
+            let path = m.catalog_path.join(" ").to_lowercase();
+            if !tokens.iter().all(|t| artifact.contains(t) || path.contains(t)) {
+                return None;
+            }
+            let mut score = 0;
+            if artifact == query || artifact.trim_end_matches(".gguf") == query {
+                score += 1000;
+            } else if artifact.starts_with(&query) {
+                score += 500;
+            }
+            score += tokens.iter().filter(|t| artifact.contains(**t)).count() as i32 * 100;
+            Some((score, index))
+        })
+        .collect();
+    matches.sort_by(|(sa, a), (sb, b)| {
+        sb.cmp(sa).then_with(|| models[*a].catalog_path.cmp(&models[*b].catalog_path))
+    });
+    matches.into_iter().map(|(_, index)| index).collect()
+}
+
 fn catalog_entry_in_search_scope(
     catalog_path: &[String],
     remote: bool,
@@ -3123,6 +3131,65 @@ mod tests {
     fn device_hotkeys_stay_at_default_when_no_devices_are_discovered() {
         assert_eq!(cycle_device(&[], "default", 1), "default");
         assert_eq!(cycle_device(&[], "stale-device", -1), "default");
+    }
+
+    fn flm_catalog_entry(tag: &str, label: &str) -> Model {
+        let mut model = crate::domain::Model {
+            id: format!("flm:{tag}"),
+            name: tag.into(),
+            path: PathBuf::new(),
+            shard_paths: Vec::new(),
+            mtp_path: None,
+            projector_path: None,
+            has_mtp: false,
+            catalog_path: vec!["online".into(), label.into(), tag.into()],
+            catalog_dir: PathBuf::new(),
+            size_bytes: 0,
+            quantization: None,
+            architecture: None,
+            context_length: None,
+            modified: None,
+            has_chat_template: true,
+            remote: None,
+            flm: None,
+            runtime: crate::runtime::flm::NAME.into(),
+        };
+        model.flm = Some(crate::domain::FlmModel {
+            tag: tag.into(),
+            installed: false,
+            repo: format!("FastFlowLM/{tag}"),
+            revision: "main".into(),
+            files: vec!["model.q4nx".into()],
+            labels: vec![label.into()],
+            vlm: false,
+            asr: false,
+            max_prefill_len: None,
+        });
+        model
+    }
+
+    /// Regression: search ranked one runtime's catalog and then resolved the
+    /// resulting indices against another, panicking with an out-of-bounds index
+    /// as soon as the ranked list was the longer of the two.
+    #[test]
+    fn search_indices_address_the_list_they_were_ranked_against() {
+        // A FastFlowLM catalog that is longer than the llama.cpp one, which is
+        // what turned the mismatch into a panic rather than a wrong result.
+        let flm: Vec<Model> =
+            (0..54).map(|i| flm_catalog_entry(&format!("qwen3:{i}b"), "reasoning")).collect();
+
+        let scope = vec!["online".into(), "reasoning".into()];
+        let ranked = rank_models(&flm, "qwen3", &scope, false);
+        assert!(!ranked.is_empty());
+        // Every index must address the slice that was ranked.
+        for index in &ranked {
+            assert!(*index < flm.len(), "index {index} escapes a {}-entry list", flm.len());
+            assert_eq!(flm[*index].runtime, crate::runtime::flm::NAME);
+        }
+
+        // A FastFlowLM entry has no `remote`, so a Hub-scoped search must not
+        // return it — that is what keeps `/` from querying Hugging Face here.
+        assert!(rank_models(&flm, "qwen3", &scope, true).is_empty());
     }
 
     #[test]
