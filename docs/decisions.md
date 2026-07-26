@@ -396,6 +396,28 @@ and to re-acquire the server process by command line. Readiness is `GET
 /v1/models` returning 200; FastFlowLM has no `/health`. The process token
 recorded for `/proc` matching is the tag, since that is what appears in argv.
 
+*Exclusivity.* The XDNA driver grants one hardware context at a time. A second
+`flm serve` (or `flm run`) spawns happily, gets as far as loading the model, and
+dies with `DRM_IOCTL_AMDXDNA_CREATE_HWCTX IOCTL failed (err=-22)`, leaving a
+crashed session behind. `RuntimeBackend::single_session` lets a runtime declare
+that, and llmctl refuses the second start with the name of the session already
+holding the device. This is deliberately narrow: how many servers to run is
+normally the user's call — two llama.cpp servers that overcommit VRAM still
+start, and may be exactly what was wanted — so the guard is only for hardware
+that admits one client and where the second launch *cannot* work. It gates
+starting a model, not building its command, so `y` still previews and copies the
+launch line while a session is up.
+
+Restart is the same collision with the user on the right side of it, so it is
+handled by waiting rather than refusing. `SessionManager::restart` signals the
+old process and records a `PendingRestart`; `poll_restarts`, driven from the
+input loop, spawns the replacement only once that process is actually gone,
+escalating to SIGKILL after five seconds. The wait is deferred rather than a
+blocking loop because llmctl has no async runtime (ADR-007) and a synchronous
+wait would freeze the TUI for the whole of a large model's teardown. This also
+fixes a smaller pre-existing race for every runtime: respawning while the old
+server still held its socket could push a restart onto a different port.
+
 *Downloads.* llmctl fetches the model's files from Hugging Face itself — see
 the amendment below.
 

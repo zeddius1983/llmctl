@@ -193,7 +193,15 @@ on `C`; `/` filtering the catalog in place and `s` switching between the
 Categories and Flat arrangements. `flm
 validate` gates launching and explains an unready NPU stack in the status line.
 Sessions survive `flm` being a launcher wrapper (a distrobox entry point, for
-instance) via the existing `/proc` re-acquisition.
+instance) via the existing `/proc` re-acquisition. Because the XDNA driver
+grants one hardware context at a time, `RuntimeBackend::single_session` lets a
+runtime declare itself exclusive; a second FastFlowLM start (server or chat) is
+refused with the name of the session holding the device, instead of spawning one
+that dies during model load (ADR-012). For the same reason `R` (restart) is now
+two-phase: it signals the old process, shows the session as `Restarting`, and
+spawns the replacement from the poll loop once the old one has actually exited
+(escalating to SIGKILL after five seconds) — so the replacement inherits a free
+port and a free device rather than racing the process it replaced.
 
 ## Next (post-v0.3.1)
 

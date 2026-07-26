@@ -455,6 +455,7 @@ impl App {
             self.poll_online();
             self.poll_online_search();
             self.poll_model_download();
+            self.poll_restarts();
             if self.last_tick.elapsed() >= Duration::from_secs(1) {
                 self.tick();
             }
@@ -475,6 +476,15 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// Finish any restart whose old process has exited. Polled on the input
+    /// loop rather than the one-second tick so a restart comes back promptly.
+    fn poll_restarts(&mut self) {
+        let errors = self.sessions.poll_restarts();
+        if !errors.is_empty() {
+            self.message = Some(Message { title: "Restart failed".into(), lines: errors });
+        }
     }
 
     /// Periodic refresh: update live session status/resources, and reload the
@@ -1278,6 +1288,26 @@ impl App {
         })
     }
 
+    /// Why a second model cannot be started on `runtime` right now, as message
+    /// lines — or `None` if the runtime is happy to run several at once, or has
+    /// nothing live.
+    ///
+    /// Kept out of [`App::build_launch_request`] on purpose: this blocks
+    /// *starting* a model, not building its command, so `y` still previews and
+    /// copies the launch line while a session holds the device.
+    fn single_session_conflict(&self, runtime: &str) -> Option<Vec<String>> {
+        let backend = self.runtimes.items.iter().find(|b| b.descriptor().name == runtime)?;
+        if !backend.single_session() {
+            return None;
+        }
+        let live = self.sessions.active_for_runtime(runtime)?;
+        Some(vec![
+            format!("{runtime} can only run one model at a time."),
+            format!("{} is {}.", live.record.name, live.status_label()),
+            "Stop it in the Session Manager (x), then start this one.".into(),
+        ])
+    }
+
     /// Preview the generated command and copy it to the clipboard (`y`).
     fn yank_command(&mut self) {
         if self.focus != Pane::Profile && self.focus != Pane::Options {
@@ -1310,6 +1340,10 @@ impl App {
                 return;
             }
         };
+        if let Some(lines) = self.single_session_conflict(&req.runtime) {
+            self.message = Some(Message { title: "Cannot launch".into(), lines });
+            return;
+        }
         match self.sessions.launch(req) {
             Ok(idx) => {
                 let endpoint = self.sessions.sessions[idx].record.endpoint();
@@ -1637,6 +1671,13 @@ impl App {
             self.message = Some(Message { title: "Cannot start chat".into(), lines: vec![reason] });
             return;
         }
+        // An interactive client loads the model too, so it collides with a live
+        // server on a single-session runtime exactly as a second launch would.
+        let runtime = backend.descriptor().name.clone();
+        if let Some(lines) = self.single_session_conflict(&runtime) {
+            self.message = Some(Message { title: "Cannot start chat".into(), lines });
+            return;
+        }
         let (Some(model), Some(binary)) =
             (self.selected_model(), backend.descriptor().binary_path.as_ref())
         else {
@@ -1647,7 +1688,6 @@ impl App {
         match backend.chat_argv(&ctx) {
             Some(argv) => self.pending_chat = Some(argv),
             None => {
-                let runtime = backend.descriptor().name.clone();
                 self.message = Some(Message {
                     title: "Chat unavailable".into(),
                     lines: vec![format!("{runtime} has no interactive client on this system.")],
@@ -3360,6 +3400,67 @@ mod tests {
             "expected the flat model list, got folders"
         );
         assert!(app.models.items.len() > 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The AMD NPU takes one client at a time, so a live FastFlowLM session has
+    /// to block the next launch — while leaving llama.cpp free to run several.
+    /// Ignored by default: it spawns a stand-in server process.
+    #[test]
+    #[ignore = "spawns a real process; run with --ignored --test-threads=1"]
+    fn a_live_flm_session_blocks_a_second_launch() {
+        use crate::session::LaunchRequest;
+        use crate::session::command::Command;
+
+        let stamp =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("llmctl-exclusive-{stamp}"));
+        let paths = Paths {
+            config_file: root.join("config.toml"),
+            models_dir: root.join("models"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+            sessions_dir: root.join("sessions"),
+        };
+        paths.ensure_dirs().unwrap();
+
+        let mut app = App::new(Config::default(), paths);
+        let flm = crate::runtime::flm::NAME;
+        assert!(app.single_session_conflict(flm).is_none(), "nothing running yet");
+
+        // A stand-in for `flm serve`: long-lived, and never answering /health,
+        // so the session stays non-terminal for the duration of the test.
+        let req = LaunchRequest {
+            runtime: flm.into(),
+            model: "qwen3:0.6b".into(),
+            model_path: "qwen3:0.6b".into(),
+            command: Command { argv: vec!["sleep".into(), "30".into()] },
+            health_path: "/v1/models".into(),
+            download: None,
+            profile: "Default".into(),
+            host: "127.0.0.1".into(),
+            port: 52625,
+        };
+        app.sessions.launch(req).expect("launch stand-in");
+
+        let lines = app.single_session_conflict(flm).expect("a live flm session must block");
+        assert!(lines[0].contains("one model at a time"), "{lines:?}");
+        assert!(lines[1].contains("qwen3"), "the blocking session is named: {lines:?}");
+        // llama.cpp shares no such constraint.
+        assert!(app.single_session_conflict("llama.cpp").is_none());
+
+        // Once it is gone, the guard lifts.
+        app.sessions.stop(0).expect("stop");
+        for _ in 0..50 {
+            app.sessions.refresh();
+            if app.single_session_conflict(flm).is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(app.single_session_conflict(flm).is_none(), "guard stuck after the session ended");
 
         let _ = std::fs::remove_dir_all(&root);
     }

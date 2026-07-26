@@ -408,6 +408,14 @@ impl RuntimeBackend for FlmBackend {
         (!blobs.is_empty()).then_some(DownloadRecord { blobs })
     }
 
+    /// The XDNA driver hands out one hardware context at a time. A second
+    /// `flm serve`/`flm run` starts, gets as far as loading the model, and dies
+    /// with `DRM_IOCTL_AMDXDNA_CREATE_HWCTX IOCTL failed (err=-22): Invalid
+    /// argument` — so llmctl declines it instead of leaving a crashed session.
+    fn single_session(&self) -> bool {
+        true
+    }
+
     fn unavailable_reason(&self) -> Option<String> {
         if self.runtime.binary_path.is_none() {
             return Some("flm binary not found on PATH".into());
@@ -871,6 +879,19 @@ mod tests {
         assert_eq!(entries[0].details.quantization_level.as_deref(), Some("Q4_1"));
     }
 
+    /// FastFlowLM is exclusive (one NPU hardware context) where llama.cpp is
+    /// not — the distinction the launch guard rests on.
+    #[test]
+    fn only_the_npu_runtime_is_single_session() {
+        let flm = FlmBackend::discover(&FastFlowLmConfig::default());
+        assert!(flm.single_session());
+        let llama = crate::runtime::LlamaCppBackend::discover(
+            &crate::config::LlamaCppConfig::default(),
+            Path::new("/nonexistent"),
+        );
+        assert!(!llama.single_session());
+    }
+
     #[test]
     fn local_and_online_split_by_installed_then_group_by_label() {
         let entries = entries();
@@ -1199,8 +1220,13 @@ mod tests {
     /// The point of replacing `flm pull`: an interrupted download must continue
     /// rather than start over. Downloads a real model, cancels partway, then
     /// resumes and checks that `flm` accepts the result.
+    ///
+    /// The fixture is whichever catalog entry is not yet installed and smallest
+    /// on disk, rather than a fixed tag: running the test *installs* its model,
+    /// so pinning one makes the test pass once and then fail on the machine that
+    /// ran it.
     #[test]
-    #[ignore = "downloads ~0.7 GB from Hugging Face; run with --ignored --test-threads=1"]
+    #[ignore = "downloads ~1 GB from Hugging Face; run with --ignored --test-threads=1"]
     fn an_interrupted_download_resumes_instead_of_restarting() {
         use std::sync::atomic::AtomicBool;
 
@@ -1208,9 +1234,17 @@ mod tests {
         let entry = backend
             .catalog()
             .into_iter()
-            .find(|e| e.name == "qwen3:0.6b")
-            .expect("qwen3:0.6b in the catalog");
-        assert!(!entry.installed, "test needs a model that is not already installed");
+            .filter(|e| !e.installed && e.footprint > 0.0 && !e.files.is_empty())
+            .min_by(|a, b| a.footprint.total_cmp(&b.footprint))
+            .expect("the catalog has no model left to download; uninstall one to run this test");
+        let tag = entry.name.clone();
+        let weights = entry
+            .files
+            .iter()
+            .find(|f| f.ends_with(".q4nx"))
+            .cloned()
+            .expect("a weights file to interrupt");
+        eprintln!("resume fixture: {tag} ({:.2} GB)", entry.footprint);
 
         let model = entry.to_model(&online("chat"), &model_root(), Path::new("/tmp"));
         let dir = model_dir(&model).unwrap();
@@ -1229,10 +1263,10 @@ mod tests {
 
         // A partial file must survive, under a name `flm` will not mistake for
         // a finished download.
-        let partial = partial_path(&dir, "model.q4nx");
+        let partial = partial_path(&dir, &weights);
         let carried = partial.metadata().expect("partial file kept").len();
         assert!(carried > 0, "nothing was kept to resume from");
-        assert!(!dir.join("model.q4nx").exists(), "an incomplete file was published");
+        assert!(!dir.join(&weights).exists(), "an incomplete file was published");
 
         // Resume: progress must start from what is already on disk, not zero.
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -1254,12 +1288,23 @@ mod tests {
         // The scratch file is gone and flm accepts the model.
         assert!(!partial.exists(), "the partial file outlived the download");
         let binary = backend.descriptor().binary_path.clone().unwrap();
-        let check = ProcCommand::new(&binary).args(["check", "qwen3:0.6b"]).output().unwrap();
+        // Via the supervisor helper: an earlier test in the same (single-threaded)
+        // run may have set SIGCHLD to SIG_IGN, which makes a bare `output()` fail
+        // to reap. See `session::supervisor::with_default_sigchld`.
+        let check =
+            crate::session::supervisor::output(ProcCommand::new(&binary).args(["check", &tag]))
+                .unwrap();
         assert!(check.status.success(), "flm check rejected the downloaded model");
         assert!(
-            backend.catalog().iter().any(|e| e.name == "qwen3:0.6b" && e.installed),
+            backend.catalog().iter().any(|e| e.name == tag && e.installed),
             "flm does not report the model as installed"
         );
+
+        // Put the machine back as it was found. Without this the test installs a
+        // model every run, and each run has to reach further down the catalog for
+        // a bigger one — this is the only directory the test created, and it was
+        // verified not-installed before it started.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

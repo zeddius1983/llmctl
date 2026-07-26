@@ -466,6 +466,7 @@ fn status_color(status: SessionStatus) -> Color {
         SessionStatus::Downloading => Color::Cyan,
         SessionStatus::Running => Color::Green,
         SessionStatus::Starting => ACCENT,
+        SessionStatus::Restarting => Color::Yellow,
         SessionStatus::Crashed => Color::Red,
         SessionStatus::Stopped => Color::DarkGray,
         SessionStatus::Unknown => Color::DarkGray,

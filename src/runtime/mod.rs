@@ -126,6 +126,17 @@ pub trait RuntimeBackend: Send + Sync {
         None
     }
 
+    /// Whether this runtime can only have one model loaded at a time, so llmctl
+    /// declines a second launch rather than spawning one that dies on load.
+    ///
+    /// How many servers to run is normally the user's call, not llmctl's: two
+    /// llama.cpp servers that between them overcommit VRAM still start, and may
+    /// well be what was wanted. This is for the narrower case where the device
+    /// admits exactly one client and a second launch *cannot* succeed.
+    fn single_session(&self) -> bool {
+        false
+    }
+
     /// Alternative arrangements of this runtime's catalog, cycled with `s` and
     /// named in the pane title. Empty when the catalog has only one shape.
     ///

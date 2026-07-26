@@ -113,7 +113,13 @@ legacy profile migration), `~/.cache/llmctl/` (models.json, llama-server.help.tx
 - Reading a subprocess's output at runtime must go through
   `session::supervisor::output`. The supervisor sets `SIGCHLD` to `SIG_IGN` so
   detached servers self-reap, which makes a plain `Command::output()` fail to
-  `wait()` — silently, if the caller treats an error as "no output".
+  `wait()` — silently, if the caller treats an error as "no output". The same
+  trap bites `Command::spawn()`, which *panics* when exec fails because it reaps
+  the failed child to read its errno; `DetachedSupervisor::spawn` wraps it in
+  `supervisor::with_default_sigchld` for that reason. Anything in std that waits
+  on a child belongs inside that helper. This applies to tests too — a
+  single-threaded `--ignored` run inherits the disposition from whichever test
+  built a `SessionManager` first.
 - Logs go to a **file** under the state dir, never stderr (it corrupts the TUI).
 - Keep `domain/` IO-free. Discovery/process/IO lives in `discovery/`, `runtime/`,
   `profiles/`, and `session/`.
