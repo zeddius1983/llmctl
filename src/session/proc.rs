@@ -50,18 +50,28 @@ pub fn find_server(binary: &str, model_path: &str, port: u16) -> Option<i32> {
     let exe = &exe[..exe.len().min(15)]; // kernel truncates comm to TASK_COMM_LEN-1
     let port = port.to_string();
     let mut best: Option<i32> = None;
+    let mut wrapped: Option<i32> = None;
     for entry in fs::read_dir("/proc").ok()?.filter_map(|e| e.ok()) {
         let Ok(name) = entry.file_name().into_string() else { continue };
         let Ok(pid) = name.parse::<i32>() else { continue };
-        if comm(pid).as_deref() != Some(exe) || !is_alive(pid) {
+        if !is_alive(pid) {
             continue;
         }
         let args = cmdline(pid);
-        if args.iter().any(|a| a == model_path) && args.iter().any(|a| *a == port) {
+        let identity = args.iter().any(|a| a == model_path) && args.iter().any(|a| *a == port);
+        if !identity {
+            continue;
+        }
+        if comm(pid).as_deref() == Some(exe) {
             best = Some(best.map_or(pid, |b| b.min(pid)));
+        } else if args.iter().any(|argument| argument == "serve") {
+            // A launcher may exit after creating the real server process.
+            // Exact model tag + port + serve is the runtime-neutral fallback
+            // identity.
+            wrapped = Some(wrapped.map_or(pid, |candidate| candidate.min(pid)));
         }
     }
-    best
+    best.or(wrapped)
 }
 
 /// Parent PID from `/proc/<pid>/status`, or `None` if unreadable.

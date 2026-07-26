@@ -4,12 +4,12 @@ A keyboard-driven terminal UI (TUI) for discovering, configuring, launching, and
 managing local LLM inference servers — in the style of [Yazi](https://github.com/sxyazi/yazi),
 [Lazygit](https://github.com/jesseduffield/lazygit), and `systemctl`.
 
-The goal: **never hand-type a complex `llama-server` command again.** Browse your
-GGUF models, tune launch options with live validation, start detached servers,
-and watch them from a built-in session manager.
+The goal: **never hand-type a complex local-inference command again.** Browse
+runtime-compatible models, tune launch options with live validation, start
+detached servers, and watch them from a built-in session manager.
 
-> **Status:** v0.3.1. Targets **llama.cpp + GGUF on Linux**. Other runtimes
-> (vLLM, Ollama, …) are navigable stubs / future work.
+> **Status:** v0.3.1 plus unreleased FastFlowLM support. Targets **Linux** with
+> llama.cpp/GGUF and AMD Ryzen AI NPU inference through FastFlowLM.
 
 ## Features
 
@@ -32,6 +32,10 @@ and watch them from a built-in session manager.
   and their artifacts; MTP/projector companions remain attributes of their base
   model, and starting a remote model lets llama.cpp download it into the standard
   Hugging Face cache.
+- **FastFlowLM catalogue** — reads the authoritative `flm list --json`
+  catalogue, shows installed and available NPU models, checks minimum FLM
+  versions, and delegates first-use downloads to `flm serve`/`flm run`.
+  Arbitrary Hugging Face artifacts are never offered to this runtime.
 - **Profiles & options** — built-in, read-only templates (Default, Chat, Coding,
   Long Context, Server) that fork into per-model editable instances on first edit.
   Edit options with live validation, cycle enums/flags in place, and adjust
@@ -56,6 +60,9 @@ and watch them from a built-in session manager.
 - **[llama.cpp](https://github.com/ggml-org/llama.cpp)** — `llama-server` must be
   on your `$PATH` (or set its path in the config). `llama-cli` next to it enables
   the in-terminal chat shortcut (`C`).
+- **FastFlowLM** (optional) — `flm` must be on `$PATH` or configured with an
+  absolute path. LLM/VLM catalogue entries are supported initially;
+  embedding-only and ASR-only entries remain visible but cannot yet be launched.
 - **Rust** (edition 2024) to build — install via [rustup](https://rustup.rs).
 
 ## Install
@@ -102,7 +109,7 @@ overlay.
 | `g` / `G` | First / last item |
 | `/` | Search recursively in the current catalog directory |
 | `s` | Sort online models: Trending / Most likes / Most downloads |
-| `d` | Download the selected online GGUF file |
+| `d` | Download the selected online GGUF artifact |
 | **Profiles** | |
 | `a` | Create profile |
 | `r` | Rename (custom profiles only) |
@@ -115,8 +122,8 @@ overlay.
 | `Home` / `End` | Default·min / max |
 | **Launch & sessions** | |
 | `s` | Start server |
-| `C` | Chat in terminal (`llama-cli`) |
-| `b` | Benchmark selected model with its profile device and GPU layers (when available) |
+| `C` | Chat in terminal (`llama-cli` or `flm run`) |
+| `b` | Benchmark the selected model with its runtime's benchmark command |
 | `y` | Yank launch command |
 | `t` | Session manager |
 | `x` / `K` | Stop / kill a server; cancel a download |
@@ -161,6 +168,9 @@ layout = "directory" # auto, directory, flat, lm-studio, or hugging-face
 # Binary name (resolved on $PATH) or an absolute path.
 binary = "llama-server"
 
+[runtime.fastflowlm]
+binary = "flm"
+
 [defaults]
 host = "127.0.0.1"
 port = 8000
@@ -180,6 +190,26 @@ The generated file explicitly lists the standard locations so they are easy to
 inspect and extend. Older `[models].paths` arrays remain supported, but named
 `[[models.sources]]` entries provide stable catalog names and layout control.
 Your `$HOME` is never scanned wholesale.
+
+### FastFlowLM models
+
+Select `FastFlowLM` to browse its models directly. Installed entries are marked
+`✓`; available entries are marked `⇣`. `F5` reruns
+`flm list --json --quiet`, and `/` searches only that catalogue. llmctl does not
+offer a separate FLM pre-download action because FLM cannot resume partial
+pulls; `d` remains reserved for managed online GGUF downloads.
+
+Starting an available model does not require a separate pull: `s` launches
+`flm serve <tag>` and `C` launches `flm run <tag>`, allowing FastFlowLM to
+download the catalogue model on first use. During a server launch, llmctl
+derives aggregate progress from FLM's captured output and shows
+`Downloading (N%)` before model loading begins.
+
+FastFlowLM profiles expose only supported FLM launch flags: context length,
+NPU power mode, prefill chunk length, optional vision resize, host/port, queue,
+socket, and CORS. `s` runs `flm serve`, `C` runs `flm run`, and `b` runs
+`flm bench`. Server readiness uses `GET /v1/models`; only one FastFlowLM LLM
+session may be active because the NPU runtime keeps one loaded model per type.
 
 ### Online models
 

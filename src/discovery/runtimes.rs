@@ -7,7 +7,7 @@ use std::process::Command;
 use tracing::{debug, warn};
 
 use crate::config::LlamaCppConfig;
-use crate::domain::Runtime;
+use crate::domain::{Runtime, RuntimeId};
 
 /// Discover the llama.cpp runtime from configuration.
 pub fn discover_llama_cpp(cfg: &LlamaCppConfig, cache_dir: &Path) -> Runtime {
@@ -25,10 +25,16 @@ pub fn discover_llama_cpp(cfg: &LlamaCppConfig, cache_dir: &Path) -> Runtime {
     }
 
     Runtime {
+        id: RuntimeId::LlamaCpp,
         name: "llama.cpp".into(),
         description: "GGUF inference via llama-server".into(),
         version,
+        command: binary_path
+            .as_ref()
+            .map(|path| vec![path.display().to_string()])
+            .unwrap_or_default(),
         binary_path,
+        default_port: None,
         bench_path,
         formats: vec!["GGUF".into()],
         devices,
@@ -37,7 +43,7 @@ pub fn discover_llama_cpp(cfg: &LlamaCppConfig, cache_dir: &Path) -> Runtime {
 
 /// Resolve a binary to an absolute path: honor an explicit path, else search
 /// `$PATH`.
-fn resolve_binary(binary: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_binary(binary: &str) -> Option<PathBuf> {
     let candidate = Path::new(binary);
     if candidate.is_absolute() || binary.contains('/') {
         return candidate.exists().then(|| candidate.to_path_buf());

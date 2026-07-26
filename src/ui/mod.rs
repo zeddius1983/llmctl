@@ -426,10 +426,15 @@ fn model_artifact_columns(model: &crate::domain::Model) -> Option<(String, Strin
         return None;
     }
     let quantization = model.quantization.as_deref().unwrap_or("-");
-    Some((
-        format!("{quantization:<12}{:>7}  ", download_size(model.size_bytes)),
-        model.display_label().into(),
-    ))
+    let filename = if let Some(flm) = &model.fastflow {
+        format!("{} {}", if flm.installed { "✓" } else { "⇣" }, model.display_label())
+    } else {
+        model.display_label().into()
+    };
+    // The longest value emitted by `download_size` is eight columns
+    // (`999.9 MB`), so reserve that width to keep filenames aligned when units
+    // change between MB, GB, and TB.
+    Some((format!("{quantization:<12}{:>8}  ", download_size(model.size_bytes)), filename))
 }
 
 fn download_size(bytes: u64) -> String {
@@ -560,10 +565,9 @@ fn render_download_list(frame: &mut Frame, area: Rect, app: &App) {
             ModelDownloadStatus::Interrupted => "  interrupted",
             ModelDownloadStatus::Failed(_) => "  failed",
         };
-        let metadata = format!(
-            " ⇣ {}{suffix}",
-            download_progress(download.downloaded_bytes, download.total_bytes, download.percent())
-        );
+        let progress =
+            download_progress(download.downloaded_bytes, download.total_bytes, download.percent());
+        let metadata = format!(" ⇣ {progress}{suffix}");
         let name = truncate_download_name(&download.model, &metadata, row_width);
         ListItem::new(Line::from(vec![
             Span::raw(name),
@@ -768,7 +772,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::raw(""),
         Line::from("Launch & sessions".bold()),
         help_row("s", "start server (profile/options)"),
-        help_row("C", "chat in terminal (llama-cli)"),
+        help_row("C", "chat in terminal (runtime client)"),
         help_row("b", "benchmark selected model (llama-bench)"),
         help_row("y", "yank command"),
         help_row("t", "session manager"),
@@ -1007,14 +1011,30 @@ mod tests {
 
         assert_eq!(
             model_artifact_columns(&model).unwrap(),
-            ("Q4_K_M      20.6 GB  ".into(), "Qwen-AgentWorld-35B-A3B-UD-Q4_K_M.gguf".into())
+            ("Q4_K_M       20.6 GB  ".into(), "Qwen-AgentWorld-35B-A3B-UD-Q4_K_M.gguf".into())
         );
 
         model.remote = None;
         assert_eq!(
             model_artifact_columns(&model).unwrap(),
-            ("Q4_K_M      20.6 GB  ".into(), "Qwen-AgentWorld-35B-A3B-UD-Q4_K_M.gguf".into())
+            ("Q4_K_M       20.6 GB  ".into(), "Qwen-AgentWorld-35B-A3B-UD-Q4_K_M.gguf".into())
         );
+    }
+
+    #[test]
+    fn artifact_size_column_aligns_mb_and_gb_values() {
+        let mut model = crate::domain::stubs::vllm_models().remove(0);
+        model.catalog_path = vec![model.name.clone()];
+        model.quantization = Some("Q4_0".into());
+
+        model.size_bytes = 960_000_000;
+        let (mb, _) = model_artifact_columns(&model).unwrap();
+        model.size_bytes = 1_800_000_000;
+        let (gb, _) = model_artifact_columns(&model).unwrap();
+
+        assert_eq!(mb.chars().count(), gb.chars().count());
+        assert!(mb.ends_with("960.0 MB  "));
+        assert!(gb.ends_with("  1.8 GB  "));
     }
 
     #[test]

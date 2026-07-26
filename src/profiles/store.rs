@@ -100,8 +100,9 @@ impl ProfileStore {
             for loaded in load_model_profiles(model, &mut instances) {
                 fallback.remove(&loaded);
             }
-            for profile in super::templates::names() {
-                instances.entry(key("llama.cpp", &model.profile_key(), profile)).or_default();
+            let runtime = model_runtime(model);
+            for profile in super::template_names(runtime.0) {
+                instances.entry(key(runtime.1, &model.profile_key(), profile)).or_default();
             }
         }
 
@@ -121,8 +122,9 @@ impl ProfileStore {
             for loaded in load_model_profiles(model, &mut self.instances) {
                 self.fallback.remove(&loaded);
             }
-            for profile in super::templates::names() {
-                self.instances.entry(key("llama.cpp", &model.profile_key(), profile)).or_default();
+            let runtime = model_runtime(model);
+            for profile in super::template_names(runtime.0) {
+                self.instances.entry(key(runtime.1, &model.profile_key(), profile)).or_default();
             }
         }
         self.persist_registered();
@@ -220,7 +222,7 @@ impl ProfileStore {
         self.instances.entry(key(runtime, model, profile)).or_insert_with(|| Instance {
             values: base.clone(),
             favorite: false,
-            custom: !super::templates::is_builtin(profile),
+            custom: !super::is_builtin(runtime_id(runtime), profile),
         })
     }
 
@@ -354,7 +356,7 @@ fn load_model_profiles(model: &Model, instances: &mut BTreeMap<Key, Instance>) -
             .and_then(|bytes| serde_yaml::from_slice::<ProfileFile>(&bytes).ok())
         {
             Some(file) if file.schema == 1 => {
-                let entry = key("llama.cpp", &model.profile_key(), &file.name);
+                let entry = key(model_runtime(model).1, &model.profile_key(), &file.name);
                 instances.insert(
                     entry.clone(),
                     Instance { values: file.values, favorite: file.favorite, custom: file.custom },
@@ -365,6 +367,22 @@ fn load_model_profiles(model: &Model, instances: &mut BTreeMap<Key, Instance>) -
         }
     }
     loaded
+}
+
+fn model_runtime(model: &Model) -> (crate::domain::RuntimeId, &'static str) {
+    if model.fastflow.is_some() {
+        (crate::domain::RuntimeId::FastFlowLm, "FastFlowLM")
+    } else {
+        (crate::domain::RuntimeId::LlamaCpp, "llama.cpp")
+    }
+}
+
+fn runtime_id(runtime: &str) -> crate::domain::RuntimeId {
+    if runtime == "FastFlowLM" {
+        crate::domain::RuntimeId::FastFlowLm
+    } else {
+        crate::domain::RuntimeId::LlamaCpp
+    }
 }
 
 fn valid_catalog_dir(path: &Path) -> bool {
@@ -446,6 +464,7 @@ mod tests {
             modified: None,
             has_chat_template: false,
             remote: None,
+            fastflow: None,
         };
         let store = ProfileStore::load(legacy.clone(), &[model]);
         assert_eq!(
@@ -482,6 +501,7 @@ mod tests {
             modified: None,
             has_chat_template: false,
             remote: None,
+            fastflow: None,
         };
         let mut store = ProfileStore::load(legacy.clone(), &[model]);
         store.set_value(

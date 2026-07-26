@@ -1,6 +1,7 @@
 //! Profile/option resolution: combine the registry, built-in templates, the
 //! config defaults, and persisted instances into the lists the UI shows.
 
+pub mod fastflow;
 pub mod registry;
 pub mod store;
 pub mod templates;
@@ -8,7 +9,7 @@ pub mod templates;
 use std::collections::BTreeMap;
 
 use crate::config::Defaults;
-use crate::domain::{Model, OptionItem, Profile, Runtime};
+use crate::domain::{Model, OptionItem, Profile, Runtime, RuntimeId};
 use crate::profiles::registry::OptionKind;
 
 pub use store::ProfileStore;
@@ -27,7 +28,7 @@ pub fn effective_kind(spec: &registry::OptionSpec, model: &Model) -> OptionKind 
 /// user-created custom profiles, with favorite flags from the store.
 pub fn list_profiles(runtime: &Runtime, model: &Model, store: &ProfileStore) -> Vec<Profile> {
     let model_key = model.profile_key();
-    let mut profiles: Vec<Profile> = templates::names()
+    let mut profiles: Vec<Profile> = template_names(runtime.id)
         .map(|name| Profile {
             name: name.to_string(),
             builtin: true,
@@ -53,6 +54,9 @@ pub fn resolve_options(
     store: &ProfileStore,
     defaults: &Defaults,
 ) -> Vec<OptionItem> {
+    if runtime.id == RuntimeId::FastFlowLm {
+        return resolve_fastflow_options(runtime, model, profile, store, defaults);
+    }
     let model_key = model.profile_key();
     let instance = store.get(&runtime.name, &model_key, &profile.name);
     let template = templates::find(&profile.name);
@@ -79,6 +83,113 @@ pub fn resolve_options(
             }
         })
         .collect()
+}
+
+fn resolve_fastflow_options(
+    runtime: &Runtime,
+    model: &Model,
+    profile: &Profile,
+    store: &ProfileStore,
+    defaults: &Defaults,
+) -> Vec<OptionItem> {
+    let model_key = model.profile_key();
+    let instance = store.get(&runtime.name, &model_key, &profile.name);
+    fastflow::REGISTRY
+        .iter()
+        .filter(|spec| spec.key != "img-pre-resize" || model.supports_multimodal())
+        .map(|spec| {
+            let default = match spec.key {
+                "ctx-len" => fastflow::DEFAULT.to_string(),
+                "prefill-chunk-len" => fastflow::DEFAULT.to_string(),
+                "host" => defaults.host.clone(),
+                "port" => runtime.default_port.unwrap_or(52625).to_string(),
+                _ => fastflow::omit_token(spec.key).unwrap_or(spec.default).to_string(),
+            };
+            let value = instance
+                .and_then(|stored| stored.values.get(spec.key).cloned())
+                .or_else(|| fastflow::override_value(&profile.name, spec.key))
+                .unwrap_or_else(|| default.clone());
+            OptionItem {
+                key: spec.key.to_string(),
+                value,
+                default,
+                range: effective_kind_for(runtime.id, spec, model).range_label(),
+                cli: spec.cli.to_string(),
+                description: spec.description.to_string(),
+            }
+        })
+        .collect()
+}
+
+pub fn template_names(runtime: RuntimeId) -> Box<dyn Iterator<Item = &'static str>> {
+    match runtime {
+        RuntimeId::FastFlowLm => Box::new(fastflow::names()),
+        _ => Box::new(templates::names()),
+    }
+}
+
+pub fn is_builtin(runtime: RuntimeId, name: &str) -> bool {
+    match runtime {
+        RuntimeId::FastFlowLm => fastflow::is_builtin(name),
+        _ => templates::is_builtin(name),
+    }
+}
+
+pub fn spec(runtime: RuntimeId, key: &str) -> Option<&'static registry::OptionSpec> {
+    match runtime {
+        RuntimeId::FastFlowLm => fastflow::spec(key),
+        _ => registry::spec(key),
+    }
+}
+
+pub fn omit_token(runtime: RuntimeId, key: &str) -> Option<&'static str> {
+    match runtime {
+        RuntimeId::FastFlowLm => fastflow::omit_token(key),
+        _ => registry::omit_token(key),
+    }
+}
+
+pub fn uses_sentinel(runtime: RuntimeId, key: &str) -> bool {
+    if runtime == RuntimeId::FastFlowLm {
+        omit_token(runtime, key) == Some(registry::DEFAULT)
+            && !matches!(spec(runtime, key).map(|spec| spec.kind), Some(OptionKind::Enum(_)))
+    } else {
+        registry::uses_sentinel(key)
+    }
+}
+
+pub fn effective_kind_for(
+    runtime: RuntimeId,
+    spec: &registry::OptionSpec,
+    model: &Model,
+) -> OptionKind {
+    if runtime == RuntimeId::FastFlowLm && spec.key == "prefill-chunk-len" {
+        return OptionKind::Int {
+            min: Some(512),
+            max: model.fastflow.as_ref().and_then(|value| value.max_prefill_len).map(|v| v as i64),
+        };
+    }
+    effective_kind(spec, model)
+}
+
+pub fn bump(
+    runtime: RuntimeId,
+    spec: &registry::OptionSpec,
+    kind: &OptionKind,
+    current: &str,
+    dir: i32,
+) -> Option<String> {
+    if runtime != RuntimeId::FastFlowLm {
+        return spec.bump(kind, current, dir);
+    }
+    if uses_sentinel(runtime, spec.key) && current == registry::DEFAULT {
+        return Some(if dir > 0 {
+            spec.default.to_string()
+        } else {
+            registry::DEFAULT.to_string()
+        });
+    }
+    kind.adjust(current, dir, spec.step)
 }
 
 /// The fully-resolved current values for a (runtime, model, profile), including
@@ -115,6 +226,31 @@ pub fn resolved_values(
                 .unwrap_or_else(|| spec_default(spec, model, defaults));
             let value = clamp_ctx_to_model(spec.key, value, model);
             (spec.key.to_string(), normalize_legacy(spec.key, value))
+        })
+        .collect()
+}
+
+pub fn resolved_values_for(
+    runtime: &Runtime,
+    profile: &Profile,
+    model: &Model,
+    defaults: &Defaults,
+) -> BTreeMap<String, String> {
+    if runtime.id != RuntimeId::FastFlowLm {
+        return resolved_values(profile, model, defaults);
+    }
+    fastflow::REGISTRY
+        .iter()
+        .filter(|spec| spec.key != "img-pre-resize" || model.supports_multimodal())
+        .map(|spec| {
+            let default = match spec.key {
+                "ctx-len" | "prefill-chunk-len" => fastflow::DEFAULT.to_string(),
+                "host" => defaults.host.clone(),
+                "port" => runtime.default_port.unwrap_or(52625).to_string(),
+                _ => fastflow::omit_token(spec.key).unwrap_or(spec.default).to_string(),
+            };
+            let value = fastflow::override_value(&profile.name, spec.key).unwrap_or(default);
+            (spec.key.to_string(), value)
         })
         .collect()
 }
@@ -193,15 +329,34 @@ fn clamp_ctx_to_model(key: &str, value: String, model: &Model) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn runtime() -> Runtime {
         Runtime {
+            id: crate::domain::RuntimeId::LlamaCpp,
             name: "llama.cpp".into(),
             description: String::new(),
             version: None,
             binary_path: None,
+            command: Vec::new(),
+            default_port: None,
             bench_path: None,
             formats: vec![],
+            devices: vec![],
+        }
+    }
+
+    fn fastflow_runtime() -> Runtime {
+        Runtime {
+            id: RuntimeId::FastFlowLm,
+            name: "FastFlowLM".into(),
+            description: String::new(),
+            version: Some("0.9.45".into()),
+            binary_path: None,
+            command: vec!["flm".into()],
+            default_port: Some(52625),
+            bench_path: None,
+            formats: vec!["NPU2".into()],
             devices: vec![],
         }
     }
@@ -224,6 +379,7 @@ mod tests {
             modified: None,
             has_chat_template: false,
             remote: None,
+            fastflow: None,
         }
     }
 
@@ -237,6 +393,37 @@ mod tests {
 
     fn value_of(opts: &[OptionItem], key: &str) -> String {
         opts.iter().find(|o| o.key == key).unwrap().value.clone()
+    }
+
+    #[test]
+    fn fastflow_uses_its_own_options_and_runtime_port() {
+        let mut model = model();
+        model.path = PathBuf::new();
+        model.fastflow = Some(crate::domain::FastFlowModel {
+            tag: "qwen3:4b".into(),
+            installed: true,
+            min_version: Some("0.9.22".into()),
+            version_compatible: Some(true),
+            footprint_gb: Some(3.1),
+            parameter_size: Some("4B".into()),
+            labels: vec!["reasoning".into()],
+            vision: false,
+            default_context_length: Some(32768),
+            max_prefill_len: Some(4096),
+            supported: true,
+        });
+        let runtime = fastflow_runtime();
+        let opts = resolve_options(
+            &runtime,
+            &model,
+            &profile("Default"),
+            &empty_store(),
+            &Defaults::default(),
+        );
+        assert_eq!(value_of(&opts, "ctx-len"), "default");
+        assert_eq!(value_of(&opts, "port"), "52625");
+        assert!(opts.iter().all(|option| option.key != "gpu-layers"));
+        assert!(opts.iter().all(|option| option.key != "img-pre-resize"));
     }
 
     #[test]

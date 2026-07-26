@@ -1,6 +1,7 @@
 //! Discovery of runtimes and models from the local system.
 
 pub mod catalog;
+pub mod fastflowlm;
 pub mod gguf;
 pub mod models;
 pub mod online;

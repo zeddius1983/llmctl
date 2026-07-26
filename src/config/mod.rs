@@ -41,6 +41,9 @@ layout = "directory"
 [runtime.llama_cpp]
 binary = "llama-server"
 
+[runtime.fastflowlm]
+binary = "flm"
+
 [defaults]
 host = "127.0.0.1"
 port = 8000
@@ -90,6 +93,7 @@ pub enum ModelLayout {
 #[serde(default)]
 pub struct RuntimeConfig {
     pub llama_cpp: LlamaCppConfig,
+    pub fastflowlm: FastFlowLmConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -102,6 +106,19 @@ pub struct LlamaCppConfig {
 impl Default for LlamaCppConfig {
     fn default() -> Self {
         Self { binary: "llama-server".to_string() }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct FastFlowLmConfig {
+    /// FastFlowLM executable name or absolute path.
+    pub binary: String,
+}
+
+impl Default for FastFlowLmConfig {
+    fn default() -> Self {
+        Self { binary: "flm".to_string() }
     }
 }
 

@@ -237,6 +237,7 @@ fn build_model(path: &Path, size: u64, modified: Option<u64>) -> Model {
         modified,
         has_chat_template: info.as_ref().map(|i| i.has_chat_template).unwrap_or(false),
         remote: None,
+        fastflow: None,
     }
 }
 
@@ -456,6 +457,7 @@ mod tests {
             modified: None,
             has_chat_template: false,
             remote: None,
+            fastflow: None,
         }
     }
 

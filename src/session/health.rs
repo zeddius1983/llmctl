@@ -24,7 +24,7 @@ pub enum Health {
 ///
 /// `host` may be a bind address like `0.0.0.0`; we probe `127.0.0.1` in that
 /// case since the wildcard address isn't directly connectable.
-pub fn probe(host: &str, port: u16) -> Health {
+pub fn probe_path(host: &str, port: u16, path: &str) -> Health {
     let connect_host = match host {
         "0.0.0.0" | "::" | "" => "127.0.0.1",
         other => other,
@@ -40,7 +40,7 @@ pub fn probe(host: &str, port: u16) -> Health {
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
 
-    let req = format!("GET /health HTTP/1.0\r\nHost: {connect_host}\r\nConnection: close\r\n\r\n");
+    let req = format!("GET {path} HTTP/1.0\r\nHost: {connect_host}\r\nConnection: close\r\n\r\n");
     if stream.write_all(req.as_bytes()).is_err() {
         return Health::Loading; // connected but couldn't speak; treat as not-ready
     }

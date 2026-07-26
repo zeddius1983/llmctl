@@ -38,6 +38,30 @@ Users should be able to:
 
 Everything should be available from a single terminal application.
 
+## FastFlowLM AMD NPU runtime
+
+When FastFlowLM is installed, llmctl exposes it as a separate runtime backed
+by the authoritative catalogue returned by `flm list --json --quiet`. Only
+catalogue entries may be selected and launched; llmctl must not offer arbitrary
+Hugging Face artifacts to this runtime. Installed and available entries share
+the usual Model → Profile → Options workflow, while unsupported model families
+or entries requiring a newer FLM release remain visible but cannot be launched.
+
+Runtime discovery collects `flm version --json`, `flm validate --json`, the
+configured server port from `flm port`, and the model list. A failed refresh
+falls back to the last valid catalogue. The configured `flm` binary is resolved
+directly from `$PATH` or an absolute path.
+
+llmctl does not expose `flm pull` as a pre-download action because FLM cannot
+resume partial pulls. Launching an available model invokes `flm serve <tag>` or
+`flm run <tag>` and lets FastFlowLM download it on first use. For server
+launches, llmctl derives
+aggregate download percentage from FLM's captured per-file progress and shows
+the normal `Downloading (N%)` session state before model loading. Server
+sessions use the `/v1/models` health endpoint, while benchmark actions use
+`flm bench`. Only one live FastFlowLM LLM server session may exist at a time,
+matching the runtime's NPU constraint.
+
 ## Online model catalog
 
 The llama.cpp hierarchy contains the virtual source `online ▸ huggingface`.
@@ -658,7 +682,7 @@ Manual refresh must be supported.
 
 ---
 
-## Runtime Discovery
+## llama.cpp Runtime Discovery
 
 The application should discover:
 

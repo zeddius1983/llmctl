@@ -470,6 +470,7 @@ fn artifacts_with_cache(
                 likes: detail.repository.likes,
                 gated: detail.repository.gated,
             }),
+            fastflow: None,
         });
     }
     result
@@ -503,6 +504,7 @@ fn repository_directory(root: &Path, repository: &Repository) -> Model {
             likes: repository.likes,
             gated: repository.gated,
         }),
+        fastflow: None,
     }
 }
 
@@ -524,6 +526,7 @@ fn directory(path: &[&str]) -> Model {
         modified: None,
         has_chat_template: false,
         remote: None,
+        fastflow: None,
     }
 }
 

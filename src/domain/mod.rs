@@ -7,14 +7,28 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// An inference backend (MVP: only llama.cpp).
+/// Stable identity for an inference backend. Display names are deliberately
+/// separate so persistence and behavior never depend on UI text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeId {
+    LlamaCpp,
+    FastFlowLm,
+    Vllm,
+}
+
+/// An inference backend discovered on the local system.
 #[derive(Debug, Clone)]
 pub struct Runtime {
+    pub id: RuntimeId,
     pub name: String,
     #[allow(dead_code)] // shown in the runtime detail view (Phase 1)
     pub description: String,
     pub version: Option<String>,
     pub binary_path: Option<PathBuf>,
+    /// Executable argv used to launch this runtime without invoking a shell.
+    pub command: Vec<String>,
+    pub default_port: Option<u16>,
     pub bench_path: Option<PathBuf>,
     pub formats: Vec<String>,
     /// Device identifiers reported by the runtime (for example ROCm0 or Vulkan0).
@@ -62,6 +76,35 @@ pub struct Model {
     /// launchable remote GGUF leaf even before it has a local cache path.
     #[serde(default)]
     pub remote: Option<RemoteModel>,
+    /// FastFlowLM catalogue identity and runtime-owned installation state.
+    #[serde(default)]
+    pub fastflow: Option<FastFlowModel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FastFlowModel {
+    pub tag: String,
+    pub installed: bool,
+    #[serde(default)]
+    pub min_version: Option<String>,
+    /// `Some(false)` only when discovery obtained both versions and proved the
+    /// installed runtime is too old. `None` means compatibility is unknown.
+    #[serde(default)]
+    pub version_compatible: Option<bool>,
+    #[serde(default)]
+    pub footprint_gb: Option<f64>,
+    #[serde(default)]
+    pub parameter_size: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub vision: bool,
+    #[serde(default)]
+    pub default_context_length: Option<u64>,
+    #[serde(default)]
+    pub max_prefill_len: Option<u64>,
+    #[serde(default)]
+    pub supported: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +177,7 @@ impl Model {
     pub fn is_catalog_dir(&self) -> bool {
         self.path.as_os_str().is_empty()
             && self.remote.as_ref().and_then(|remote| remote.file.as_ref()).is_none()
+            && self.fastflow.is_none()
     }
 
     pub fn is_model(&self) -> bool {
@@ -143,6 +187,9 @@ impl Model {
     /// Stable persistence identity used before and after an online model is
     /// downloaded into the Hugging Face cache.
     pub fn profile_key(&self) -> String {
+        if let Some(model) = &self.fastflow {
+            return format!("flm:{}", model.tag);
+        }
         match &self.remote {
             Some(remote) => match &remote.file {
                 Some(file) => format!("hf:{}/{}", remote.repo, file),
@@ -163,7 +210,8 @@ impl Model {
     }
 
     pub fn supports_multimodal(&self) -> bool {
-        self.projector_path.is_some()
+        self.fastflow.as_ref().is_some_and(|model| model.vision)
+            || self.projector_path.is_some()
             || self.remote.as_ref().is_some_and(|remote| remote.projector_file.is_some())
     }
 }
@@ -208,10 +256,13 @@ pub mod stubs {
     /// so multi-runtime navigation is exercisable alongside discovered llama.cpp.
     pub fn vllm_runtime() -> Runtime {
         Runtime {
+            id: RuntimeId::Vllm,
             name: "vLLM".into(),
             description: "High-throughput serving with PagedAttention".into(),
             version: None,
             binary_path: None,
+            command: Vec::new(),
+            default_port: None,
             bench_path: None,
             formats: vec!["Safetensors".into(), "HF".into()],
             devices: vec![],
@@ -247,6 +298,7 @@ pub mod stubs {
             modified: None,
             has_chat_template: true,
             remote: None,
+            fastflow: None,
         };
         vec![
             model(

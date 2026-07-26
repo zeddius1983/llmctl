@@ -31,13 +31,24 @@ pub struct SessionRecord {
     pub pid: i32,
     pub host: String,
     pub port: u16,
+    /// Runtime-specific readiness endpoint (`/health` or `/v1/models`).
+    #[serde(default = "default_health_path")]
+    pub health_path: String,
     pub command: Vec<String>,
     pub log_file: PathBuf,
     /// Cache blobs observed while llama.cpp downloads a remote Hub artifact.
     #[serde(default)]
     pub download: Option<DownloadRecord>,
+    /// The FastFlowLM catalogue reported this model as not installed when the
+    /// session was launched, so FLM may download it before loading.
+    #[serde(default)]
+    pub fastflow_download: bool,
     /// Process start time, seconds since the Unix epoch (for uptime).
     pub started_unix: u64,
+}
+
+fn default_health_path() -> String {
+    "/health".into()
 }
 
 impl SessionRecord {

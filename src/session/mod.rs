@@ -11,7 +11,7 @@ pub mod proc;
 pub mod record;
 pub mod supervisor;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,7 +27,7 @@ use supervisor::{DetachedSupervisor, LaunchSpec, SessionSupervisor};
 /// Observable lifecycle state of a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStatus {
-    /// llama.cpp is downloading one or more GGUF blobs into the Hub cache.
+    /// The runtime is downloading model artifacts before it can load them.
     Downloading,
     /// Process is up but `/health` isn't ready yet (model still loading).
     Starting,
@@ -124,7 +124,17 @@ fn session_status_label(status: SessionStatus, download_percent: Option<u8>) -> 
 }
 
 fn download_percent(record: &SessionRecord) -> Option<u8> {
-    download_record_percent(record.download.as_ref()?)
+    if let Some(download) = record.download.as_ref() {
+        return download_record_percent(download);
+    }
+    if record.runtime != "FastFlowLM" {
+        return None;
+    }
+    match fastflow_download_state(&record.log_file) {
+        FastFlowDownloadState::Downloading(percent) => Some(percent),
+        FastFlowDownloadState::NotStarted if record.fastflow_download => Some(0),
+        FastFlowDownloadState::NotStarted | FastFlowDownloadState::Complete => None,
+    }
 }
 
 fn download_record_percent(download: &DownloadRecord) -> Option<u8> {
@@ -147,11 +157,126 @@ fn download_record_percent(download: &DownloadRecord) -> Option<u8> {
     if complete { None } else { Some(((downloaded.saturating_mul(100) / expected).min(99)) as u8) }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FastFlowDownloadState {
+    NotStarted,
+    Downloading(u8),
+    Complete,
+}
+
+/// Derive aggregate first-use download progress from FLM's server log. FLM
+/// prints per-file progress, so completed file sizes must be added to the
+/// current file's downloaded bytes to avoid resetting the displayed percent.
+fn fastflow_download_state(log_file: &Path) -> FastFlowDownloadState {
+    let Ok(log) = std::fs::read(log_file) else {
+        return FastFlowDownloadState::NotStarted;
+    };
+    fastflow_download_state_from_text(&String::from_utf8_lossy(&log))
+}
+
+fn fastflow_download_state_from_text(log: &str) -> FastFlowDownloadState {
+    if log.contains("Model downloaded successfully!")
+        || log.contains("All downloads completed successfully!")
+    {
+        return FastFlowDownloadState::Complete;
+    }
+
+    let mut started = false;
+    let mut total_mb = None;
+    let mut file_sizes_mb = Vec::new();
+    let mut current_file = None;
+    let mut current_downloaded_mb = None;
+    let mut current_percent = None;
+
+    // Progress updates use carriage returns and may be prefixed with ANSI
+    // clearing sequences, so treat both CR and LF as logical separators and
+    // search within each fragment instead of assuming clean lines.
+    for fragment in log.split(['\n', '\r']) {
+        if fragment.contains("Missing files (")
+            || fragment.contains("Downloading")
+            || fragment.contains("Files to download (")
+        {
+            started = true;
+        }
+
+        if let Some(rest) = fragment.split_once("Files to download (").map(|(_, rest)| rest)
+            && let Some(size) = rest.split_once(')').and_then(|(size, _)| parse_size_mb(size))
+        {
+            total_mb = Some(size);
+            file_sizes_mb.clear();
+            current_file = None;
+            current_downloaded_mb = None;
+            current_percent = None;
+            continue;
+        }
+
+        if total_mb.is_some()
+            && current_file.is_none()
+            && fragment.contains("- ")
+            && let Some(open) = fragment.rfind('(')
+            && let Some(close) = fragment[open + 1..].find(')')
+            && let Some(size) = parse_size_mb(&fragment[open + 1..open + 1 + close])
+        {
+            file_sizes_mb.push(size);
+        }
+
+        if let Some(rest) = fragment.split_once("Downloading ").map(|(_, rest)| rest)
+            && !rest.starts_with(':')
+            && let Some((position, _)) = rest.split_once(':')
+            && let Some((index, count)) = position.split_once('/')
+            && count.trim().parse::<usize>().is_ok()
+            && let Ok(index) = index.trim().parse::<usize>()
+        {
+            current_file = Some(index);
+            current_downloaded_mb = None;
+            current_percent = None;
+            continue;
+        }
+
+        if let Some(rest) = fragment.split_once("Downloading:").map(|(_, rest)| rest) {
+            current_percent = rest
+                .trim_start()
+                .split_once('%')
+                .and_then(|(percent, _)| percent.trim().parse::<f64>().ok());
+            current_downloaded_mb = rest
+                .split_once('(')
+                .and_then(|(_, sizes)| sizes.split_once('/'))
+                .and_then(|(downloaded, _)| parse_size_mb(downloaded.trim()));
+        }
+    }
+
+    if let (Some(total), Some(index), Some(downloaded)) =
+        (total_mb, current_file, current_downloaded_mb)
+        && total > 0.0
+    {
+        let completed: f64 = file_sizes_mb.iter().take(index.saturating_sub(1)).sum();
+        let percent = ((completed + downloaded) * 100.0 / total).round().clamp(0.0, 99.0) as u8;
+        return FastFlowDownloadState::Downloading(percent);
+    }
+    if let Some(percent) = current_percent {
+        return FastFlowDownloadState::Downloading(percent.round().clamp(0.0, 99.0) as u8);
+    }
+    if started { FastFlowDownloadState::Downloading(0) } else { FastFlowDownloadState::NotStarted }
+}
+
+fn parse_size_mb(text: &str) -> Option<f64> {
+    let text = text.trim();
+    for (unit, multiplier) in [("GB", 1024.0), ("MB", 1.0), ("KB", 1.0 / 1024.0)] {
+        if let Some(number) = text.strip_suffix(unit) {
+            return number.trim().parse::<f64>().ok().map(|value| value * multiplier);
+        }
+    }
+    None
+}
+
 /// Everything the manager needs to launch a server. Built by the app from the
 /// current runtime/model/profile selection and resolved options.
 pub struct LaunchRequest {
     pub runtime: String,
     pub binary: String,
+    pub command_prefix: Vec<String>,
+    pub fastflow: bool,
+    pub fastflow_download: bool,
     pub model: String,
     pub model_path: String,
     pub mtp_path: Option<String>,
@@ -163,6 +288,7 @@ pub struct LaunchRequest {
     pub profile: String,
     pub host: String,
     pub port: u16,
+    pub health_path: String,
     pub options: Vec<OptionItem>,
 }
 
@@ -194,15 +320,33 @@ impl SessionManager {
     /// matches, delete the JSON for the rest (the spec's "stale records removed").
     pub fn rediscover(&mut self) {
         self.sessions.clear();
-        for record in record::load_all(&self.dir) {
+        for mut record in record::load_all(&self.dir) {
+            let alive =
+                proc::is_alive(record.pid) && proc::cmdline_matches(record.pid, &record.model_path);
+            if !alive
+                && let Some(binary) = record.command.first()
+                && let Some(pid) = proc::find_server(binary, &record.model_path, record.port)
+            {
+                record.pid = pid;
+                record.save(&self.dir);
+            }
             let alive =
                 proc::is_alive(record.pid) && proc::cmdline_matches(record.pid, &record.model_path);
             if alive {
-                let status = match health::probe(&record.host, record.port) {
+                let health = health::probe_path(&record.host, record.port, &record.health_path);
+                let status = match health {
                     Health::Ready => SessionStatus::Running,
                     _ if download_percent(&record).is_some() => SessionStatus::Downloading,
                     _ => SessionStatus::Starting,
                 };
+                if record.fastflow_download
+                    && (health == Health::Ready
+                        || fastflow_download_state(&record.log_file)
+                            == FastFlowDownloadState::Complete)
+                {
+                    record.fastflow_download = false;
+                    record.save(&self.dir);
+                }
                 self.sessions.push(Session::new(record, status));
             } else {
                 record.delete(&self.dir);
@@ -213,6 +357,13 @@ impl SessionManager {
     /// Launch a server from `req`, resolving a free port if the preferred one is
     /// taken. Returns the index of the new session.
     pub fn launch(&mut self, req: LaunchRequest) -> Result<usize> {
+        if req.fastflow
+            && self.sessions.iter().any(|session| {
+                session.record.runtime == "FastFlowLM" && !session.status.is_terminal()
+            })
+        {
+            anyhow::bail!("FastFlowLM can keep only one NPU LLM loaded at a time");
+        }
         let port = self.resolve_port(req.port, None);
 
         // Reflect the resolved port in the options we render into the command.
@@ -220,24 +371,33 @@ impl SessionManager {
         if let Some(opt) = options.iter_mut().find(|o| o.key == "port") {
             opt.value = port.to_string();
         }
-        let command = match &req.hf_repo {
-            Some(repo) => Command::build_huggingface(
-                &req.binary,
-                repo,
+        let command = if req.fastflow {
+            Command::build_fastflow(
+                &req.command_prefix,
+                command::FastFlowMode::Serve,
                 &req.model_path,
-                req.mtp_path.as_deref(),
-                req.draft_hf.as_deref(),
-                req.projector_path.as_deref(),
-                req.projector_auto,
                 &options,
-            ),
-            None => Command::build_local(
-                &req.binary,
-                &req.model_path,
-                req.mtp_path.as_deref(),
-                req.projector_path.as_deref(),
-                &options,
-            ),
+            )
+        } else {
+            match &req.hf_repo {
+                Some(repo) => Command::build_huggingface(
+                    &req.binary,
+                    repo,
+                    &req.model_path,
+                    req.mtp_path.as_deref(),
+                    req.draft_hf.as_deref(),
+                    req.projector_path.as_deref(),
+                    req.projector_auto,
+                    &options,
+                ),
+                None => Command::build_local(
+                    &req.binary,
+                    &req.model_path,
+                    req.mtp_path.as_deref(),
+                    req.projector_path.as_deref(),
+                    &options,
+                ),
+            }
         };
 
         let id = next_id();
@@ -255,9 +415,11 @@ impl SessionManager {
             pid: spawned.pid,
             host: req.host,
             port,
+            health_path: req.health_path,
             command: command.argv,
             log_file,
             download: req.download,
+            fastflow_download: req.fastflow_download,
             started_unix: now_unix(),
         };
         record.save(&self.dir);
@@ -329,30 +491,45 @@ impl SessionManager {
             let host = self.sessions[idx].record.host.clone();
             let port = self.sessions[idx].record.port;
             let prev = self.sessions[idx].last_cpu;
-            let was_running = self.sessions[idx].status == SessionStatus::Running;
+            let status = self.sessions[idx].status;
             let progress = download_percent(&self.sessions[idx].record);
 
             let rss = proc::rss_bytes(pid);
             let sample = proc::cpu_sample(pid);
-            let health = health::probe(&host, port);
+            let health_path = self.sessions[idx].record.health_path.clone();
+            // Health requests only promote a loading process to Running. Once
+            // promoted, process liveness is authoritative; probing forever
+            // provides no state change and FastFlowLM logs every request.
+            let health = if needs_health_probe(status) {
+                health::probe_path(&host, port, &health_path)
+            } else {
+                Health::Ready
+            };
 
             let s = &mut self.sessions[idx];
             s.rss_bytes = rss;
-            s.download_percent = progress;
+            s.download_percent = if health == Health::Ready { None } else { progress };
             if let Some(now) = sample {
                 if let Some(prev) = prev {
                     s.cpu_percent = proc::cpu_percent(prev, now);
                 }
                 s.last_cpu = Some(now);
             }
-            // Ready promotes to Running; otherwise keep Running if we were already
-            // there (tolerate transient probe failures), else Starting.
+            // Ready promotes to Running; otherwise remain in the appropriate
+            // loading state until a later probe succeeds.
             s.status = match health {
                 Health::Ready => SessionStatus::Running,
-                _ if was_running => SessionStatus::Running,
                 _ if progress.is_some() => SessionStatus::Downloading,
                 _ => SessionStatus::Starting,
             };
+            if s.record.fastflow_download
+                && (health == Health::Ready
+                    || fastflow_download_state(&s.record.log_file)
+                        == FastFlowDownloadState::Complete)
+            {
+                s.record.fastflow_download = false;
+                s.record.save(&self.dir);
+            }
         }
     }
 
@@ -467,6 +644,10 @@ fn session_name(model: &str, profile: &str) -> String {
     format!("{}-{}", slug(model), slug(profile))
 }
 
+fn needs_health_probe(status: SessionStatus) -> bool {
+    matches!(status, SessionStatus::Starting | SessionStatus::Downloading)
+}
+
 /// Lowercase, replacing runs of non-alphanumeric characters with a single dash.
 fn slug(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -560,6 +741,52 @@ mod tests {
         assert_eq!(session_status_label(SessionStatus::Starting, None), "Starting");
     }
 
+    #[test]
+    fn fastflow_progress_is_aggregate_across_catalogue_files() {
+        let log = "[FLM]  Missing files (4):\n\
+                   [FLM]  Files to download (663.05 MB):\n\
+                     - config.json (0.00 MB)\n\
+                     - model.q4nx (652.14 MB)\n\
+                     - tokenizer.json (10.89 MB)\n\
+                     - tokenizer_config.json (0.01 MB)\n\
+                   [FLM]  Downloading 1/4: config.json\n\
+                   [FLM]  Overall progress:  1/4 files\n\
+                   [FLM]  Downloading 2/4: model.q4nx\r\x1b[K\
+                   [FLM]  Downloading: 61.7% (402.2MB / 652.1MB)";
+
+        assert_eq!(fastflow_download_state_from_text(log), FastFlowDownloadState::Downloading(61));
+
+        let tokenizer = format!(
+            "{log}\n[FLM]  Overall progress:  2/4 files\n\
+             [FLM]  Downloading 3/4: tokenizer.json\r\x1b[K\
+             [FLM]  Downloading: 3.9% (0.4MB / 10.9MB)"
+        );
+        assert_eq!(
+            fastflow_download_state_from_text(&tokenizer),
+            FastFlowDownloadState::Downloading(98)
+        );
+    }
+
+    #[test]
+    fn fastflow_progress_ends_before_model_loading() {
+        assert_eq!(
+            fastflow_download_state_from_text(
+                "[FLM]  Downloading: 99.8% (651.0MB / 652.1MB)\n\
+                 [FLM]  All downloads completed successfully!\n\
+                 [FLM]  Model downloaded successfully!\n\
+                 [FLM]  Loading model: /home/user/.config/flm/models/example"
+            ),
+            FastFlowDownloadState::Complete
+        );
+    }
+
+    #[test]
+    fn health_polling_stops_after_session_reaches_running() {
+        assert!(needs_health_probe(SessionStatus::Starting));
+        assert!(needs_health_probe(SessionStatus::Downloading));
+        assert!(!needs_health_probe(SessionStatus::Running));
+    }
+
     fn opt(key: &str, value: &str, cli: &str) -> OptionItem {
         OptionItem {
             key: key.into(),
@@ -611,6 +838,9 @@ mod tests {
         let req = LaunchRequest {
             runtime: "llama.cpp".into(),
             binary: server.display().to_string(),
+            command_prefix: vec![server.display().to_string()],
+            fastflow: false,
+            fastflow_download: false,
             model: "fake.gguf".into(),
             model_path: "/models/fake.gguf".into(),
             mtp_path: None,
@@ -622,6 +852,7 @@ mod tests {
             profile: "Default".into(),
             host: "127.0.0.1".into(),
             port: 18900,
+            health_path: "/health".into(),
             options: vec![opt("host", "127.0.0.1", "--host"), opt("port", "18900", "--port")],
         };
 

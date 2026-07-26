@@ -15,6 +15,7 @@ Living status of the build. Update this when phases complete or scope shifts
 | 5 | Search/filter & polish | ◻ Post-v0.1.0 |
 | 6 | Source-aware model catalog | ✅ Done |
 | 7 | Online Hugging Face catalog | ✅ Done |
+| 8 | FastFlowLM AMD NPU runtime | ✅ Done (unreleased) |
 
 **v0.1.0 released** — Phases 0–3 (the MVP), plus extra launch options
 (`--no-mmap`, `--cache-type-k`/`-v`, speculative decoding) and a README, were
@@ -53,6 +54,20 @@ When a batch is ready to ship, the feature branches merge into a release umbrell
 `phase-*`/`docs` branches predate this policy and are grandfathered.)
 
 ## Done
+
+### Phase 8 — FastFlowLM AMD NPU runtime
+Runtime discovery resolves `flm` directly and parses banner-prefixed `version`,
+`validate`, `port`, and authoritative model list output, caching the last good
+catalogue. The runtime opens directly to
+its model list with runtime-scoped search, installed/available state,
+compatibility gates, per-model YAML profiles, FLM-specific options/templates,
+`flm serve` sessions, foreground `flm run` chat and `flm bench`. There is no
+explicit FLM pre-download job because FLM cannot resume partial pulls; serve/run
+launches delegate first-use downloads to FLM. First-use server downloads expose
+an aggregate `Downloading (N%)` session status derived from captured FLM output.
+FastFlow servers use `/v1/models` readiness and process rediscovery; polling
+stops once readiness succeeds to avoid health-request log spam. Embedding-only
+and ASR-only workloads remain deferred.
 
 ### Phase 0 — Skeleton
 Cargo project (Rust 2024), XDG config + `Paths`, domain types, ratatui shell,

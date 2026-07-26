@@ -70,6 +70,10 @@ state.
     share the right-hand Detail pane.
   - `runtimes.rs` — locate `llama-server` (explicit path or `$PATH`), capture
     `--version`, cache `--help`.
+  - `fastflowlm.rs` — query the installed FastFlowLM CLI for its version,
+    readiness, server port, and authoritative model catalogue; tolerate the
+    CLI's log preamble, retain a last-good cache, and materialize catalogue
+    leaves without pretending FLM-owned weights are local files.
 - **`profiles/`**
   - `registry.rs` — static `REGISTRY` of `OptionSpec`s (kind, default, range,
     step, CLI flag, description) plus `OptionKind` validate/adjust/extreme logic.
@@ -77,8 +81,10 @@ state.
     Context/Server) as option overrides.
   - `store.rs` — `ProfileStore`: model-scoped instances persisted as YAML in
     each catalog leaf; create/rename/delete/favorite/set-value, auto-saved.
-  - `mod.rs` — resolution: `list_profiles`, `resolve_options`,
-    `current_values`, `effective_kind` (model-aware ctx-size bound).
+  - `fastflow.rs` — FastFlowLM option registry and its runtime-specific
+    Default/Power Saver/Balanced/Turbo/Server templates.
+  - `mod.rs` — runtime-aware profile listing and resolution, including
+    model-aware context and FastFlowLM prefill bounds.
 - **`session/`**
   - `command.rs` — pure launch-command builder (argv + shell-quoted display;
     bool flags emitted only when on, local model via `-m`, remote model via
@@ -155,12 +161,24 @@ keeps sessions whose PID is alive *and* whose `/proc/<pid>/cmdline` still
 contains the model path (PID-reuse guard), deleting the JSON for the rest.
 
 `SessionManager::refresh` (called on the ≈1 s tick) derives status —
-`Downloading (N%)` while known Hub blobs are incomplete, `Starting` while the
-model loads, then `Running` after `GET /health` returns 200; `Stopped` if the
-user asked it to stop and the process is gone, else `Crashed` — and samples
-`/proc` for RSS and CPU%. Launch resolves a bindable port (skipping ports held by other live
-sessions) before spawning. A future `DaemonSupervisor` or `systemd-run` backend
-can implement the same trait. See ADR-005 and ADR-007.
+`Downloading (N%)` while known Hub blobs are incomplete or a FastFlowLM
+first-use download is active, `Starting` while the model loads, then `Running`
+after the runtime health endpoint returns 200; `Stopped` if the user asked it
+to stop and the process is gone, else `Crashed` — and samples
+`/proc` for RSS and CPU%. Readiness polling stops after the first successful
+response because subsequent state is already governed by process liveness; this
+also avoids filling server logs with health-check requests. Launch resolves a
+bindable port (skipping ports held by other live sessions) before spawning. A
+future `DaemonSupervisor` or `systemd-run` backend can implement the same trait.
+See ADR-005 and ADR-007.
+
+FastFlowLM launches use the same persisted session lifecycle, but build
+`flm serve <tag>` commands and probe the OpenAI-compatible `/v1/models`
+endpoint. Because FastFlowLM permits only one loaded LLM at a time, llmctl
+rejects a second live FastFlowLM server session. Rediscovery can reacquire the
+actual server process by its exact model tag and port. While FLM performs a
+first-use download, the manager parses its captured total, file sizes, and
+current downloaded amount into one aggregate session percentage.
 
 ## Testing strategy
 

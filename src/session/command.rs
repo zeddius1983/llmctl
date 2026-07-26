@@ -13,7 +13,52 @@ pub struct Command {
     pub argv: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastFlowMode {
+    Serve,
+    Run,
+    Bench,
+}
+
+impl FastFlowMode {
+    fn command(self) -> &'static str {
+        match self {
+            Self::Serve => "serve",
+            Self::Run => "run",
+            Self::Bench => "bench",
+        }
+    }
+}
+
 impl Command {
+    /// Build a FastFlowLM command from its executable argv.
+    pub fn build_fastflow(
+        base: &[String],
+        mode: FastFlowMode,
+        model_tag: &str,
+        options: &[OptionItem],
+    ) -> Self {
+        let mut argv = base.to_vec();
+        argv.push(mode.command().into());
+        argv.push(model_tag.into());
+        if matches!(mode, FastFlowMode::Serve | FastFlowMode::Run) {
+            for option in options {
+                let server_only =
+                    matches!(option.key.as_str(), "host" | "port" | "q-len" | "socket" | "cors");
+                if mode == FastFlowMode::Run && server_only {
+                    continue;
+                }
+                if crate::profiles::fastflow::omit_token(&option.key) == Some(option.value.as_str())
+                {
+                    continue;
+                }
+                argv.push(option.cli.clone());
+                argv.push(option.value.clone());
+            }
+        }
+        Self { argv }
+    }
+
     /// Build from the runtime binary, the model file path, and resolved options.
     ///
     /// Every option is emitted as `--flag value`, in registry order (current
@@ -255,6 +300,44 @@ mod tests {
         opts.push(opt("top-k", registry::DEFAULT, "--top-k"));
         let cmd = local("/m/x.gguf", &opts);
         assert!(!cmd.argv.iter().any(|a| a == "--temp" || a == "--top-k"));
+    }
+
+    #[test]
+    fn builds_fastflow_server_and_filters_defaults() {
+        let base = vec!["flm".into()];
+        let options = vec![
+            opt("ctx-len", "default", "--ctx-len"),
+            opt("pmode", "balanced", "--pmode"),
+            opt("host", "127.0.0.1", "--host"),
+            opt("port", "52625", "--port"),
+        ];
+        let command = Command::build_fastflow(&base, FastFlowMode::Serve, "llama3.2:1b", &options);
+        assert_eq!(
+            command.argv,
+            [
+                "flm",
+                "serve",
+                "llama3.2:1b",
+                "--pmode",
+                "balanced",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "52625",
+            ]
+        );
+    }
+
+    #[test]
+    fn fastflow_chat_drops_server_only_options() {
+        let options = vec![
+            opt("pmode", "turbo", "--pmode"),
+            opt("host", "0.0.0.0", "--host"),
+            opt("port", "52625", "--port"),
+        ];
+        let command =
+            Command::build_fastflow(&["flm".into()], FastFlowMode::Run, "qwen3:4b", &options);
+        assert_eq!(command.argv, ["flm", "run", "qwen3:4b", "--pmode", "turbo"]);
     }
 
     #[test]

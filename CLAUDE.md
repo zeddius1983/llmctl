@@ -8,9 +8,9 @@ Stable, slow-changing context for working in this repo. For volatile details
 
 `llmctl` is a keyboard-driven terminal UI (TUI) for discovering, configuring,
 launching, and managing local LLM inference servers — in the style of Yazi,
-Lazygit, and systemctl. The goal: never hand-type a complex `llama-server`
-command again. The MVP targets **llama.cpp + GGUF on Linux**; other runtimes
-(vLLM, Ollama, …) are future work. Full spec: [docs/requirements.md](docs/requirements.md).
+Lazygit, and systemctl. It supports **llama.cpp + GGUF** and **FastFlowLM on AMD
+Ryzen AI NPUs** on Linux; vLLM remains a navigation stub. Full spec:
+[docs/requirements.md](docs/requirements.md).
 
 ## Tech stack
 
@@ -41,11 +41,11 @@ src/
   main.rs        entry: XDG paths, file tracing, launch TUI
   app/           App state, event loop, navigation, prompts, actions
   config/        Config (first-run config.toml generation) + XDG Paths resolution
-  domain/        pure types (Runtime, Model, Profile, OptionItem), helpers, vLLM stubs
+  domain/        pure types (runtime/model identities, Profile, OptionItem), helpers, vLLM stubs
   discovery/     catalog.rs (source parsing + managed tree), gguf.rs (header parser),
                  models.rs (scan+cache), online.rs (lazy Hugging Face catalog),
-                 runtimes.rs (llama.cpp)
-  profiles/      registry.rs (option specs), templates.rs, store.rs (per-model YAML), mod.rs (resolution)
+                 runtimes.rs (llama.cpp), fastflowlm.rs (FLM runtime/catalogue)
+  profiles/      llama/FLM option specs and templates, store.rs (per-model YAML), mod.rs (resolution)
   session/       command.rs (builder), supervisor.rs (DetachedSupervisor: setsid/signals),
                  record.rs (session-<id>.json), proc.rs (/proc), health.rs (/health), mod.rs (SessionManager)
   ui/            ratatui rendering (browser columns, Session Manager, log view, footer, prompts, help)

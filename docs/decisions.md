@@ -302,3 +302,44 @@ cleanup explicitly skip that directory. On restart, llmctl reconstructs byte
 progress from the Hub blobs and presents the job as `Interrupted`; it does not
 resume network activity until the user presses `R` or selects the model with
 `d`. Completed or explicitly removed jobs delete their record.
+
+---
+
+## ADR-011: FastFlowLM owns its NPU model catalogue and storage
+
+**Status:** Accepted
+
+**Context:** FastFlowLM runs models compiled for AMD Ryzen AI NPUs. Unlike
+llama.cpp, it cannot launch arbitrary Hugging Face artifacts: the supported set,
+metadata, minimum runtime version, and installed state come from `flm list`.
+
+**Decision:** Treat FastFlowLM as a first-class runtime with stable runtime and
+model identities. Resolve its configured `flm` binary directly from `$PATH` or
+an absolute path. A failed version probe is treated as unknown rather than
+evidence that every version-gated catalogue entry is incompatible. The
+banner-prefixed JSON from `flm list --json --quiet` is authoritative and is
+cached only as a last-good startup fallback. Catalogue URLs are informational;
+llmctl never downloads them directly or exposes `flm pull` as a pre-download
+action because FLM cannot resume partial pulls. Server and chat launches use
+`flm serve`/`flm run` even when the model is not installed, delegating the
+first-use download to FLM. Model files remain owned by FLM. Catalogue leaves
+contain only manifests and runtime-scoped profiles.
+
+FastFlowLM has its own option registry and templates. Session readiness probes
+`/v1/models`, process rediscovery can reacquire the server, and llmctl permits
+one live FastFlow LLM session at a time. Readiness polling ends after the first
+successful response because FLM logs each HTTP request and live sessions are
+already monitored by process identity. During first-use server downloads,
+llmctl derives an aggregate percentage from FLM's captured per-file progress;
+the persisted launch intent preserves that state across llmctl restarts. The
+first implementation launches LLM and VLM entries; embedding-only and ASR-only
+catalogue entries are retained as visible unsupported items for future
+typed-workload support.
+
+**Consequences:** FastFlowLM catalogue changes are picked up with `F5` without
+mixing NPU artifacts into the GGUF/Hugging Face tree. FLM entries never appear
+in llmctl's managed Downloads queue, avoiding a partial-download or resume
+promise that FLM cannot honor. First-use server progress is a best-effort
+interpretation of captured FLM output rather than a structured API contract.
+Runtime-specific registries, health probes, command builders, and stable
+identities replace assumptions that every real runtime is llama.cpp.
