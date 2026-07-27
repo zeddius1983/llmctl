@@ -232,7 +232,8 @@ went from ~155 ms to ~60 µs (ADR-012).
       used to track `flm serve`'s own native downloads (ADR-013)
 - [ ] `flm remove` for installed models (the CLI supports it; no llmctl binding yet)
 - [ ] Surface `think` / `think_toggleable` from the catalog as a profile option
-- [ ] Revisit `flm bench` if a future release ships the documented subcommand
+- [x] `flm bench` — it was a hidden subcommand of v0.9.45 all along, not a
+      missing one; `b` now benchmarks the selected FastFlowLM model (ADR-012)
 - [ ] Per-model gating of `--asr` / `--embed` / `--img-pre-resize` by the
       catalog's `asr` / `vlm` flags, rather than offering them for every model
 

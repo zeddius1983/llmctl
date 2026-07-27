@@ -236,10 +236,13 @@ impl FlmBackend {
                 name: NAME.into(),
                 description: "AMD NPU inference via flm".into(),
                 version: version.map(|v| format!("flm {v}")),
+                // `flm bench` is a *hidden* subcommand: it is missing from
+                // `flm --help`, which is what led us to believe it did not
+                // exist, but v0.9.45 parses and runs it. The benchmark tool is
+                // therefore `flm` itself, not a sibling binary the way
+                // llama.cpp ships `llama-bench` next to `llama-server`.
+                bench_path: binary_path.clone(),
                 binary_path,
-                // `flm bench` is documented but absent from the shipping CLI,
-                // so there is no benchmark tool to point at.
-                bench_path: None,
                 formats: vec!["NPU".into()],
                 devices,
             },
@@ -403,9 +406,20 @@ impl RuntimeBackend for FlmBackend {
         Some(argv)
     }
 
-    /// `flm bench` is documented upstream but not present in the shipping CLI.
-    fn bench_argv(&self, _ctx: &LaunchContext) -> Option<Vec<String>> {
-        None
+    /// `flm bench <tag>` runs FastFlowLM's own multi-stage throughput
+    /// benchmark on the NPU.
+    ///
+    /// Only `--pmode` carries over from the profile. The benchmark picks its
+    /// own context lengths per stage (32k upward), so `ctx-len` and
+    /// `prefill-chunk-len` would be overridden; it never opens a socket, so the
+    /// server options are meaningless; and `asr`/`embed`/`img-pre-resize` only
+    /// load extra models that the benchmark does not exercise.
+    fn bench_argv(&self, ctx: &LaunchContext) -> Option<Vec<String>> {
+        let mut argv = vec![ctx.binary.to_string(), "bench".into(), tag(ctx.model)];
+        let options: Vec<OptionItem> =
+            ctx.options.iter().filter(|o| o.key == "pmode").cloned().collect();
+        Command::append_options(&mut argv, &SCHEMA, &options);
+        Some(argv)
     }
 
     /// FastFlowLM exposes no `/health`; `GET /v1/models` answers 200 once the
@@ -1181,6 +1195,35 @@ mod tests {
         assert_eq!(argv[..3], ["flm", "run", "qwen3:4b"]);
         assert!(argv.windows(2).any(|w| w == ["--ctx-len", "8192"]));
         assert!(!argv.iter().any(|a| a == "--port" || a == "--host"));
+    }
+
+    #[test]
+    fn bench_keeps_only_the_power_mode() {
+        let backend = FlmBackend {
+            runtime: Runtime {
+                name: NAME.into(),
+                description: String::new(),
+                version: None,
+                binary_path: None,
+                bench_path: None,
+                formats: vec![],
+                devices: vec![],
+            },
+            npu_ready: true,
+            npu_problem: None,
+            catalog_cache: Mutex::new(None),
+        };
+        let model =
+            entries()[0].to_model(&local("reasoning"), Path::new("/models"), Path::new("/cfg"));
+        let options = vec![
+            opt("pmode", "turbo", "--pmode"),
+            opt("ctx-len", "8192", "--ctx-len"),
+            opt("port", "52625", "--port"),
+        ];
+        let ctx = LaunchContext { binary: "flm", model: &model, options: &options };
+        let argv = backend.bench_argv(&ctx).unwrap();
+
+        assert_eq!(argv, ["flm", "bench", "qwen3:4b", "--pmode", "turbo"]);
     }
 
     /// Exercises the real `flm` on this machine: discovery, NPU validation, and

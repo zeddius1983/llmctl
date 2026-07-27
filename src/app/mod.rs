@@ -1707,6 +1707,15 @@ impl App {
         let (Some(backend), Some(model)) = (self.runtimes.selected(), self.selected_model()) else {
             return;
         };
+        // A benchmark loads the model just as a server or an interactive client
+        // does, so it collides with a live session on a single-session runtime.
+        // Only reachable since FastFlowLM gained a benchmark: `llama-bench`
+        // belongs to a runtime that is happy to run several at once.
+        let runtime = backend.descriptor().name.clone();
+        if let Some(lines) = self.single_session_conflict(&runtime) {
+            self.message = Some(Message { title: "Cannot start benchmark".into(), lines });
+            return;
+        }
         let Some(binary) = backend.descriptor().binary_path.as_ref() else { return };
         let binary = binary.display().to_string();
         let ctx = LaunchContext { binary: &binary, model, options: &self.options.items };
@@ -2293,7 +2302,10 @@ impl App {
             })
     }
 
-    /// Whether the selected runtime exposes `llama-bench` for this model.
+    /// Whether the selected runtime ships a benchmark tool for this model.
+    /// The model must be present locally: llama.cpp needs a GGUF to point
+    /// `llama-bench` at, and `flm bench` on an un-pulled tag would turn a
+    /// benchmark into a multi-gigabyte download.
     pub fn benchmark_available(&self) -> bool {
         self.selected_model().is_some_and(|model| !model.path.as_os_str().is_empty())
             && self

@@ -445,9 +445,16 @@ profiles are unaffected by switching.
 
 **Consequences:** FastFlowLM is listed even when absent or unusable, with the
 reason (missing binary, or an NPU stack that `flm validate` reports as not
-ready) surfaced in the status line rather than at launch time. `flm bench` is
-documented upstream but absent from v0.9.45, so `bench_argv` returns `None` and
-the `b` key is inert for this runtime.
+ready) surfaced in the status line rather than at launch time.
+
+`flm bench` was originally recorded here as absent from v0.9.45, on the strength
+of it not appearing in `flm --help`. That was wrong: it is a *hidden* subcommand
+that the same v0.9.45 parses and runs. `bench_argv` now returns
+`flm bench <tag> [--pmode …]` and `bench_path` points at `flm` itself, so `b`
+works for FastFlowLM. Only the power mode carries over from the profile — the
+benchmark drives its own per-stage context lengths and opens no socket. The
+lesson generalizes: probe a runtime's CLI by invoking a subcommand, not by
+trusting its help text to be complete.
 
 A practical note that shaped the session design: `flm` may legitimately be a
 *wrapper* rather than the server binary — on the development machine it is a
