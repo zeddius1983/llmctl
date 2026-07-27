@@ -4,15 +4,21 @@ A keyboard-driven terminal UI (TUI) for discovering, configuring, launching, and
 managing local LLM inference servers — in the style of [Yazi](https://github.com/sxyazi/yazi),
 [Lazygit](https://github.com/jesseduffield/lazygit), and `systemctl`.
 
-The goal: **never hand-type a complex `llama-server` command again.** Browse your
-GGUF models, tune launch options with live validation, start detached servers,
+The goal: **never hand-type a complex inference-server command again.** Browse
+your models, tune launch options with live validation, start detached servers,
 and watch them from a built-in session manager.
 
-> **Status:** v0.3.1. Targets **llama.cpp + GGUF on Linux**. Other runtimes
-> (vLLM, Ollama, …) are navigable stubs / future work.
+> **Status:** v0.4.0. Two runtimes ship on **Linux**: **llama.cpp + GGUF**
+> (CPU/GPU) and **FastFlowLM** (`flm`, AMD XDNA2 NPU). Others (vLLM, Ollama, …)
+> are future work behind the `RuntimeBackend` trait.
 
 ## Features
 
+- **Two runtimes, one workflow** — llama.cpp for CPU/GPU GGUF inference, and
+  FastFlowLM (`flm`) for models on an AMD XDNA2 NPU. Everything runtime-specific
+  — binary discovery, option vocabulary, templates, catalog, launch/chat/benchmark
+  commands, readiness checks — sits behind a `RuntimeBackend` trait, so both
+  runtimes browse, configure, launch, and monitor identically.
 - **Yazi-style navigation** — a sliding three-column view over the hierarchy
   `Runtime ▸ source ▸ provider/repository ▸ Model ▸ Profile ▸ Options`, driven entirely from the keyboard
   (`hjkl`, `g`/`G`, drill in / back out).
@@ -41,6 +47,13 @@ and watch them from a built-in session manager.
   the resolved options. `y` previews and yanks the command to your clipboard
   (OSC 52); options left at their default are omitted so llama.cpp's own defaults
   apply.
+- **FastFlowLM on the NPU** — the `flm` catalog, grouped by capability label
+  (reasoning, vision, tool-calling, audio, embeddings) under the same
+  `local`/`online` split. NPU-specific options (power mode, prefill chunk,
+  queue length) and templates, `flm serve` sessions, `flm run` chat, and `flm
+  bench` benchmarking. Downloads are llmctl's own, so they resume. The XDNA
+  driver grants a single hardware context, so llmctl runs one FastFlowLM model
+  at a time and says which session holds the device.
 - **Detached sessions** — `s` launches a server in its own process group
   (`setsid`), with stdout/stderr redirected to a per-session log file and
   automatic port-conflict resolution. Sessions are rediscovered across restarts.
@@ -52,10 +65,18 @@ and watch them from a built-in session manager.
 
 ## Requirements
 
-- **Linux** (the MVP uses `setsid`, `/proc` sampling, and POSIX signals).
-- **[llama.cpp](https://github.com/ggml-org/llama.cpp)** — `llama-server` must be
-  on your `$PATH` (or set its path in the config). `llama-cli` next to it enables
-  the in-terminal chat shortcut (`C`).
+- **Linux** (`setsid`, `/proc` sampling, and POSIX signals).
+- **At least one runtime.** Each is optional and discovered independently; a
+  runtime that is missing or unusable is still listed, with the reason shown in
+  the status line instead of failing at launch.
+  - **[llama.cpp](https://github.com/ggml-org/llama.cpp)** — `llama-server` on
+    your `$PATH` (or an absolute path in the config). `llama-cli` beside it
+    enables the chat shortcut (`C`), `llama-bench` the benchmark shortcut (`b`).
+  - **[FastFlowLM](https://github.com/FastFlowLM/FastFlowLM)** — `flm` on your
+    `$PATH`, plus an AMD XDNA2 NPU with a working driver stack. `flm validate`
+    gates launching, so a missing driver or too low a memlock limit is reported
+    up front. `flm` may be a wrapper script (a distrobox entry point, say);
+    llmctl re-acquires the real server process either way.
 - **Rust** (edition 2024) to build — install via [rustup](https://rustup.rs).
 
 ## Install
@@ -115,8 +136,8 @@ overlay.
 | `Home` / `End` | Default·min / max |
 | **Launch & sessions** | |
 | `s` | Start server |
-| `C` | Chat in terminal (`llama-cli`) |
-| `b` | Benchmark selected model with its profile device and GPU layers (when available) |
+| `C` | Chat in terminal (`llama-cli` / `flm run`) |
+| `b` | Benchmark the selected model (`llama-bench` / `flm bench`, when available) |
 | `y` | Yank launch command |
 | `t` | Session manager |
 | `x` / `K` | Stop / kill a server; cancel a download |
@@ -129,7 +150,12 @@ overlay.
 
 ### Launch options
 
-The MVP exposes a curated set of `llama-server` flags, including context size,
+Each runtime exposes its own curated option set; the sections below cover
+llama.cpp, then FastFlowLM.
+
+#### llama.cpp
+
+A curated set of `llama-server` flags, including context size,
 GPU layers, device selection (`--device`, with a selector populated by
 `llama-server --list-devices`), sampling (`temperature`, `top-p`, `top-k`,
 `min-p`, `repeat-penalty`),
@@ -144,6 +170,18 @@ the sidecar name. A compatible local `mmproj-*.gguf` is passed through
 MTP and projector companions from `-hf`; downloaded companions become explicit
 local paths on subsequent launches.
 Any option left at its default value is omitted from the command line.
+
+#### FastFlowLM
+
+An NPU has no GPU layers or flash attention, so `flm` gets its own vocabulary:
+power mode (`--pmode`: powersaver / balanced / performance / turbo), context
+length, prefill chunk length, NPU queue length, socket limit, preemption, CORS,
+the ASR and embedding companion models, vision pre-resize, and host/port.
+Templates (Default, Chat, Long Context, Server, Low Power) mirror llama.cpp's
+intent in FastFlowLM's dialect. Options are clamped to what the selected model
+actually supports — its trained context length and maximum prefill.
+`--host`/`--port` are always emitted, because llmctl needs the concrete endpoint
+to health-check the server and re-acquire it after a restart.
 
 ## Configuration
 
@@ -161,6 +199,11 @@ layout = "directory" # auto, directory, flat, lm-studio, or hugging-face
 # Binary name (resolved on $PATH) or an absolute path.
 binary = "llama-server"
 
+# FastFlowLM runs models on an AMD XDNA2 NPU. Its catalog comes from `flm`
+# itself, so the model sources above do not apply to it.
+[runtime.fastflowlm]
+binary = "flm"
+
 [defaults]
 host = "127.0.0.1"
 port = 8000
@@ -175,6 +218,7 @@ port = 8000
 | `~/.config/llmctl/models/` | Managed source tree, symlinks, and YAML profiles |
 | `~/.local/state/llmctl/` | Session records, logs, and profile migration fallback |
 | `~/.cache/llmctl/` | Model & runtime scan cache |
+| `~/.config/flm/models/` | FastFlowLM's own models, owned by `flm` (or `$FLM_MODEL_PATH`) |
 
 The generated file explicitly lists the standard locations so they are easy to
 inspect and extend. Older `[models].paths` arrays remain supported, but named

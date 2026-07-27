@@ -48,13 +48,15 @@ multimodal projectors with compatible base models, and preserves companion
 relationships across Hugging Face discovery, downloads, and cached launches.
 See [release notes](release-notes-v0.3.1.md).
 
-**v0.4.0 (unreleased) — runtime backends and FastFlowLM** — replaces the
-string-literal runtime dispatch with a `RuntimeBackend` trait (ADR-011), deletes
-the vLLM navigation stub, and adds FastFlowLM as a real second runtime running
-models on an AMD XDNA2 NPU (ADR-012): curated `flm list` catalog grouped by
-capability label, NPU-specific option set and templates, `flm serve` sessions
-with `/v1/models` readiness, resumable llmctl-owned downloads on `d`, and
-`flm run` chat.
+**v0.4.0 — runtime backends and FastFlowLM** — replaces the string-literal
+runtime dispatch with a `RuntimeBackend` trait (ADR-011), deletes the vLLM
+navigation stub, and adds FastFlowLM as a real second runtime running models on
+an AMD XDNA2 NPU (ADR-012): curated `flm list` catalog grouped by capability
+label, NPU-specific option set and templates, `flm serve` sessions with
+`/v1/models` readiness, resumable llmctl-owned downloads on `d` (ADR-013),
+`flm run` chat, and `flm bench` benchmarking. The NPU's single hardware context
+is modelled as `RuntimeBackend::single_session`. See
+[release notes](release-notes-v0.4.0.md).
 
 Branching: each remaining phase is built on its own `feature/<task>` branch.
 When a batch is ready to ship, the feature branches merge into a release umbrella

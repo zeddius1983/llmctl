@@ -3,3 +3,6 @@
 /llmctl
 # editor / IDE settings
 /.idea/
+# `flm bench` writes its results as a CSV into the working directory, which is
+# wherever llmctl was started from when `b` runs it in the foreground.
+/bench_*.csv
