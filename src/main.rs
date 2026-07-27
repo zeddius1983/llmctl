@@ -1,10 +1,11 @@
-//! llmctl — keyboard-driven TUI for managing local llama.cpp servers.
+//! llmctl — keyboard-driven TUI for managing local LLM inference servers.
 
 mod app;
 mod config;
 mod discovery;
 mod domain;
 mod profiles;
+mod runtime;
 mod session;
 mod ui;
 

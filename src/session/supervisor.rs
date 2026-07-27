@@ -49,6 +49,41 @@ impl DetachedSupervisor {
     }
 }
 
+/// Run `f` with `SIGCHLD` temporarily restored to its default disposition.
+///
+/// [`DetachedSupervisor::new`] sets `SIGCHLD` to `SIG_IGN` so detached servers
+/// are reaped without llmctl ever waiting on them. The cost is that anything in
+/// the standard library which *does* wait breaks, because `wait()` then fails
+/// with `ECHILD`:
+///
+/// * `Command::output()` reports an error for a process that ran perfectly well
+///   — silently, if the caller treats failure as "no output";
+/// * `Command::spawn()` panics outright (`wait() should either return Ok or
+///   panic`) when exec fails, since it reaps the failed child to read its errno.
+///
+/// The previous disposition is restored rather than assumed, and restoring
+/// `SIG_IGN` also reaps anything that exited during the call, so the window
+/// leaves no zombie behind.
+fn with_default_sigchld<T>(f: impl FnOnce() -> T) -> T {
+    // SAFETY: setting a signal disposition is async-signal-safe and has no
+    // preconditions. llmctl spawns processes only from the main thread, so
+    // there is no window where another thread relies on the disposition.
+    let previous = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
+    let result = f();
+    if previous != libc::SIG_ERR {
+        unsafe { libc::signal(libc::SIGCHLD, previous) };
+    }
+    result
+}
+
+/// Run `command` to completion and capture its output, whatever `SIGCHLD`
+/// disposition is currently installed. Any code that reads a subprocess's
+/// output *after* the session manager exists must go through here — see
+/// [`with_default_sigchld`] for why.
+pub fn output(command: &mut std::process::Command) -> std::io::Result<std::process::Output> {
+    with_default_sigchld(|| command.output())
+}
+
 impl SessionSupervisor for DetachedSupervisor {
     fn spawn(&self, spec: &LaunchSpec) -> Result<Spawned> {
         let (program, args) = spec.argv.split_first().context("empty command")?;
@@ -78,7 +113,12 @@ impl SessionSupervisor for DetachedSupervisor {
             });
         }
 
-        let child = cmd.spawn().with_context(|| format!("spawning {}", program))?;
+        // Not a bare `cmd.spawn()`: an exec failure (a binary that has since been
+        // moved or uninstalled) makes std reap the failed child to read its
+        // errno, which panics under our `SIG_IGN` disposition instead of
+        // returning the error the caller is ready to report.
+        let child = with_default_sigchld(|| cmd.spawn())
+            .with_context(|| format!("spawning {}", program))?;
         Ok(Spawned { pid: child.id() as i32 })
     }
 

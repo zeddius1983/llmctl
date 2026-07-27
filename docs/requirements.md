@@ -367,6 +367,7 @@ Status indicators:
 ● Running
 ⇩ Downloading (67%)
 ◐ Starting
+↻ Restarting
 ✖ Crashed
 ■ Stopped
 ```
@@ -541,6 +542,7 @@ Running
 Stopped
 Downloading
 Starting
+Restarting
 Crashed
 Unknown
 ```

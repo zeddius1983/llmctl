@@ -33,3 +33,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
 ureq = { version = "2.12", features = ["json"] }
+
+[dev-dependencies]
+# Already in the tree via ratatui. Used only to assert that a rendered log line
+# measures the same width the terminal will draw (see the log-sanitizing tests).
+unicode-width = "0.2"

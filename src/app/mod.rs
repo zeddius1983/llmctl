@@ -18,8 +18,9 @@ use std::time::{Duration, Instant};
 use crate::config::{Config, ModelLayout, ModelSourceConfig, Paths};
 use crate::discovery;
 use crate::discovery::ModelSource;
-use crate::domain::{Model, OptionItem, Profile, Runtime, format_unix_date, human_size, stubs};
+use crate::domain::{Model, OptionItem, Profile, format_unix_date, human_size};
 use crate::profiles::{self, ProfileStore};
+use crate::runtime::{CatalogCtx, LaunchContext, RuntimeBackend};
 use crate::session::{self, LaunchRequest, SessionManager};
 use crate::ui;
 
@@ -83,6 +84,17 @@ pub enum ModelDownloadStatus {
     Failed(String),
 }
 
+/// Where a tracked download's bytes come from, and how to fetch them.
+#[derive(Clone)]
+enum DownloadSource {
+    /// Hugging Face blobs that llmctl fetches into the Hub cache itself.
+    Hub(Box<crate::domain::RemoteModel>),
+    /// A FastFlowLM model, fetched from its Hugging Face repository into
+    /// `flm`'s model directory. Deliberately not `flm pull` — that cannot
+    /// resume and mis-detects partial downloads.
+    Flm(Box<crate::domain::Model>),
+}
+
 pub struct ModelDownload {
     id: u64,
     pub model_id: String,
@@ -90,7 +102,7 @@ pub struct ModelDownload {
     pub downloaded_bytes: u64,
     pub total_bytes: u64,
     pub status: ModelDownloadStatus,
-    remote: crate::domain::RemoteModel,
+    source: DownloadSource,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -136,7 +148,7 @@ fn restore_model_downloads(models_dir: &std::path::Path) -> (Vec<ModelDownload>,
             downloaded_bytes,
             total_bytes,
             status,
-            remote: record.remote,
+            source: DownloadSource::Hub(Box::new(record.remote)),
             cancelled: Arc::new(AtomicBool::new(false)),
         });
         next_id = next_id.wrapping_add(1).max(1);
@@ -285,7 +297,7 @@ pub struct App {
     #[allow(dead_code)] // retained for Phase 2+ (profiles, defaults)
     pub config: Config,
     pub focus: Pane,
-    pub runtimes: PaneList<Runtime>,
+    pub runtimes: PaneList<Box<dyn RuntimeBackend>>,
     pub models: PaneList<Model>,
     /// Child nodes of the selected catalog directory (empty for a model leaf).
     pub catalog_preview: Vec<Model>,
@@ -311,8 +323,13 @@ pub struct App {
     /// Scroll offset (lines from the top) for the log view when not following.
     pub log_scroll: u16,
     should_quit: bool,
-    /// Discovered GGUF models for the llama.cpp runtime.
+    /// Discovered GGUF models for the llama.cpp runtime, plus its cached online
+    /// tree. The online browsing machinery below is llama.cpp-specific, so this
+    /// list stays llama.cpp's alone.
     scanned_models: Vec<Model>,
+    /// FastFlowLM's catalog, from `flm list`. Unlike the GGUF scan this is a
+    /// single curated list covering installed and available models alike.
+    flm_models: Vec<Model>,
     catalog_prefix: Vec<String>,
     catalog_history: Vec<(Vec<Model>, Option<usize>, Vec<String>)>,
     /// Expanded, absolute model search directories.
@@ -331,11 +348,11 @@ pub struct App {
     online_tx: Sender<discovery::online::Response>,
     online_rx: Receiver<discovery::online::Response>,
     online_pending: Option<discovery::online::Request>,
-    llama_hf_supported: bool,
-    llama_draft_hf_supported: bool,
-    llama_mmproj_auto_supported: bool,
     online_search_due: Option<(Instant, String)>,
     online_sort: discovery::online::Sort,
+    /// Which of the selected runtime's `catalog_views` is active (cycled with
+    /// `s`). Runtimes offering a single arrangement ignore it.
+    catalog_view: usize,
     online_epoch: u64,
     online_reload_deferred: bool,
     online_restore_models: bool,
@@ -348,17 +365,7 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config, paths: Paths) -> Self {
-        // Discover the real llama.cpp runtime; keep vLLM as a demo stub.
-        let llama = discovery::discover_llama_cpp(&config.runtime.llama_cpp, &paths.cache_dir);
-        let llama_help =
-            std::fs::read_to_string(paths.cache_dir.join("llama-server.help.txt")).ok();
-        let llama_hf_supported = llama_help
-            .as_deref()
-            .is_some_and(|help| help.contains("--hf-repo") && help.contains("--hf-file"));
-        let llama_draft_hf_supported =
-            llama_help.as_deref().is_some_and(|help| help.contains("--spec-draft-hf"));
-        let llama_mmproj_auto_supported =
-            llama_help.as_deref().is_some_and(|help| help.contains("--mmproj-auto"));
+        let runtimes = crate::runtime::discover(&config, &paths);
         let model_sources = resolve_model_sources(&config.models.paths, &config.models.sources);
         let model_cache = paths.cache_dir.join("models.json");
         let mut scanned_models = discovery::scan_models(&model_sources, &model_cache);
@@ -366,7 +373,24 @@ impl App {
         let online_sort = discovery::online::cached_sort(&paths.models_dir);
         let (model_downloads, next_download_id) = restore_model_downloads(&paths.models_dir);
         scanned_models.extend(discovery::online::load_cached(&paths.models_dir));
-        let store = ProfileStore::load(paths.state_dir.join("profiles.json"), &scanned_models);
+
+        let catalog_ctx = CatalogCtx {
+            sources: &model_sources,
+            cache_path: &model_cache,
+            models_dir: &paths.models_dir,
+            view: 0,
+            // Nothing is memoized yet, so this reads from `flm` either way.
+            reload: false,
+        };
+        let flm_models = runtimes
+            .iter()
+            .find(|backend| !backend.supports_online_browse())
+            .map(|backend| backend.models(&catalog_ctx))
+            .unwrap_or_default();
+
+        let mut all_models = scanned_models.clone();
+        all_models.extend(flm_models.iter().cloned());
+        let store = ProfileStore::load(paths.state_dir.join("profiles.json"), &all_models);
         // Built after discovery's one-shot `Command`s: the supervisor ignores
         // SIGCHLD, which would otherwise prevent reaping those probe processes.
         let sessions = SessionManager::new(paths.sessions_dir.clone(), paths.log_dir.clone());
@@ -376,7 +400,7 @@ impl App {
         let mut app = Self {
             config,
             focus: Pane::Runtime,
-            runtimes: PaneList::new(vec![llama, stubs::vllm_runtime()]),
+            runtimes: PaneList::new(runtimes),
             models: PaneList::new(Vec::new()),
             catalog_preview: Vec::new(),
             profiles: PaneList::new(Vec::new()),
@@ -394,6 +418,7 @@ impl App {
             log_scroll: 0,
             should_quit: false,
             scanned_models,
+            flm_models,
             catalog_prefix: Vec::new(),
             catalog_history: Vec::new(),
             model_sources,
@@ -406,11 +431,9 @@ impl App {
             online_tx,
             online_rx,
             online_pending: None,
-            llama_hf_supported,
-            llama_draft_hf_supported,
-            llama_mmproj_auto_supported,
             online_search_due: None,
             online_sort,
+            catalog_view: 0,
             online_epoch: 0,
             online_reload_deferred: false,
             online_restore_models: false,
@@ -434,6 +457,7 @@ impl App {
             self.poll_online();
             self.poll_online_search();
             self.poll_model_download();
+            self.poll_restarts();
             if self.last_tick.elapsed() >= Duration::from_secs(1) {
                 self.tick();
             }
@@ -454,6 +478,15 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// Finish any restart whose old process has exited. Polled on the input
+    /// loop rather than the one-second tick so a restart comes back promptly.
+    fn poll_restarts(&mut self) {
+        let errors = self.sessions.poll_restarts();
+        if !errors.is_empty() {
+            self.message = Some(Message { title: "Restart failed".into(), lines: errors });
+        }
     }
 
     /// Periodic refresh: update live session status/resources, and reload the
@@ -619,6 +652,12 @@ impl App {
     }
 
     fn maybe_fetch_online(&mut self, force: bool) {
+        // FastFlowLM names its remote group `online` too, and `request_for_path`
+        // only inspects the path — without this, browsing its catalog would fire
+        // Hugging Face requests for repositories that do not exist.
+        if !self.runtimes.selected().is_some_and(|backend| backend.supports_online_browse()) {
+            return;
+        }
         let Some(selected) = self.models.selected() else { return };
         let Some(request) =
             discovery::online::request_for_path(&selected.catalog_path, self.online_sort)
@@ -655,8 +694,15 @@ impl App {
         }
     }
 
+    /// Is the Hugging Face browsing surface — Hub-wide search, sort orders,
+    /// lazy repository fetches — active right now?
+    ///
+    /// The path alone is not enough: FastFlowLM also names its remote group
+    /// `online`, but that is a fixed catalog rather than a live view of the Hub,
+    /// so the runtime has to agree.
     pub fn online_view_active(&self) -> bool {
-        self.focus >= Pane::Model
+        self.runtimes.selected().is_some_and(|backend| backend.supports_online_browse())
+            && self.focus >= Pane::Model
             && (discovery::online::is_online_path(&self.catalog_prefix)
                 || self
                     .models
@@ -664,23 +710,69 @@ impl App {
                     .is_some_and(|model| discovery::online::is_online_path(&model.catalog_path)))
     }
 
+    /// Title for a catalog pane showing `prefix`.
+    ///
+    /// A runtime with alternative arrangements names the active one; otherwise
+    /// the Hub subtree names its sort order, and everything else is "Model".
+    fn catalog_title(&self, prefix: &[String]) -> String {
+        match self.catalog_view_label() {
+            Some(view) => view.to_string(),
+            None => model_catalog_title(prefix, self.online_sort),
+        }
+    }
+
     pub fn model_pane_title(&self) -> String {
-        model_catalog_title(&self.catalog_prefix, self.online_sort)
+        self.catalog_title(&self.catalog_prefix)
     }
 
     pub fn catalog_parent_title(&self) -> String {
-        self.catalog_history
-            .last()
-            .map(|(_, _, prefix)| model_catalog_title(prefix, self.online_sort))
-            .unwrap_or_else(|| "Model".into())
+        match self.catalog_history.last() {
+            Some((_, _, prefix)) => self.catalog_title(prefix),
+            None => "Model".into(),
+        }
     }
 
     pub fn catalog_preview_title(&self) -> String {
         self.models
             .selected()
             .filter(|model| model.is_catalog_dir())
-            .map(|model| model_catalog_title(&model.catalog_path, self.online_sort))
+            .map(|model| self.catalog_title(&model.catalog_path))
             .unwrap_or_else(|| self.model_pane_title())
+    }
+
+    /// How many arrangements the selected runtime offers for its catalog.
+    fn catalog_view_count(&self) -> usize {
+        self.runtimes.selected().map(|backend| backend.catalog_views().len()).unwrap_or(0)
+    }
+
+    /// The name of the active arrangement, for the pane title.
+    pub fn catalog_view_label(&self) -> Option<&'static str> {
+        let views = self.runtimes.selected()?.catalog_views();
+        if views.len() < 2 {
+            return None;
+        }
+        views.get(self.catalog_view % views.len()).copied()
+    }
+
+    /// Switch to the next catalog arrangement (`s`), rebuilding the tree.
+    fn cycle_catalog_view(&mut self) {
+        let count = self.catalog_view_count();
+        if count < 2 {
+            return;
+        }
+        // Remember where we are browsing, and what is selected if it is a
+        // model, so the new arrangement can restore both.
+        let prefix = self.catalog_prefix.clone();
+        let selection = self.selected_model().map(|model| model.id.clone());
+
+        self.catalog_view = (self.catalog_view + 1) % count;
+        self.catalog_history.clear();
+        self.catalog_prefix.clear();
+        // Same catalog, arranged differently — no reason to ask `flm` again.
+        self.refresh_flm_models(false);
+        self.rebuild_below(Pane::Runtime);
+
+        self.restore_catalog_position(selection.as_deref(), &prefix);
     }
 
     fn cycle_online_sort(&mut self) {
@@ -728,7 +820,7 @@ impl App {
 
     fn show_online_models_root(&mut self) {
         if let Some(runtime) =
-            self.runtimes.items.iter().position(|runtime| runtime.name == "llama.cpp")
+            self.runtimes.items.iter().position(|backend| backend.supports_online_browse())
         {
             self.runtimes.state.select(Some(runtime));
         }
@@ -803,8 +895,15 @@ impl App {
                     .selected()
                     .filter(|model| model.is_catalog_dir())
                     .map(|model| model.catalog_path.as_slice());
-                let scope = normalized_search_scope(self.focus, selected_dir, &self.catalog_prefix);
-                let online = discovery::online::is_online_path(&scope);
+                let hub = self
+                    .runtimes
+                    .selected()
+                    .is_some_and(|backend| backend.supports_online_browse());
+                let scope =
+                    normalized_search_scope(self.focus, selected_dir, &self.catalog_prefix, hub);
+                // FastFlowLM's `online` group is a local catalog, so `/` filters
+                // it in place rather than querying the Hub.
+                let online = hub && discovery::online::is_online_path(&scope);
                 self.model_search = Some(ModelSearch {
                     query: String::new(),
                     cursor: 0,
@@ -817,6 +916,9 @@ impl App {
             KeyCode::Char('y') => self.yank_command(),
             KeyCode::Char('s') if self.focus == Pane::Model && self.online_view_active() => {
                 self.cycle_online_sort()
+            }
+            KeyCode::Char('s') if self.focus == Pane::Model && self.catalog_view_count() > 1 => {
+                self.cycle_catalog_view()
             }
             KeyCode::Char('s') => self.start_session(),
             KeyCode::Char('C') => self.start_chat(),
@@ -878,7 +980,7 @@ impl App {
                     .model_search
                     .as_ref()
                     .and_then(|s| s.result_indices.get(s.cursor))
-                    .and_then(|i| self.scanned_models.get(*i))
+                    .and_then(|i| self.catalog_source().get(*i))
                     .cloned();
                 let promote = self.model_search.as_ref().is_some_and(|search| search.online)
                     && target.as_ref().is_some_and(|model| {
@@ -933,7 +1035,7 @@ impl App {
 
     pub fn search_results(&self) -> Vec<&Model> {
         let Some(search) = &self.model_search else { return Vec::new() };
-        search.result_indices.iter().filter_map(|i| self.scanned_models.get(*i)).collect()
+        search.result_indices.iter().filter_map(|i| self.catalog_source().get(*i)).collect()
     }
 
     fn refresh_model_search(&mut self) {
@@ -962,64 +1064,67 @@ impl App {
         scope: &[String],
         online_only: bool,
     ) -> Vec<usize> {
-        let query = raw_query.to_lowercase();
-        let tokens: Vec<&str> = query.split_whitespace().collect();
-        let mut matches: Vec<(i32, usize)> = self
-            .scanned_models
-            .iter()
-            .enumerate()
-            .filter_map(|(index, m)| {
-                if !catalog_entry_in_search_scope(
-                    &m.catalog_path,
-                    m.remote.is_some(),
-                    scope,
-                    online_only,
-                ) {
-                    return None;
-                }
-                let artifact = m.name.to_lowercase();
-                let path = m.catalog_path.join(" ").to_lowercase();
-                if !tokens.iter().all(|t| artifact.contains(t) || path.contains(t)) {
-                    return None;
-                }
-                let mut score = 0;
-                if artifact == query || artifact.trim_end_matches(".gguf") == query {
-                    score += 1000;
-                } else if artifact.starts_with(&query) {
-                    score += 500;
-                }
-                score += tokens.iter().filter(|t| artifact.contains(**t)).count() as i32 * 100;
-                Some((score, index))
-            })
-            .collect();
-        matches.sort_by(|(sa, a), (sb, b)| {
-            sb.cmp(sa).then_with(|| {
-                self.scanned_models[*a].catalog_path.cmp(&self.scanned_models[*b].catalog_path)
-            })
-        });
-        matches.into_iter().map(|(_, index)| index).collect()
+        rank_models(self.catalog_source(), raw_query, scope, online_only)
     }
 
-    fn jump_to_model(&mut self, id: &str) {
+    /// Navigate to a model by id, within the selected runtime. Returns whether
+    /// the model was found and the browser moved.
+    fn jump_to_model(&mut self, id: &str) -> bool {
         let Some(path) =
-            self.scanned_models.iter().find(|m| m.id == id).map(|m| m.catalog_path.clone())
+            self.catalog_source().iter().find(|m| m.id == id).map(|m| m.catalog_path.clone())
         else {
-            return;
+            return false;
         };
-        let Some(route) = self.catalog_route(&path) else { return };
-        let Some(runtime) = self.runtimes.items.iter().position(|rt| rt.name == "llama.cpp") else {
-            return;
-        };
-
-        // Commit only after the complete route and compatible runtime exist.
-        self.runtimes.state.select(Some(runtime));
+        let Some(route) = self.catalog_route(&path) else { return false };
         self.focus = Pane::Model;
+        self.apply_catalog_route(route);
+        true
+    }
+
+    /// Commit a resolved route — only ever called once the whole route exists,
+    /// so the browser never lands half-way.
+    fn apply_catalog_route(&mut self, route: CatalogRoute) {
         self.catalog_prefix = route.prefix;
         self.catalog_history = route.history;
         self.models.items = route.items;
         self.models.state.select(Some(route.selected));
         self.rebuild_below(Pane::Model);
         self.maybe_fetch_online(false);
+    }
+
+    /// Put the browser back where it was after the catalog was rebuilt in a
+    /// different arrangement.
+    ///
+    /// The anchor is the directory being browsed, not the highlighted row: a
+    /// row may be a folder that the new arrangement does not have, and landing
+    /// *on* a folder is not the same as being *inside* one. Browsing
+    /// `online ▸ chat` in Categories should leave you inside `online` in Flat,
+    /// looking at models — not back at the group list with `online` highlighted.
+    ///
+    /// A selected model takes precedence, since it is identified by tag and so
+    /// survives regrouping wherever it lands.
+    fn restore_catalog_position(&mut self, selection: Option<&str>, prefix: &[String]) {
+        if let Some(id) = selection
+            && self.jump_to_model(id)
+        {
+            return;
+        }
+        self.descend_to_prefix(prefix);
+    }
+
+    /// Move the browser inside `prefix`, or the deepest part of it that still
+    /// exists, listing that directory's contents.
+    fn descend_to_prefix(&mut self, prefix: &[String]) {
+        for depth in (1..=prefix.len()).rev() {
+            let Some(route) = self.catalog_route(&prefix[..depth]) else { continue };
+            self.apply_catalog_route(route);
+            // `catalog_route` lands *on* the directory; step into it so the
+            // pane shows its contents.
+            if self.models.selected().is_some_and(|model| model.is_catalog_dir()) {
+                self.enter();
+            }
+            return;
+        }
     }
 
     fn catalog_route(&self, path: &[String]) -> Option<CatalogRoute> {
@@ -1143,107 +1248,67 @@ impl App {
     }
 
     /// Build a launch request from the current selection and resolved options.
+    ///
+    /// Everything runtime-specific — the argv, the readiness path, the process
+    /// token, any pre-flight capability check — comes from the backend.
     fn build_launch_request(&self) -> Result<LaunchRequest, String> {
-        if self.is_stub_runtime() {
-            return Err("vLLM is a navigation-only stub (not launchable)".into());
+        let backend = self.runtimes.selected().ok_or("no runtime selected")?;
+        if let Some(reason) = backend.unavailable_reason() {
+            return Err(reason);
         }
-        let rt = self.runtimes.selected().ok_or("no runtime selected")?;
         let model = self.selected_model().ok_or("no model selected")?;
-        let options = self.options.items.clone();
-        let mtp_enabled = option_value(&options, "spec-type").as_deref() == Some("draft-mtp");
-        let remote = model.remote.as_ref();
-        let base_missing = remote.is_some() && model.path.as_os_str().is_empty();
-        let remote_mtp_missing = mtp_enabled
-            && model.mtp_path.is_none()
-            && remote.is_some_and(|remote| remote.mtp_file.is_some());
-        let remote_projector_missing = model.projector_path.is_none()
-            && remote.is_some_and(|remote| remote.projector_file.is_some());
-        let remote_draft_hf = remote_mtp_missing
-            .then(|| {
-                let remote = remote?;
-                draft_hf_repository(&remote.repo, remote.mtp_file.as_deref()?)
-            })
-            .flatten();
-        let remote_launch =
-            remote.is_some() && (base_missing || remote_mtp_missing || remote_projector_missing);
-        if remote_launch && !self.llama_hf_supported {
-            return Err(
-                "this llama-server does not advertise --hf-repo/--hf-file; upgrade llama.cpp"
-                    .into(),
-            );
-        }
-        if remote_draft_hf.is_some() && !self.llama_draft_hf_supported {
-            return Err(
-                "this llama-server does not advertise --spec-draft-hf; upgrade llama.cpp or download the MTP companion first"
-                    .into(),
-            );
-        }
-        if remote_projector_missing && !self.llama_mmproj_auto_supported {
-            return Err(
-                "this llama-server does not advertise --mmproj-auto; upgrade llama.cpp or download the projector first"
-                    .into(),
-            );
-        }
         let profile = self.profiles.selected().ok_or("no profile selected")?;
-        let binary = rt
+        let options = self.options.items.clone();
+        let binary = backend
+            .descriptor()
             .binary_path
             .as_ref()
-            .ok_or("llama-server binary not found on PATH")?
+            .ok_or("runtime binary not found on PATH")?
             .display()
             .to_string();
+
+        let ctx = LaunchContext { binary: &binary, model, options: &options };
+        if let Some(blocker) = backend.launch_blocker(&ctx) {
+            return Err(blocker);
+        }
+
         let host = option_value(&options, "host").unwrap_or_else(|| "127.0.0.1".into());
-        let port = option_value(&options, "port").and_then(|v| v.parse().ok()).unwrap_or(8000);
-        let mtp_path = mtp_enabled
-            .then(|| model.mtp_path.as_ref().map(|path| path.display().to_string()))
-            .flatten();
-        let projector_path = model.projector_path.as_ref().map(|path| path.display().to_string());
-        let draft_hf = remote_launch.then_some(remote_draft_hf).flatten();
-        let projector_auto = remote_launch
-            && projector_path.is_none()
-            && remote.is_some_and(|remote| remote.projector_file.is_some());
-        let download = remote_launch
-            .then(|| {
-                let remote = remote?;
-                let blobs = remote
-                    .blobs
-                    .iter()
-                    .filter(|blob| {
-                        remote.mtp_file.as_deref() != Some(blob.file.as_str())
-                            && remote.projector_file.as_deref() != Some(blob.file.as_str())
-                    })
-                    .filter_map(|blob| {
-                        let (incomplete_file, complete_file) =
-                            discovery::online::cache_blob_paths(&remote.repo, &blob.oid)?;
-                        Some(session::record::DownloadBlob {
-                            incomplete_file,
-                            complete_file,
-                            expected_bytes: blob.size_bytes,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                (!blobs.is_empty()).then_some(session::record::DownloadRecord { blobs })
-            })
-            .flatten();
+        let port = option_value(&options, "port")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| backend.schema().spec("port")?.default.parse().ok())
+            .unwrap_or(8000);
+
         Ok(LaunchRequest {
-            runtime: rt.name.clone(),
-            binary,
+            runtime: backend.descriptor().name.clone(),
             model: model.name.clone(),
-            model_path: if remote_launch {
-                remote.and_then(|remote| remote.file.clone()).unwrap_or_default()
-            } else {
-                model.path.display().to_string()
-            },
-            mtp_path,
-            projector_path,
-            hf_repo: remote_launch.then(|| remote.map(|remote| remote.repo.clone())).flatten(),
-            draft_hf,
-            projector_auto,
-            download,
+            model_path: backend.process_token(&ctx),
+            command: backend.build_command(&ctx),
+            health_path: backend.health_path().to_string(),
+            download: backend.launch_download(&ctx),
             profile: profile.name.clone(),
             host,
             port,
-            options,
         })
+    }
+
+    /// Why a second model cannot be started on `runtime` right now, as message
+    /// lines — or `None` if the runtime is happy to run several at once, or has
+    /// nothing live.
+    ///
+    /// Kept out of [`App::build_launch_request`] on purpose: this blocks
+    /// *starting* a model, not building its command, so `y` still previews and
+    /// copies the launch line while a session holds the device.
+    fn single_session_conflict(&self, runtime: &str) -> Option<Vec<String>> {
+        let backend = self.runtimes.items.iter().find(|b| b.descriptor().name == runtime)?;
+        if !backend.single_session() {
+            return None;
+        }
+        let live = self.sessions.active_for_runtime(runtime)?;
+        Some(vec![
+            format!("{runtime} can only run one model at a time."),
+            format!("{} is {}.", live.record.name, live.status_label()),
+            "Stop it in the Session Manager (x), then start this one.".into(),
+        ])
     }
 
     /// Preview the generated command and copy it to the clipboard (`y`).
@@ -1253,29 +1318,10 @@ impl App {
         }
         match self.build_launch_request() {
             Ok(req) => {
-                let cmd = match &req.hf_repo {
-                    Some(repo) => session::command::Command::build_huggingface(
-                        &req.binary,
-                        repo,
-                        &req.model_path,
-                        req.mtp_path.as_deref(),
-                        req.draft_hf.as_deref(),
-                        req.projector_path.as_deref(),
-                        req.projector_auto,
-                        &req.options,
-                    ),
-                    None => session::command::Command::build_local(
-                        &req.binary,
-                        &req.model_path,
-                        req.mtp_path.as_deref(),
-                        req.projector_path.as_deref(),
-                        &req.options,
-                    ),
-                };
-                copy_to_clipboard(&cmd.display());
+                copy_to_clipboard(&req.command.display());
                 self.message = Some(Message {
                     title: "Launch command".into(),
-                    lines: command_message_lines(&cmd),
+                    lines: command_message_lines(&req.command),
                 });
             }
             Err(e) => {
@@ -1297,6 +1343,10 @@ impl App {
                 return;
             }
         };
+        if let Some(lines) = self.single_session_conflict(&req.runtime) {
+            self.message = Some(Message { title: "Cannot launch".into(), lines });
+            return;
+        }
         match self.sessions.launch(req) {
             Ok(idx) => {
                 let endpoint = self.sessions.sessions[idx].record.endpoint();
@@ -1316,8 +1366,13 @@ impl App {
         }
     }
 
+    /// Start (or reveal) a download for the selected model — the `d` key.
     fn download_selected_model(&mut self) {
         let Some(model) = self.selected_model().cloned() else { return };
+        if model.flm.is_some() {
+            self.download_flm_model(&model);
+            return;
+        }
         let Some(remote) = model.remote.clone() else { return };
         let total_bytes = remote.blobs.iter().map(|blob| blob.size_bytes).sum();
         let downloaded_bytes = discovery::online::cached_downloaded_bytes(&remote);
@@ -1381,13 +1436,68 @@ impl App {
             downloaded_bytes: 0,
             total_bytes,
             status: ModelDownloadStatus::Downloading,
-            remote: remote.clone(),
+            source: DownloadSource::Hub(Box::new(remote.clone())),
             cancelled: cancelled.clone(),
         });
+        self.reveal_latest_download();
+        self.spawn_model_download(id, DownloadSource::Hub(Box::new(remote)), cancelled);
+    }
+
+    /// `flm pull <tag>`. There is no persisted resume record: `flm` keeps its
+    /// own partial state and a re-run picks up where it left off, so an
+    /// interrupted pull is simply started again.
+    fn download_flm_model(&mut self, model: &Model) {
+        let Some(flm) = model.flm.as_ref() else { return };
+        if flm.installed {
+            return;
+        }
+        // Already tracked: jump to it rather than starting a second transfer.
+        if let Some(index) =
+            self.model_downloads.iter().position(|download| download.model_id == model.id)
+        {
+            let restartable = matches!(
+                self.model_downloads[index].status,
+                ModelDownloadStatus::Cancelled
+                    | ModelDownloadStatus::Interrupted
+                    | ModelDownloadStatus::Failed(_)
+            );
+            if restartable {
+                let id = self.next_download_id();
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let source = self.model_downloads[index].source.clone();
+                let download = &mut self.model_downloads[index];
+                download.id = id;
+                download.status = ModelDownloadStatus::Downloading;
+                download.cancelled = cancelled.clone();
+                self.spawn_model_download(id, source, cancelled);
+            }
+            self.screen = Screen::Sessions;
+            self.session_sel.select(Some(self.sessions.sessions.len() + index));
+            return;
+        }
+
+        let id = self.next_download_id();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let source = DownloadSource::Flm(Box::new(model.clone()));
+        self.model_downloads.push(ModelDownload {
+            id,
+            model_id: model.id.clone(),
+            model: flm.tag.clone(),
+            downloaded_bytes: 0,
+            total_bytes: model.size_bytes,
+            status: ModelDownloadStatus::Downloading,
+            source: source.clone(),
+            cancelled: cancelled.clone(),
+        });
+        self.reveal_latest_download();
+        self.spawn_model_download(id, source, cancelled);
+    }
+
+    /// Switch to the Session Manager with the newest download selected.
+    fn reveal_latest_download(&mut self) {
         self.screen = Screen::Sessions;
         self.session_sel
             .select(Some(self.sessions.sessions.len() + self.model_downloads.len() - 1));
-        self.spawn_model_download(id, remote, cancelled);
     }
 
     fn next_download_id(&mut self) -> u64 {
@@ -1396,29 +1506,37 @@ impl App {
         id
     }
 
-    fn spawn_model_download(
-        &self,
-        id: u64,
-        remote: crate::domain::RemoteModel,
-        cancelled: Arc<AtomicBool>,
-    ) {
+    fn spawn_model_download(&self, id: u64, source: DownloadSource, cancelled: Arc<AtomicBool>) {
         let tx = self.download_tx.clone();
         std::thread::spawn(move || {
-            let result = discovery::online::download_model(
-                &remote,
-                &cancelled,
-                |downloaded_bytes, total_bytes| {
-                    let _ =
-                        tx.send(ModelDownloadEvent::Progress { id, downloaded_bytes, total_bytes });
-                },
-            )
-            .map_err(|error| error.to_string());
+            let progress = |downloaded_bytes, total_bytes| {
+                let _ = tx.send(ModelDownloadEvent::Progress { id, downloaded_bytes, total_bytes });
+            };
+            let result = match source {
+                DownloadSource::Hub(remote) => {
+                    discovery::online::download_model(&remote, &cancelled, progress)
+                        .map_err(|error| error.to_string())
+                }
+                DownloadSource::Flm(model) => {
+                    crate::runtime::flm::download(&model, &cancelled, progress).map(|outcome| {
+                        match outcome {
+                            crate::runtime::flm::DownloadOutcome::Downloaded(path) => {
+                                discovery::online::DownloadResult::Downloaded(path)
+                            }
+                            crate::runtime::flm::DownloadOutcome::Cancelled => {
+                                discovery::online::DownloadResult::Cancelled
+                            }
+                        }
+                    })
+                }
+            };
             let _ = tx.send(ModelDownloadEvent::Finished { id, result });
         });
     }
 
     fn poll_model_download(&mut self) {
         let mut refresh_models = false;
+        let mut refresh_flm = false;
         let mut completed_records = Vec::new();
         while let Ok(event) = self.download_rx.try_recv() {
             match event {
@@ -1444,8 +1562,13 @@ impl App {
                         Ok(discovery::online::DownloadResult::Downloaded(path)) => {
                             download.downloaded_bytes = download.total_bytes;
                             download.status = ModelDownloadStatus::Downloaded(path);
-                            completed_records.push(download.model_id.clone());
-                            refresh_models = true;
+                            match download.source {
+                                DownloadSource::Flm { .. } => refresh_flm = true,
+                                DownloadSource::Hub(_) => {
+                                    completed_records.push(download.model_id.clone());
+                                    refresh_models = true;
+                                }
+                            }
                         }
                         Ok(discovery::online::DownloadResult::Cancelled) => {
                             download.status = ModelDownloadStatus::Cancelled;
@@ -1465,9 +1588,28 @@ impl App {
                 tracing::warn!(%error, model = %model_id, "failed to remove completed download record");
             }
         }
+        if refresh_flm {
+            // A download just finished: `flm` now reports the model installed,
+            // which is exactly the change the cached catalog cannot know about.
+            self.refresh_flm_models(true);
+            self.reselect_current_catalog();
+        }
         if refresh_models {
             self.refresh_downloaded_online_models();
         }
+    }
+
+    /// Rebuild the Model pane in place, keeping the cursor on the same entry.
+    fn reselect_current_catalog(&mut self) {
+        let selected = self.models.selected().map(|model| model.id.clone());
+        let items = self.catalog_children(&self.catalog_prefix);
+        let index = selected
+            .as_ref()
+            .and_then(|id| items.iter().position(|model| &model.id == id))
+            .unwrap_or(0);
+        self.models.items = items;
+        self.models.state.select((!self.models.items.is_empty()).then_some(index));
+        self.rebuild_below(Pane::Model);
     }
 
     fn refresh_downloaded_online_models(&mut self) {
@@ -1475,7 +1617,7 @@ impl App {
         self.scanned_models.retain(|model| !discovery::online::is_online_path(&model.catalog_path));
         self.scanned_models.extend(discovery::online::load_cached(&self.models_dir));
         self.store.sync_models(&self.scanned_models);
-        if self.runtimes.selected().is_some_and(|runtime| runtime.name == "llama.cpp") {
+        if self.runtimes.selected().is_some_and(|backend| backend.supports_online_browse()) {
             let items = self.catalog_children(&self.catalog_prefix);
             let index = selected
                 .as_ref()
@@ -1499,87 +1641,85 @@ impl App {
         }
         let id = self.next_download_id();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let remote = self.model_downloads[index].remote.clone();
-        let record = discovery::online::DownloadJobRecord::new(
-            self.model_downloads[index].model_id.clone(),
-            self.model_downloads[index].model.clone(),
-            remote.clone(),
-        );
-        if let Err(error) = discovery::online::save_download_record(&self.models_dir, &record) {
-            self.message = Some(Message {
-                title: "Cannot resume".into(),
-                lines: vec![format!("Cannot persist download state: {error}")],
-            });
-            return;
+        let source = self.model_downloads[index].source.clone();
+        // Only Hub downloads persist a resume record; `flm` tracks its own.
+        if let DownloadSource::Hub(remote) = &source {
+            let record = discovery::online::DownloadJobRecord::new(
+                self.model_downloads[index].model_id.clone(),
+                self.model_downloads[index].model.clone(),
+                (**remote).clone(),
+            );
+            if let Err(error) = discovery::online::save_download_record(&self.models_dir, &record) {
+                self.message = Some(Message {
+                    title: "Cannot resume".into(),
+                    lines: vec![format!("Cannot persist download state: {error}")],
+                });
+                return;
+            }
         }
         let download = &mut self.model_downloads[index];
         download.id = id;
         download.status = ModelDownloadStatus::Downloading;
         download.cancelled = cancelled.clone();
-        self.spawn_model_download(id, remote, cancelled);
+        self.spawn_model_download(id, source, cancelled);
     }
 
-    /// Launch an interactive `llama-cli` chat for the current selection in the
-    /// foreground (`C`). Server-only flags (host/port) are dropped and
-    /// conversation mode is forced; the TUI is suspended while it runs.
+    /// Run the runtime's interactive client in the foreground (`C`), suspending
+    /// the TUI while it owns the terminal. Server-only flags are dropped by the
+    /// backend.
     fn start_chat(&mut self) {
         if self.focus != Pane::Profile && self.focus != Pane::Options {
             return;
         }
-        let req = match self.build_launch_request() {
-            Ok(req) => req,
-            Err(e) => {
-                self.message = Some(Message { title: "Cannot start chat".into(), lines: vec![e] });
-                return;
-            }
-        };
-        let Some(cli) = cli_binary(&req.binary) else {
-            self.message = Some(Message {
-                title: "llama-cli not found".into(),
-                lines: vec![
-                    "Expected a 'llama-cli' binary next to llama-server.".into(),
-                    "Chat mode needs the interactive llama.cpp client.".into(),
-                ],
-            });
+        let Some(backend) = self.runtimes.selected() else { return };
+        if let Some(reason) = backend.unavailable_reason() {
+            self.message = Some(Message { title: "Cannot start chat".into(), lines: vec![reason] });
             return;
-        };
-        // Drop server-only flags; keep the model plus sampling/runtime options.
-        let opts: Vec<OptionItem> =
-            req.options.into_iter().filter(|o| o.key != "host" && o.key != "port").collect();
-        let cmd = match &req.hf_repo {
-            Some(repo) => session::command::Command::build_huggingface(
-                &cli.display().to_string(),
-                repo,
-                &req.model_path,
-                req.mtp_path.as_deref(),
-                req.draft_hf.as_deref(),
-                req.projector_path.as_deref(),
-                req.projector_auto,
-                &opts,
-            ),
-            None => session::command::Command::build_local(
-                &cli.display().to_string(),
-                &req.model_path,
-                req.mtp_path.as_deref(),
-                req.projector_path.as_deref(),
-                &opts,
-            ),
-        };
-        let mut argv = cmd.argv;
-        argv.push("-cnv".into()); // conversation/chat mode
-        self.pending_chat = Some(argv);
-    }
-
-    /// Run `llama-bench` for the selected model with the benchmark's defaults.
-    fn start_benchmark(&mut self) {
-        let Some(model) = self.selected_model() else {
+        }
+        // An interactive client loads the model too, so it collides with a live
+        // server on a single-session runtime exactly as a second launch would.
+        let runtime = backend.descriptor().name.clone();
+        if let Some(lines) = self.single_session_conflict(&runtime) {
+            self.message = Some(Message { title: "Cannot start chat".into(), lines });
             return;
-        };
-        let Some(bench) = self.runtimes.selected().and_then(|runtime| runtime.bench_path.as_ref())
+        }
+        let (Some(model), Some(binary)) =
+            (self.selected_model(), backend.descriptor().binary_path.as_ref())
         else {
             return;
         };
-        self.pending_benchmark = Some(benchmark_argv(bench, &model.path, &self.options.items));
+        let binary = binary.display().to_string();
+        let ctx = LaunchContext { binary: &binary, model, options: &self.options.items };
+        match backend.chat_argv(&ctx) {
+            Some(argv) => self.pending_chat = Some(argv),
+            None => {
+                self.message = Some(Message {
+                    title: "Chat unavailable".into(),
+                    lines: vec![format!("{runtime} has no interactive client on this system.")],
+                });
+            }
+        }
+    }
+
+    /// Run the runtime's benchmark tool in the foreground (`b`). Runtimes
+    /// without one leave `pending_benchmark` unset, so the key is inert.
+    fn start_benchmark(&mut self) {
+        let (Some(backend), Some(model)) = (self.runtimes.selected(), self.selected_model()) else {
+            return;
+        };
+        // A benchmark loads the model just as a server or an interactive client
+        // does, so it collides with a live session on a single-session runtime.
+        // Only reachable since FastFlowLM gained a benchmark: `llama-bench`
+        // belongs to a runtime that is happy to run several at once.
+        let runtime = backend.descriptor().name.clone();
+        if let Some(lines) = self.single_session_conflict(&runtime) {
+            self.message = Some(Message { title: "Cannot start benchmark".into(), lines });
+            return;
+        }
+        let Some(binary) = backend.descriptor().binary_path.as_ref() else { return };
+        let binary = binary.display().to_string();
+        let ctx = LaunchContext { binary: &binary, model, options: &self.options.items };
+        self.pending_benchmark = backend.bench_argv(&ctx);
     }
 
     pub fn async_job_count(&self) -> usize {
@@ -1780,7 +1920,7 @@ impl App {
     /// ([`SELECTOR_THRESHOLD`]) open the filterable selector popup; numeric/
     /// string open a text prompt. Applies only to real (non-stub) runtimes.
     fn open_editor(&mut self) {
-        if self.focus != Pane::Options || self.is_stub_runtime() {
+        if self.focus != Pane::Options {
             return;
         }
         let Some(option) = self.options.selected() else {
@@ -1792,7 +1932,7 @@ impl App {
         if key == "device" {
             let mut variants = vec![profiles::registry::DEFAULT.to_string()];
             if let Some(runtime) = self.runtimes.selected() {
-                variants.extend(runtime.devices.iter().cloned());
+                variants.extend(runtime.descriptor().devices.iter().cloned());
             }
             self.selector = Some(Selector {
                 title: "Select device".into(),
@@ -1804,7 +1944,8 @@ impl App {
             return;
         }
 
-        if let Some(spec) = profiles::registry::spec(&key) {
+        let Some(backend) = self.runtimes.selected() else { return };
+        if let Some(spec) = backend.schema().spec(&key) {
             use profiles::registry::OptionKind;
             if let OptionKind::Enum(variants) = spec.kind {
                 if variants.len() > SELECTOR_THRESHOLD {
@@ -1820,13 +1961,13 @@ impl App {
                 }
                 // Small enums don't need a popup — `e` advances to the next
                 // state (which, for omittable options, cycles "default" too).
-                if let Some(next) = spec.bump(&spec.kind, &current, 1) {
+                if let Some(next) = backend.schema().bump(spec, &spec.kind, &current, 1) {
                     self.apply_option_value(&key, next);
                 }
                 return;
             }
         }
-        let title = if profiles::registry::uses_sentinel(&key) {
+        let title = if backend.schema().uses_sentinel(&key) {
             format!("Edit {key} (number or 'default')")
         } else {
             format!("Edit {key}")
@@ -1843,7 +1984,7 @@ impl App {
     /// Unlike `Home`, this restores the *resolved* default — the omit token for
     /// omittable options, but e.g. ctx/8 for ctx-size or the config host/port.
     fn reset_option_default(&mut self) {
-        if self.focus != Pane::Options || self.is_stub_runtime() {
+        if self.focus != Pane::Options {
             return;
         }
         let Some(option) = self.options.selected() else {
@@ -1861,14 +2002,17 @@ impl App {
                 let next = self
                     .runtimes
                     .selected()
-                    .map(|runtime| cycle_device(&runtime.devices, &option.value, dir));
+                    .map(|runtime| cycle_device(&runtime.descriptor().devices, &option.value, dir));
                 if let Some(next) = next {
                     self.apply_option_value("device", next);
                 }
                 return;
             }
         }
-        self.transform_option(|spec, kind, current| spec.bump(kind, current, dir));
+        let schema = self.runtimes.selected().map(|b| b.schema());
+        self.transform_option(move |spec, kind, current| {
+            schema.and_then(|schema| schema.bump(spec, kind, current, dir))
+        });
     }
 
     /// Set the selected option to its min (`dir < 0`) or max (`dir > 0`).
@@ -1885,7 +2029,7 @@ impl App {
             &str,
         ) -> Option<String>,
     ) {
-        if self.focus != Pane::Options || self.is_stub_runtime() {
+        if self.focus != Pane::Options {
             return;
         }
         let Some(option) = self.options.selected() else {
@@ -1893,12 +2037,13 @@ impl App {
         };
         let key = option.key.clone();
         let current = option.value.clone();
-        let Some(spec) = profiles::registry::spec(&key) else {
+        let Some(backend) = self.runtimes.selected() else { return };
+        let Some(spec) = backend.schema().spec(&key) else {
             return;
         };
         // Use the model-aware kind so ctx-size respects the model's max context.
         let kind = match self.selected_model() {
-            Some(m) => profiles::effective_kind(spec, m),
+            Some(m) => backend.effective_kind(spec, m),
             None => spec.kind,
         };
         if let Some(value) = f(spec, &kind, &current) {
@@ -1930,16 +2075,17 @@ impl App {
     }
 
     fn commit_option_edit(&mut self, key: &str, input: &str) -> Result<(), String> {
-        let spec = profiles::registry::spec(key).ok_or("unknown option")?;
+        let backend = self.runtimes.selected().ok_or("no runtime selected")?;
+        let spec = backend.schema().spec(key).ok_or("unknown option")?;
         // Sentinel options accept "default" (or an empty entry) to drop the flag.
-        if profiles::registry::uses_sentinel(key)
+        if backend.schema().uses_sentinel(key)
             && (input.is_empty() || input.eq_ignore_ascii_case(profiles::registry::DEFAULT))
         {
             self.apply_option_value(key, profiles::registry::DEFAULT.to_string());
             return Ok(());
         }
         let kind = match self.selected_model() {
-            Some(m) => profiles::effective_kind(spec, m),
+            Some(m) => backend.effective_kind(spec, m),
             None => spec.kind,
         };
         let value = kind.validate(input)?;
@@ -1950,15 +2096,15 @@ impl App {
     /// Persist an option value to the model-scoped instance (auto-saves) and
     /// refresh the Options pane while preserving the cursor position.
     fn apply_option_value(&mut self, key: &str, value: String) {
-        let (Some(rt), Some(m), Some(p)) =
+        let (Some(backend), Some(m), Some(p)) =
             (self.runtimes.selected(), self.selected_model(), self.profiles.selected())
         else {
             return;
         };
-        let runtime = rt.name.clone();
+        let runtime = backend.descriptor().name.clone();
         let model = m.profile_key();
         let profile = p.clone();
-        let base = profiles::resolved_values(&profile, m, &self.config.defaults);
+        let base = profiles::resolved_values(backend.as_ref(), &profile, m, &self.config.defaults);
 
         let cursor = self.options.state.selected();
         self.store.set_value(&runtime, &model, &profile.name, key, value, &base);
@@ -1968,18 +2114,18 @@ impl App {
 
     /// Toggle the favorite flag on the selected profile (real runtimes only).
     fn toggle_favorite(&mut self) {
-        if self.focus != Pane::Profile || self.is_stub_runtime() {
+        if self.focus != Pane::Profile {
             return;
         }
-        let (Some(rt), Some(m), Some(p)) =
+        let (Some(backend), Some(m), Some(p)) =
             (self.runtimes.selected(), self.selected_model(), self.profiles.selected())
         else {
             return;
         };
-        let runtime = rt.name.clone();
+        let runtime = backend.descriptor().name.clone();
         let model = m.profile_key();
         let profile = p.clone();
-        let base = profiles::resolved_values(&profile, m, &self.config.defaults);
+        let base = profiles::resolved_values(backend.as_ref(), &profile, m, &self.config.defaults);
 
         let cursor = self.profiles.state.selected();
         self.store.toggle_favorite(&runtime, &model, &profile.name, &base);
@@ -1990,7 +2136,7 @@ impl App {
     // --- profile management (Profile pane) ---------------------------------
 
     fn prompt_new_profile(&mut self) {
-        if self.focus != Pane::Profile || self.is_stub_runtime() {
+        if self.focus != Pane::Profile {
             return;
         }
         self.prompt = Some(Prompt {
@@ -2002,7 +2148,7 @@ impl App {
     }
 
     fn prompt_rename_profile(&mut self) {
-        if self.focus != Pane::Profile || self.is_stub_runtime() {
+        if self.focus != Pane::Profile {
             return;
         }
         let Some(p) = self.profiles.selected() else {
@@ -2021,7 +2167,7 @@ impl App {
     }
 
     fn prompt_duplicate_profile(&mut self) {
-        if self.focus != Pane::Profile || self.is_stub_runtime() {
+        if self.focus != Pane::Profile {
             return;
         }
         let Some(p) = self.profiles.selected() else {
@@ -2038,15 +2184,15 @@ impl App {
 
     /// Delete a custom profile, or reset a built-in to its template defaults.
     fn delete_profile(&mut self) {
-        if self.focus != Pane::Profile || self.is_stub_runtime() {
+        if self.focus != Pane::Profile {
             return;
         }
-        let (Some(rt), Some(m), Some(p)) =
+        let (Some(backend), Some(m), Some(p)) =
             (self.runtimes.selected(), self.selected_model(), self.profiles.selected())
         else {
             return;
         };
-        let runtime = rt.name.clone();
+        let runtime = backend.descriptor().name.clone();
         let model = m.profile_key();
         let name = p.name.clone();
 
@@ -2063,10 +2209,12 @@ impl App {
     fn commit_new_profile(&mut self, name: &str) -> Result<(), String> {
         self.validate_new_name(name)?;
         let (runtime, model) = self.current_runtime_model().ok_or("no model selected")?;
+        let backend = self.runtimes.selected().ok_or("no runtime selected")?;
         let m = self.selected_model().ok_or("no model selected")?;
         // Seed from the Default template's resolved values for this model.
         let default = Profile { name: "Default".into(), builtin: true, favorite: false };
-        let values = profiles::resolved_values(&default, m, &self.config.defaults);
+        let values =
+            profiles::resolved_values(backend.as_ref(), &default, m, &self.config.defaults);
         self.store.create(&runtime, &model, name, values, true);
         self.refresh_profiles(Some(name));
         Ok(())
@@ -2085,19 +2233,24 @@ impl App {
 
     fn commit_duplicate_profile(&mut self, src: &str, name: &str) -> Result<(), String> {
         self.validate_new_name(name)?;
-        let (Some(rt), Some(m)) = (self.runtimes.selected(), self.selected_model()) else {
+        let (Some(backend), Some(m)) = (self.runtimes.selected(), self.selected_model()) else {
             return Err("no model selected".into());
         };
-        let runtime = rt.name.clone();
+        let runtime = backend.descriptor().name.clone();
         let model = m.profile_key();
         let src_profile = Profile {
             name: src.to_string(),
-            builtin: profiles::templates::is_builtin(src),
+            builtin: profiles::templates::is_builtin(backend.templates(), src),
             favorite: false,
         };
         // Copy the source's *current* values (including any instance edits).
-        let values =
-            profiles::current_values(rt, m, &src_profile, &self.store, &self.config.defaults);
+        let values = profiles::current_values(
+            backend.as_ref(),
+            m,
+            &src_profile,
+            &self.store,
+            &self.config.defaults,
+        );
         self.store.create(&runtime, &model, name, values, true);
         self.refresh_profiles(Some(name));
         Ok(())
@@ -2114,9 +2267,9 @@ impl App {
     }
 
     fn current_runtime_model(&self) -> Option<(String, String)> {
-        let rt = self.runtimes.selected()?;
+        let backend = self.runtimes.selected()?;
         let m = self.selected_model()?;
-        Some((rt.name.clone(), m.profile_key()))
+        Some((backend.descriptor().name.clone(), m.profile_key()))
     }
 
     /// Rebuild the profile list, then optionally select a profile by name and
@@ -2131,75 +2284,81 @@ impl App {
         }
     }
 
-    /// True when the selected runtime is the vLLM stub (no editing/persistence).
-    fn is_stub_runtime(&self) -> bool {
-        self.runtimes.selected().map(|r| r.name == "vLLM").unwrap_or(true)
-    }
-
     /// The selected catalog leaf. Directory nodes intentionally have no path.
     pub fn selected_model(&self) -> Option<&Model> {
         self.models.selected().filter(|m| m.is_model())
     }
 
+    /// Whether `d` can start a download for the selection: an online GGUF that
+    /// is not cached yet, or a FastFlowLM catalog entry that is not installed.
     pub fn download_available(&self) -> bool {
         self.focus == Pane::Model
-            && self.selected_model().is_some_and(|model| {
-                model.path.as_os_str().is_empty()
-                    && model.remote.as_ref().is_some_and(|remote| remote.file.is_some())
+            && self.selected_model().is_some_and(|model| match &model.flm {
+                Some(flm) => !flm.installed,
+                None => {
+                    model.path.as_os_str().is_empty()
+                        && model.remote.as_ref().is_some_and(|remote| remote.file.is_some())
+                }
             })
     }
 
-    /// Whether the selected runtime exposes `llama-bench` for this model.
+    /// Whether the selected runtime ships a benchmark tool for this model.
+    /// The model must be present locally: llama.cpp needs a GGUF to point
+    /// `llama-bench` at, and `flm bench` on an un-pulled tag would turn a
+    /// benchmark into a multi-gigabyte download.
     pub fn benchmark_available(&self) -> bool {
         self.selected_model().is_some_and(|model| !model.path.as_os_str().is_empty())
-            && self.runtimes.selected().and_then(|runtime| runtime.bench_path.as_ref()).is_some()
+            && self
+                .runtimes
+                .selected()
+                .is_some_and(|backend| backend.descriptor().bench_path.is_some())
     }
 
     pub fn catalog_parent(&self) -> Option<(&[Model], Option<usize>)> {
         self.catalog_history.last().map(|(items, selected, _)| (items.as_slice(), *selected))
     }
 
+    /// The flat model list backing the browser tree for the selected runtime.
+    fn catalog_source(&self) -> &[Model] {
+        // The online (Hugging Face) subtree and its blob downloads only exist
+        // for llama.cpp, so the two catalogs are stored separately rather than
+        // merged behind one list.
+        match self.runtimes.selected() {
+            Some(backend) if !backend.supports_online_browse() => &self.flm_models,
+            _ => &self.scanned_models,
+        }
+    }
+
     fn catalog_children(&self, prefix: &[String]) -> Vec<Model> {
-        if let Some(repositories) = online_repository_children(&self.scanned_models, prefix) {
+        let source = self.catalog_source();
+        if let Some(repositories) = online_repository_children(source, prefix) {
             return repositories;
         }
-        if let Some(artifacts) = online_artifact_children(&self.scanned_models, prefix) {
+        if let Some(artifacts) = online_artifact_children(source, prefix) {
             return artifacts;
         }
-        use std::collections::BTreeMap;
-        let mut children: BTreeMap<String, Model> = BTreeMap::new();
-        for model in &self.scanned_models {
-            if !model.catalog_path.starts_with(prefix) || model.catalog_path.len() <= prefix.len() {
-                continue;
-            }
-            let name = model.catalog_path[prefix.len()].clone();
-            let is_leaf = model.catalog_path.len() == prefix.len() + 1;
-            children.entry(name.clone()).or_insert_with(|| {
-                if is_leaf {
-                    model.clone()
-                } else {
-                    Model {
-                        id: String::new(),
-                        name,
-                        path: PathBuf::new(),
-                        shard_paths: Vec::new(),
-                        mtp_path: None,
-                        projector_path: None,
-                        has_mtp: false,
-                        catalog_path: model.catalog_path[..=prefix.len()].to_vec(),
-                        catalog_dir: PathBuf::new(),
-                        size_bytes: 0,
-                        quantization: None,
-                        architecture: None,
-                        context_length: None,
-                        modified: None,
-                        has_chat_template: false,
-                        remote: None,
-                    }
-                }
-            });
-        }
-        children.into_values().collect()
+        catalog_children_of(source, prefix)
+    }
+
+    /// Rebuild the FastFlowLM model list for the current arrangement.
+    ///
+    /// `reload` decides whether `flm list` runs again or the backend serves the
+    /// catalog it already has. Pass it when the catalog itself may have changed
+    /// — a manual refresh, or a download that just installed a model — and not
+    /// when only the arrangement did.
+    fn refresh_flm_models(&mut self, reload: bool) {
+        let Some(backend) = self.runtimes.items.iter().find(|b| !b.supports_online_browse()) else {
+            return;
+        };
+        let ctx = CatalogCtx {
+            sources: &self.model_sources,
+            cache_path: &self.model_cache,
+            models_dir: &self.models_dir,
+            view: self.catalog_view,
+            reload,
+        };
+        self.flm_models = backend.models(&ctx);
+        self.store.sync_models(&self.flm_models);
     }
 
     /// Re-scan configured model directories (the `F5` refresh).
@@ -2208,6 +2367,9 @@ impl App {
             self.reload_online_layout();
             return;
         }
+        // The user asked for fresh data, so go back to `flm` — this is how a
+        // model installed outside llmctl shows up.
+        self.refresh_flm_models(true);
         self.scanned_models = discovery::scan_models(&self.model_sources, &self.model_cache);
         discovery::reconcile(&self.models_dir, &mut self.scanned_models);
         self.scanned_models.extend(discovery::online::load_cached(&self.models_dir));
@@ -2324,28 +2486,22 @@ impl App {
         if level < Pane::Model.index() {
             self.catalog_history.clear();
             self.catalog_prefix.clear();
-            let models = match self.runtimes.selected() {
-                // vLLM is a stub; llama.cpp uses the discovered GGUF models.
-                Some(rt) if rt.name == "vLLM" => stubs::vllm_models(),
-                Some(_) => self.catalog_children(&[]),
-                None => Vec::new(),
+            let models = if self.runtimes.selected().is_some() {
+                self.catalog_children(&[])
+            } else {
+                vec![]
             };
             self.models.replace(models);
         }
         if level < Pane::Profile.index() {
             self.catalog_preview = match self.models.selected() {
-                Some(m) if m.is_catalog_dir() => {
-                    if self.is_stub_runtime() {
-                        Vec::new()
-                    } else {
-                        self.catalog_children(&m.catalog_path)
-                    }
-                }
+                Some(m) if m.is_catalog_dir() => self.catalog_children(&m.catalog_path),
                 _ => Vec::new(),
             };
             let profiles = match (self.runtimes.selected(), self.selected_model()) {
-                (Some(rt), Some(m)) if rt.name == "vLLM" => stubs::profiles_for(m),
-                (Some(rt), Some(m)) => profiles::list_profiles(rt, m, &self.store),
+                (Some(backend), Some(m)) => {
+                    profiles::list_profiles(backend.as_ref(), m, &self.store)
+                }
                 _ => Vec::new(),
             };
             self.profiles.replace(profiles);
@@ -2353,10 +2509,13 @@ impl App {
         if level < Pane::Options.index() {
             let options =
                 match (self.runtimes.selected(), self.selected_model(), self.profiles.selected()) {
-                    (Some(rt), _, Some(p)) if rt.name == "vLLM" => stubs::options_for(p),
-                    (Some(rt), Some(m), Some(p)) => {
-                        profiles::resolve_options(rt, m, p, &self.store, &self.config.defaults)
-                    }
+                    (Some(backend), Some(m), Some(p)) => profiles::resolve_options(
+                        backend.as_ref(),
+                        m,
+                        p,
+                        &self.store,
+                        &self.config.defaults,
+                    ),
                     _ => Vec::new(),
                 };
             self.options.replace(options);
@@ -2367,17 +2526,25 @@ impl App {
     /// (line 1 — a path) and a secondary metadata summary (line 2).
     pub fn status(&self) -> (String, String) {
         match self.focus {
-            Pane::Runtime => self.runtimes.selected().map(|r| {
-                let primary = r
+            Pane::Runtime => self.runtimes.selected().map(|backend| {
+                let runtime = backend.descriptor();
+                let primary = runtime
                     .binary_path
                     .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "(binary not found)".into());
                 let mut meta = Vec::new();
-                if let Some(v) = &r.version {
+                if let Some(v) = &runtime.version {
                     meta.push(v.clone());
                 }
-                meta.push(r.formats_label());
+                meta.push(runtime.formats_label());
+                if !runtime.devices.is_empty() {
+                    meta.push(runtime.devices.join(", "));
+                }
+                // Surface an unusable runtime here rather than at launch time.
+                if let Some(reason) = backend.unavailable_reason() {
+                    meta.push(reason);
+                }
                 (primary, meta.join(" · "))
             }),
             Pane::Model => self.models.selected().map(|m| {
@@ -2470,7 +2637,7 @@ impl App {
     pub fn breadcrumb(&self) -> Vec<String> {
         let mut crumbs = Vec::new();
         if let Some(r) = self.runtimes.selected() {
-            crumbs.push(r.name.clone());
+            crumbs.push(r.descriptor().name.clone());
         }
         if self.focus >= Pane::Model {
             crumbs.extend(self.catalog_prefix.iter().cloned());
@@ -2551,24 +2718,119 @@ fn model_catalog_title(prefix: &[String], sort: discovery::online::Sort) -> Stri
 /// sources. Hovering the virtual `online` source from the runtime root enters
 /// the Hugging Face search scope; entering a flat repository row narrows the
 /// scope to its cached artifacts.
+///
+/// `hub` says whether the selected runtime's `online` group really is the
+/// Hugging Face browser. FastFlowLM uses the same group name for a fixed local
+/// catalog, and expanding its scope to `online/huggingface` would search a
+/// subtree it does not have.
 fn normalized_search_scope(
     focus: Pane,
     selected_dir: Option<&[String]>,
     catalog_prefix: &[String],
+    hub: bool,
 ) -> Vec<String> {
     if discovery::online::is_online_path(catalog_prefix) {
-        if catalog_prefix == ["online"] {
+        if hub && catalog_prefix == ["online"] {
             return vec!["online".into(), "huggingface".into()];
         }
         return catalog_prefix.to_vec();
     }
-    if selected_dir.is_some_and(discovery::online::is_online_path) {
+    if hub && selected_dir.is_some_and(discovery::online::is_online_path) {
         return vec!["online".into(), "huggingface".into()];
     }
     match focus {
         Pane::Runtime => Vec::new(),
         Pane::Model | Pane::Profile | Pane::Options => catalog_prefix.to_vec(),
     }
+}
+
+/// Direct children of `prefix` in a flat model list: leaves are the models
+/// themselves, and deeper paths collapse into one synthetic folder each.
+fn catalog_children_of(source: &[Model], prefix: &[String]) -> Vec<Model> {
+    use std::collections::BTreeMap;
+    let mut children: BTreeMap<String, Model> = BTreeMap::new();
+    for model in source {
+        if !model.catalog_path.starts_with(prefix) || model.catalog_path.len() <= prefix.len() {
+            continue;
+        }
+        let name = model.catalog_path[prefix.len()].clone();
+        let is_leaf = model.catalog_path.len() == prefix.len() + 1;
+        children.entry(name.clone()).or_insert_with(|| {
+            if is_leaf {
+                model.clone()
+            } else {
+                Model {
+                    id: String::new(),
+                    name,
+                    path: PathBuf::new(),
+                    shard_paths: Vec::new(),
+                    mtp_path: None,
+                    projector_path: None,
+                    has_mtp: false,
+                    catalog_path: model.catalog_path[..=prefix.len()].to_vec(),
+                    catalog_dir: PathBuf::new(),
+                    size_bytes: 0,
+                    quantization: None,
+                    architecture: None,
+                    context_length: None,
+                    modified: None,
+                    has_chat_template: false,
+                    remote: None,
+                    flm: None,
+                    runtime: model.runtime.clone(),
+                }
+            }
+        });
+    }
+    children.into_values().collect()
+}
+
+/// Rank `models` against a search query, returning indices **into `models`**.
+///
+/// Taking the slice rather than reading it from `App` is deliberate: the
+/// returned indices are only meaningful against the list they came from, and
+/// llmctl has more than one (llama.cpp's scanned catalog and FastFlowLM's).
+/// Ranking against one list and resolving against another panicked; a single
+/// slice parameter makes that mismatch unrepresentable.
+fn rank_models(
+    models: &[Model],
+    raw_query: &str,
+    scope: &[String],
+    online_only: bool,
+) -> Vec<usize> {
+    let query = raw_query.to_lowercase();
+    let tokens: Vec<&str> = query.split_whitespace().collect();
+    let mut matches: Vec<(i32, usize)> = models
+        .iter()
+        .enumerate()
+        .filter_map(|(index, m)| {
+            if !catalog_entry_in_search_scope(
+                &m.catalog_path,
+                m.remote.is_some(),
+                scope,
+                online_only,
+            ) {
+                return None;
+            }
+            let artifact = m.name.to_lowercase();
+            let path = m.catalog_path.join(" ").to_lowercase();
+            if !tokens.iter().all(|t| artifact.contains(t) || path.contains(t)) {
+                return None;
+            }
+            let mut score = 0;
+            if artifact == query || artifact.trim_end_matches(".gguf") == query {
+                score += 1000;
+            } else if artifact.starts_with(&query) {
+                score += 500;
+            }
+            score += tokens.iter().filter(|t| artifact.contains(**t)).count() as i32 * 100;
+            Some((score, index))
+        })
+        .collect();
+    matches.sort_by(|(sa, a), (sb, b)| {
+        sb.cmp(sa).then_with(|| models[*a].catalog_path.cmp(&models[*b].catalog_path))
+    });
+    matches.into_iter().map(|(_, index)| index).collect()
 }
 
 fn catalog_entry_in_search_scope(
@@ -2662,45 +2924,6 @@ fn option_value(options: &[OptionItem], key: &str) -> Option<String> {
     options.iter().find(|o| o.key == key).map(|o| o.value.clone())
 }
 
-fn draft_hf_repository(repo: &str, file: &str) -> Option<String> {
-    let quant = discovery::models::quant_from_filename(file);
-    if !file.contains('/') && quant.is_none() {
-        return None; // recent llama.cpp auto-discovers a root `mtp-*.gguf` beside `-hf`
-    }
-    Some(quant.map(|quant| format!("{repo}:{quant}")).unwrap_or_else(|| repo.to_string()))
-}
-
-/// Resolve the interactive `llama-cli` binary sitting next to `llama-server`.
-fn cli_binary(server_binary: &str) -> Option<PathBuf> {
-    let p = std::path::Path::new(server_binary);
-    let file = p.file_name()?.to_string_lossy().into_owned();
-    let cli_name = file.replace("llama-server", "llama-cli");
-    if cli_name == file {
-        return None; // not a llama-server-style binary name
-    }
-    let cli = p.with_file_name(cli_name);
-    cli.exists().then_some(cli)
-}
-
-fn benchmark_argv(
-    bench: &std::path::Path,
-    model: &std::path::Path,
-    options: &[OptionItem],
-) -> Vec<String> {
-    let mut argv = vec![bench.display().to_string(), "-m".into(), model.display().to_string()];
-    for (key, flag) in [("device", "--device"), ("gpu-layers", "-ngl")] {
-        if let Some(value) = options
-            .iter()
-            .find(|option| option.key == key && option.value != profiles::registry::DEFAULT)
-            .map(|option| option.value.clone())
-        {
-            argv.push(flag.into());
-            argv.push(value);
-        }
-    }
-    argv
-}
-
 /// Hand the terminal to a foreground tool, then re-enter the TUI. The detached
 /// session supervisor sets `SIGCHLD` to `SIG_IGN`, which would make `wait()`
 /// fail, so default disposition is restored while the tool runs.
@@ -2748,13 +2971,96 @@ fn copy_to_clipboard(text: &str) {
 }
 
 /// Read up to the last `max_lines` lines of a (possibly large) log file.
+///
+/// Servers write to this file as if it were a terminal — carriage returns to
+/// redraw a progress line in place, ANSI sequences to erase it and hide the
+/// cursor. Those bytes must not reach our own terminal, so each line is reduced
+/// to the text a terminal would finally have displayed. Invalid UTF-8 is
+/// replaced rather than discarding the whole file.
 fn read_log_tail(path: &std::path::Path, max_lines: usize) -> Vec<String> {
-    let content = std::fs::read_to_string(path).unwrap_or_default();
-    let mut lines: Vec<String> = content.lines().map(String::from).collect();
+    let bytes = std::fs::read(path).unwrap_or_default();
+    let content = String::from_utf8_lossy(&bytes);
+    let mut lines: Vec<String> = content.lines().map(visible_line).collect();
     if lines.len() > max_lines {
         lines = lines.split_off(lines.len() - max_lines);
     }
     lines
+}
+
+/// Variation selectors (VS1–VS16 and the supplementary block) change how the
+/// preceding character is drawn without being drawn themselves — which is
+/// exactly what makes their width unmeasurable.
+fn is_variation_selector(c: char) -> bool {
+    matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}')
+}
+
+/// What a terminal would show for one log line.
+///
+/// A carriage return rewrites the row from column 0, so a progress bar that
+/// ticked a hundred times arrives as one line holding a hundred states. Only the
+/// last one was ever visible, and it is the only one worth showing in a log
+/// tail — the rest would be a wall of `Downloading: 0.3% … 0.5% …`.
+fn visible_line(raw: &str) -> String {
+    raw.split('\r')
+        .map(strip_control)
+        .filter(|segment| !segment.trim().is_empty())
+        .last()
+        .unwrap_or_default()
+}
+
+/// Drop ANSI escape sequences, stray control bytes, and variation selectors,
+/// keeping printable text.
+///
+/// Left in place, `ESC[K` (erase to end of line) would wipe the rest of the row
+/// including the log pane's border, and `ESC[?25l` would hide the cursor for the
+/// rest of the session.
+///
+/// Variation selectors go for a subtler reason. `⬇️` is `U+2B07 U+FE0F`, and the
+/// selector asks for emoji presentation, which a terminal draws two columns
+/// wide — but `unicode-width` still measures the pair as one. The renderer then
+/// lays the row out one cell narrower than it actually paints, and everything to
+/// its right, border included, is overwritten. Dropping the selector leaves a
+/// bare `U+2B07`, which measures and draws as one column. Characters that are
+/// emoji by default (`🔗`, `🔒`) carry no selector and already measure correctly.
+fn strip_control(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            if is_variation_selector(c) {
+                continue;
+            }
+            if c == '\t' || !c.is_control() {
+                out.push(c);
+            }
+            continue;
+        }
+        match chars.next() {
+            // CSI: parameter bytes, then a final byte in @..~ .
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // OSC: runs until BEL or a String Terminator.
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\x07' {
+                        break;
+                    }
+                    if c == '\x1b' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            // Any other escape is two characters; both are already consumed.
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Cycle through automatic device selection and the devices discovered from
@@ -2785,6 +3091,70 @@ mod tests {
         }
     }
 
+    /// Regression: `flm` writes progress to its log the way it would to a
+    /// terminal. A bare carriage return sent the cursor back to column 0 and
+    /// `ESC[K` erased to end of line, so those rows overwrote the log pane's
+    /// borders and the text beside them.
+    #[test]
+    fn log_lines_are_reduced_to_what_a_terminal_would_show() {
+        // Verbatim bytes from a real FastFlowLM session log.
+        let overall = "\r[FLM]  Overall progress:  1/6 files";
+        assert_eq!(visible_line(overall), "[FLM]  Overall progress:  1/6 files");
+
+        // A progress bar redrawn in place: only the final state was ever visible.
+        let progress = "\u{1b}[?25l\r\u{1b}[K[FLM]  Downloading: 0.0% (0.0MB / 2340.0MB)\
+                        \r\u{1b}[K[FLM]  Downloading: 0.3% (6.0MB / 2340.0MB)\
+                        \r\u{1b}[K[FLM]  Downloading: 100.0% (2340.0MB / 2340.0MB)\u{1b}[?25h";
+        assert_eq!(visible_line(progress), "[FLM]  Downloading: 100.0% (2340.0MB / 2340.0MB)");
+
+        // Cursor show/hide around plain text leaves just the text.
+        assert_eq!(
+            visible_line("\u{1b}[?25l\u{1b}[?25h[FLM]  Checking Hash..."),
+            "[FLM]  Checking Hash..."
+        );
+
+        // Nothing survives a line that was only control bytes.
+        assert_eq!(visible_line("\u{1b}[?25l\u{1b}[?25h"), "");
+
+        // Ordinary lines pass through untouched, including colour codes.
+        assert_eq!(visible_line("plain server line"), "plain server line");
+        assert_eq!(visible_line("\u{1b}[31mred\u{1b}[0m text"), "red text");
+    }
+
+    /// Regression: a variation selector makes a character draw two columns wide
+    /// while `unicode-width` still measures one, so the log pane laid out rows
+    /// narrower than it painted them and clobbered its own border.
+    #[test]
+    fn rendered_log_width_matches_what_the_terminal_draws() {
+        use unicode_width::UnicodeWidthStr;
+
+        // Verbatim from a FastFlowLM session log: U+2B07 followed by U+FE0F.
+        let arrow = visible_line("[\u{2B07}\u{FE0F} ]  Incoming Request: GET");
+        assert_eq!(arrow, "[\u{2B07} ]  Incoming Request: GET");
+        // The selector is gone, so the measured width is now the drawn width.
+        assert!(!arrow.chars().any(is_variation_selector));
+        assert_eq!(arrow.width(), arrow.chars().count());
+
+        // Characters that are emoji by default carry no selector and already
+        // measure correctly at two columns; they must survive untouched.
+        let link = visible_line("[\u{1F517} ]  TCP connection established");
+        assert!(link.starts_with("[\u{1F517}"));
+        assert_eq!(link.width(), link.chars().count() + 1);
+    }
+
+    #[test]
+    fn no_rendered_log_line_can_carry_control_bytes() {
+        // Whatever a server writes, nothing that could move the cursor or erase
+        // the frame may reach the terminal.
+        let nasty = "\u{1b}[2J\u{1b}]0;title\u{7}\rone\u{1b}[Ktwo\u{0}\u{8}";
+        let rendered = visible_line(nasty);
+        assert!(
+            !rendered.chars().any(|c| c.is_control() && c != '\t'),
+            "control byte survived: {rendered:?}"
+        );
+        assert_eq!(rendered, "onetwo");
+    }
+
     #[test]
     fn selector_filters_case_insensitive_substring() {
         let mut sel = selector();
@@ -2802,15 +3172,6 @@ mod tests {
         assert_eq!(transfer_percent(0, 300), 0);
         assert_eq!(transfer_percent(201, 300), 67);
         assert_eq!(transfer_percent(400, 300), 100);
-    }
-
-    #[test]
-    fn root_mtp_uses_hf_auto_discovery_but_nested_quant_is_explicit() {
-        assert_eq!(draft_hf_repository("owner/repo", "mtp-model.gguf"), None);
-        assert_eq!(
-            draft_hf_repository("owner/repo", "MTP/mtp-model-Q8_0.gguf"),
-            Some("owner/repo:Q8_0".into())
-        );
     }
 
     #[test]
@@ -2865,14 +3226,15 @@ mod tests {
 
     #[test]
     fn chat_template_enum_exceeds_the_selector_threshold() {
-        use crate::profiles::registry::{self, OptionKind};
-        let spec = registry::spec("chat-template").unwrap();
+        use crate::profiles::registry::OptionKind;
+        use crate::runtime::llama_cpp::SCHEMA;
+        let spec = SCHEMA.spec("chat-template").unwrap();
         let OptionKind::Enum(variants) = spec.kind else {
             panic!("chat-template should be an enum");
         };
         assert!(variants.len() > SELECTOR_THRESHOLD);
         // The small on/off/auto enums keep cycling in place.
-        let flash = registry::spec("flash-attn").unwrap();
+        let flash = SCHEMA.spec("flash-attn").unwrap();
         let OptionKind::Enum(variants) = flash.kind else {
             panic!("flash-attn should be an enum");
         };
@@ -2895,96 +3257,312 @@ mod tests {
         assert_eq!(cycle_device(&[], "stale-device", -1), "default");
     }
 
+    fn flm_catalog_entry(tag: &str, label: &str) -> Model {
+        let mut model = crate::domain::Model {
+            id: format!("flm:{tag}"),
+            name: tag.into(),
+            path: PathBuf::new(),
+            shard_paths: Vec::new(),
+            mtp_path: None,
+            projector_path: None,
+            has_mtp: false,
+            catalog_path: vec!["online".into(), label.into(), tag.into()],
+            catalog_dir: PathBuf::new(),
+            size_bytes: 0,
+            quantization: None,
+            architecture: None,
+            context_length: None,
+            modified: None,
+            has_chat_template: true,
+            remote: None,
+            flm: None,
+            runtime: crate::runtime::flm::NAME.into(),
+        };
+        model.flm = Some(crate::domain::FlmModel {
+            tag: tag.into(),
+            installed: false,
+            repo: format!("FastFlowLM/{tag}"),
+            revision: "main".into(),
+            files: vec!["model.q4nx".into()],
+            labels: vec![label.into()],
+            vlm: false,
+            asr: false,
+            max_prefill_len: None,
+        });
+        model
+    }
+
+    /// Drives the real app: selecting FastFlowLM and pressing `s` must leave a
+    /// populated Model pane in every arrangement, and must keep the user on the
+    /// model they were looking at rather than resetting to the group list.
+    #[test]
+    #[ignore = "needs a real flm install; run with --ignored --test-threads=1"]
+    fn cycling_the_catalog_view_keeps_the_pane_populated_and_the_selection() {
+        let stamp =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("llmctl-view-{stamp}"));
+        let paths = Paths {
+            config_file: root.join("config.toml"),
+            models_dir: root.join("models"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+            sessions_dir: root.join("sessions"),
+        };
+        paths.ensure_dirs().unwrap();
+
+        let mut app = App::new(Config::default(), paths);
+        let flm = app
+            .runtimes
+            .items
+            .iter()
+            .position(|b| !b.supports_online_browse())
+            .expect("FastFlowLM backend");
+        app.runtimes.state.select(Some(flm));
+        app.rebuild_below(Pane::Runtime);
+        app.focus = Pane::Model;
+
+        assert_eq!(app.catalog_view_label(), Some("Categories"));
+        let categories = app.models.items.len();
+        assert!(categories > 0, "Categories view showed nothing");
+
+        app.on_key(KeyEvent::from(KeyCode::Char('s')));
+
+        assert_eq!(app.catalog_view_label(), Some("Flat"));
+        assert!(!app.models.items.is_empty(), "Flat view showed nothing");
+        // Both arrangements start at the same local/online groups.
+        assert_eq!(app.models.items.len(), categories);
+
+        // And drilling into a group reaches the models themselves.
+        app.enter();
+        assert!(app.models.items.iter().any(|m| m.is_model()), "no models under the group");
+
+        // Select a model, then switch arrangement: the browser must stay on it
+        // rather than dropping back to the group list.
+        let index = app.models.items.iter().position(|m| m.is_model()).unwrap();
+        app.models.state.select(Some(index));
+        app.rebuild_below(Pane::Model);
+        let tag = app.selected_model().unwrap().flm.as_ref().unwrap().tag.clone();
+
+        app.on_key(KeyEvent::from(KeyCode::Char('s')));
+        assert_eq!(app.catalog_view_label(), Some("Categories"));
+        assert_eq!(app.focus, Pane::Model, "arrangement switch moved the focus");
+        assert_eq!(
+            app.selected_model().and_then(|m| m.flm.as_ref()).map(|f| f.tag.clone()),
+            Some(tag.clone()),
+            "arrangement switch lost the selected model"
+        );
+        // Still inside a group, not back at the top of the tree.
+        assert!(!app.catalog_prefix.is_empty(), "arrangement switch reset to the group list");
+
+        // And back again, from the deeper arrangement to the flatter one.
+        app.on_key(KeyEvent::from(KeyCode::Char('s')));
+        assert_eq!(app.catalog_view_label(), Some("Flat"));
+        assert_eq!(
+            app.selected_model().and_then(|m| m.flm.as_ref()).map(|f| f.tag.clone()),
+            Some(tag),
+            "switching back lost the selected model"
+        );
+
+        // F5 re-reads the catalog through the same subprocess path, so it fails
+        // the same way if the SIGCHLD disposition is not handled.
+        app.refresh_models();
+        assert!(!app.flm_models.is_empty(), "F5 emptied the FastFlowLM catalog");
+        assert!(!app.models.items.is_empty(), "F5 emptied the model pane");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Browsing a capability folder in Categories and switching to Flat must
+    /// land inside the group, looking at models — not back at the group list.
+    #[test]
+    #[ignore = "needs a real flm install; run with --ignored --test-threads=1"]
+    fn switching_arrangement_from_a_capability_folder_lands_on_models() {
+        let stamp =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("llmctl-view-folder-{stamp}"));
+        let paths = Paths {
+            config_file: root.join("config.toml"),
+            models_dir: root.join("models"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+            sessions_dir: root.join("sessions"),
+        };
+        paths.ensure_dirs().unwrap();
+
+        let mut app = App::new(Config::default(), paths);
+        let flm = app.runtimes.items.iter().position(|b| !b.supports_online_browse()).unwrap();
+        app.runtimes.state.select(Some(flm));
+        app.rebuild_below(Pane::Runtime);
+        app.focus = Pane::Model;
+        assert_eq!(app.catalog_view_label(), Some("Categories"));
+
+        // Enter `online`, then the `chat` capability folder inside it.
+        let online = app.models.items.iter().position(|m| m.name == "online").unwrap();
+        app.models.state.select(Some(online));
+        app.rebuild_below(Pane::Model);
+        app.enter();
+        let chat = app.models.items.iter().position(|m| m.name == "chat").unwrap();
+        app.models.state.select(Some(chat));
+        app.rebuild_below(Pane::Model);
+        app.enter();
+        assert_eq!(app.catalog_prefix, ["online", "chat"]);
+
+        // Deselect, so the anchor is the directory rather than a model.
+        app.models.state.select(None);
+        app.rebuild_below(Pane::Model);
+        assert!(app.selected_model().is_none());
+
+        app.on_key(KeyEvent::from(KeyCode::Char('s')));
+
+        assert_eq!(app.catalog_view_label(), Some("Flat"));
+        // Inside `online`, showing models — not back at the group list.
+        assert_eq!(app.catalog_prefix, ["online"]);
+        assert!(
+            app.models.items.iter().all(|m| m.is_model()),
+            "expected the flat model list, got folders"
+        );
+        assert!(app.models.items.len() > 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The AMD NPU takes one client at a time, so a live FastFlowLM session has
+    /// to block the next launch — while leaving llama.cpp free to run several.
+    /// Ignored by default: it spawns a stand-in server process.
+    #[test]
+    #[ignore = "spawns a real process; run with --ignored --test-threads=1"]
+    fn a_live_flm_session_blocks_a_second_launch() {
+        use crate::session::LaunchRequest;
+        use crate::session::command::Command;
+
+        let stamp =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("llmctl-exclusive-{stamp}"));
+        let paths = Paths {
+            config_file: root.join("config.toml"),
+            models_dir: root.join("models"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+            sessions_dir: root.join("sessions"),
+        };
+        paths.ensure_dirs().unwrap();
+
+        let mut app = App::new(Config::default(), paths);
+        let flm = crate::runtime::flm::NAME;
+        assert!(app.single_session_conflict(flm).is_none(), "nothing running yet");
+
+        // A stand-in for `flm serve`: long-lived, and never answering /health,
+        // so the session stays non-terminal for the duration of the test.
+        let req = LaunchRequest {
+            runtime: flm.into(),
+            model: "qwen3:0.6b".into(),
+            model_path: "qwen3:0.6b".into(),
+            command: Command { argv: vec!["sleep".into(), "30".into()] },
+            health_path: "/v1/models".into(),
+            download: None,
+            profile: "Default".into(),
+            host: "127.0.0.1".into(),
+            port: 52625,
+        };
+        app.sessions.launch(req).expect("launch stand-in");
+
+        let lines = app.single_session_conflict(flm).expect("a live flm session must block");
+        assert!(lines[0].contains("one model at a time"), "{lines:?}");
+        assert!(lines[1].contains("qwen3"), "the blocking session is named: {lines:?}");
+        // llama.cpp shares no such constraint.
+        assert!(app.single_session_conflict("llama.cpp").is_none());
+
+        // Once it is gone, the guard lifts.
+        app.sessions.stop(0).expect("stop");
+        for _ in 0..50 {
+            app.sessions.refresh();
+            if app.single_session_conflict(flm).is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(app.single_session_conflict(flm).is_none(), "guard stuck after the session ended");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn flat_catalog_walks_from_the_group_straight_to_the_models() {
+        let mut flat = flm_catalog_entry("qwen3:4b", "reasoning");
+        flat.catalog_path = vec!["online".into(), "qwen3:4b".into()];
+        let mut other = flm_catalog_entry("gpt-oss:20b", "chat");
+        other.catalog_path = vec!["online".into(), "gpt-oss:20b".into()];
+        let mut local = flm_catalog_entry("qwen3:0.6b", "chat");
+        local.catalog_path = vec!["local".into(), "qwen3:0.6b".into()];
+        let source = vec![flat, other, local];
+
+        // Top level: the two groups, as folders.
+        let top = catalog_children_of(&source, &[]);
+        assert_eq!(top.iter().map(|m| m.name.clone()).collect::<Vec<_>>(), ["local", "online"]);
+        assert!(top.iter().all(|m| m.is_catalog_dir()));
+
+        // Entering a group lists the models directly — no capability level.
+        let online = catalog_children_of(&source, &["online".into()]);
+        assert_eq!(online.len(), 2);
+        assert!(online.iter().all(|m| m.is_model()), "flat entries must be leaves");
+        assert!(online.iter().any(|m| m.name == "qwen3:4b"));
+    }
+
+    /// Regression: search ranked one runtime's catalog and then resolved the
+    /// resulting indices against another, panicking with an out-of-bounds index
+    /// as soon as the ranked list was the longer of the two.
+    #[test]
+    fn search_indices_address_the_list_they_were_ranked_against() {
+        // A FastFlowLM catalog that is longer than the llama.cpp one, which is
+        // what turned the mismatch into a panic rather than a wrong result.
+        let flm: Vec<Model> =
+            (0..54).map(|i| flm_catalog_entry(&format!("qwen3:{i}b"), "reasoning")).collect();
+
+        let scope = vec!["online".into(), "reasoning".into()];
+        let ranked = rank_models(&flm, "qwen3", &scope, false);
+        assert!(!ranked.is_empty());
+        // Every index must address the slice that was ranked.
+        for index in &ranked {
+            assert!(*index < flm.len(), "index {index} escapes a {}-entry list", flm.len());
+            assert_eq!(flm[*index].runtime, crate::runtime::flm::NAME);
+        }
+
+        // A FastFlowLM entry has no `remote`, so a Hub-scoped search must not
+        // return it — that is what keeps `/` from querying Hugging Face here.
+        assert!(rank_models(&flm, "qwen3", &scope, true).is_empty());
+    }
+
     #[test]
     fn local_search_scope_is_the_current_directory_not_the_hovered_child() {
         let prefix = vec!["models".into(), "team".into()];
         let hovered = vec!["models".into(), "team".into(), "project".into()];
-        assert_eq!(normalized_search_scope(Pane::Model, Some(&hovered), &prefix), prefix);
-        assert!(normalized_search_scope(Pane::Runtime, Some(&hovered), &prefix).is_empty());
+        assert_eq!(normalized_search_scope(Pane::Model, Some(&hovered), &prefix, true), prefix);
+        assert!(normalized_search_scope(Pane::Runtime, Some(&hovered), &prefix, true).is_empty());
     }
 
     #[test]
     fn online_search_scope_tracks_the_flat_repository_folder() {
         let online = vec!["online".into()];
         assert_eq!(
-            normalized_search_scope(Pane::Model, Some(&online), &[]),
+            normalized_search_scope(Pane::Model, Some(&online), &[], true),
             vec!["online", "huggingface"]
         );
 
+        // FastFlowLM names its remote group `online` too, but it is a fixed
+        // local catalog — the scope must stay put rather than expanding into a
+        // Hugging Face subtree it does not have.
+        assert_eq!(
+            normalized_search_scope(Pane::Model, Some(&online), &[], false),
+            Vec::<String>::new()
+        );
+        let flm = vec!["online".into(), "reasoning".into()];
+        assert_eq!(normalized_search_scope(Pane::Model, None, &flm, false), flm);
+
         let repository = vec!["online".into(), "huggingface".into(), "unsloth/model".into()];
-        assert_eq!(normalized_search_scope(Pane::Profile, None, &repository), repository);
-    }
-
-    #[test]
-    fn online_repository_list_preserves_hub_ranking() {
-        let repository = |name: &str, downloads: u64| {
-            let mut model = crate::domain::stubs::vllm_models().remove(0);
-            model.name = name.into();
-            model.catalog_path = vec!["online".into(), "huggingface".into(), name.into()];
-            model.remote = Some(crate::domain::RemoteModel {
-                repo: name.into(),
-                revision: None,
-                file: None,
-                blobs: Vec::new(),
-                mtp_file: None,
-                projector_file: None,
-                downloads,
-                likes: 0,
-                gated: false,
-            });
-            model
-        };
-        let ranked = vec![
-            repository("antirez/deepseek-v4-gguf", 5_100_000),
-            repository("HauhauCS/Qwen3.6", 2_600_000),
-        ];
-
-        let children =
-            online_repository_children(&ranked, &["online".into(), "huggingface".into()]).unwrap();
-
-        assert_eq!(
-            children.iter().map(|model| model.name.as_str()).collect::<Vec<_>>(),
-            vec!["antirez/deepseek-v4-gguf", "HauhauCS/Qwen3.6"]
-        );
-    }
-
-    #[test]
-    fn online_artifacts_are_sorted_by_size_ascending() {
-        let artifact = |name: &str, size_bytes: u64| {
-            let mut model = crate::domain::stubs::vllm_models().remove(0);
-            model.name = name.into();
-            model.size_bytes = size_bytes;
-            model.catalog_path =
-                vec!["online".into(), "huggingface".into(), "owner/repo".into(), name.into()];
-            model.remote = Some(crate::domain::RemoteModel {
-                repo: "owner/repo".into(),
-                revision: None,
-                file: Some(name.into()),
-                blobs: Vec::new(),
-                mtp_file: None,
-                projector_file: None,
-                downloads: 0,
-                likes: 0,
-                gated: false,
-            });
-            model
-        };
-        let models = vec![
-            artifact("Q8_0.gguf", 40_000),
-            artifact("Q4_K_XL.gguf", 20_800),
-            artifact("Q4_K_M.gguf", 20_600),
-        ];
-
-        let children = online_artifact_children(
-            &models,
-            &["online".into(), "huggingface".into(), "owner/repo".into()],
-        )
-        .unwrap();
-
-        assert_eq!(
-            children.iter().map(|model| model.name.as_str()).collect::<Vec<_>>(),
-            vec!["Q4_K_M.gguf", "Q4_K_XL.gguf", "Q8_0.gguf"]
-        );
+        assert_eq!(normalized_search_scope(Pane::Profile, None, &repository, true), repository);
     }
 
     #[test]
@@ -3015,56 +3593,5 @@ mod tests {
             &["online".into(), "huggingface".into()],
             true
         ));
-    }
-
-    #[test]
-    fn benchmark_omits_default_device_and_gpu_layers() {
-        let defaults = vec![
-            OptionItem {
-                key: "device".into(),
-                value: profiles::registry::DEFAULT.into(),
-                default: String::new(),
-                range: None,
-                cli: "--device".into(),
-                description: String::new(),
-            },
-            OptionItem {
-                key: "gpu-layers".into(),
-                value: profiles::registry::DEFAULT.into(),
-                default: String::new(),
-                range: None,
-                cli: "-ngl".into(),
-                description: String::new(),
-            },
-        ];
-        assert_eq!(
-            benchmark_argv(
-                "/opt/llama/llama-bench".as_ref(),
-                "/models/qwen.gguf".as_ref(),
-                &defaults
-            ),
-            vec!["/opt/llama/llama-bench", "-m", "/models/qwen.gguf"]
-        );
-    }
-
-    #[test]
-    fn benchmark_applies_profile_device_and_gpu_layers() {
-        let option = |key: &str, value: &str| OptionItem {
-            key: key.into(),
-            value: value.into(),
-            default: String::new(),
-            range: None,
-            cli: String::new(),
-            description: String::new(),
-        };
-        let argv = benchmark_argv(
-            "llama-bench".as_ref(),
-            "model.gguf".as_ref(),
-            &[option("device", "Vulkan0"), option("gpu-layers", "99")],
-        );
-        assert_eq!(
-            argv,
-            vec!["llama-bench", "-m", "model.gguf", "--device", "Vulkan0", "-ngl", "99"]
-        );
     }
 }

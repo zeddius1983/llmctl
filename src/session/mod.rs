@@ -17,7 +17,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 
-use crate::domain::OptionItem;
 use command::Command;
 use health::Health;
 use proc::CpuSample;
@@ -33,6 +32,8 @@ pub enum SessionStatus {
     Starting,
     /// `/health` returned 200 (or it was previously Running and is still alive).
     Running,
+    /// Stopped and waiting for the old process to exit before respawning.
+    Restarting,
     /// We asked it to stop and the process is gone.
     Stopped,
     /// The process exited without us asking it to.
@@ -51,6 +52,7 @@ impl SessionStatus {
             SessionStatus::Downloading => "⇩",
             SessionStatus::Running => "●",
             SessionStatus::Starting => "◐",
+            SessionStatus::Restarting => "↻",
             SessionStatus::Crashed => "✖",
             SessionStatus::Stopped => "■",
             SessionStatus::Unknown => "?",
@@ -62,6 +64,7 @@ impl SessionStatus {
             SessionStatus::Downloading => "Downloading",
             SessionStatus::Running => "Running",
             SessionStatus::Starting => "Starting",
+            SessionStatus::Restarting => "Restarting",
             SessionStatus::Crashed => "Crashed",
             SessionStatus::Stopped => "Stopped",
             SessionStatus::Unknown => "Unknown",
@@ -74,6 +77,28 @@ impl SessionStatus {
     }
 }
 
+/// A restart that has signalled the old process and is waiting for it to exit
+/// before the replacement is spawned.
+///
+/// Respawning immediately is a race: the old server still holds its port, its
+/// GPU memory, or — on the AMD NPU, which grants exactly one hardware context —
+/// the device itself, and the replacement loses. Waiting is what makes a restart
+/// land on the same port with the same resources.
+struct PendingRestart {
+    argv: Vec<String>,
+    preferred_port: u16,
+    /// The process being waited on: the *real* server, already re-acquired
+    /// through any launcher wrapper. `None` if it was already gone.
+    old_pid: Option<i32>,
+    /// When politeness runs out and the old process gets SIGKILL.
+    kill_at: std::time::Instant,
+    /// Whether that escalation has happened, so it happens only once.
+    escalated: bool,
+}
+
+/// How long a restart waits for a graceful exit before escalating to SIGKILL.
+const RESTART_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// One tracked session: its persisted record plus live, in-memory status.
 pub struct Session {
     pub record: SessionRecord,
@@ -85,6 +110,8 @@ pub struct Session {
     requested_stop: bool,
     /// Previous CPU sample for delta-based percentage.
     last_cpu: Option<CpuSample>,
+    /// Set while a restart is waiting out the old process; see [`PendingRestart`].
+    restart_pending: Option<PendingRestart>,
 }
 
 impl Session {
@@ -98,6 +125,7 @@ impl Session {
             download_percent,
             requested_stop: false,
             last_cpu: None,
+            restart_pending: None,
         }
     }
 
@@ -149,21 +177,25 @@ fn download_record_percent(download: &DownloadRecord) -> Option<u8> {
 
 /// Everything the manager needs to launch a server. Built by the app from the
 /// current runtime/model/profile selection and resolved options.
+///
+/// The argv is assembled by the runtime backend before it gets here — the
+/// manager stays out of the business of knowing anyone's flags; it only patches
+/// the `--port` value if the preferred port turns out to be taken.
 pub struct LaunchRequest {
     pub runtime: String,
-    pub binary: String,
     pub model: String,
+    /// The token that identifies this model in the server's own command line: a
+    /// GGUF path for llama.cpp, a `name:size` tag for FastFlowLM. Used to
+    /// re-acquire the process from `/proc`, so it must appear in the argv.
     pub model_path: String,
-    pub mtp_path: Option<String>,
-    pub projector_path: Option<String>,
-    pub hf_repo: Option<String>,
-    pub draft_hf: Option<String>,
-    pub projector_auto: bool,
+    /// The launch command, already built by the backend.
+    pub command: Command,
+    /// HTTP path whose `200` means "ready" for this runtime.
+    pub health_path: String,
     pub download: Option<DownloadRecord>,
     pub profile: String,
     pub host: String,
     pub port: u16,
-    pub options: Vec<OptionItem>,
 }
 
 /// Owns the supervisor and the set of tracked sessions.
@@ -198,7 +230,7 @@ impl SessionManager {
             let alive =
                 proc::is_alive(record.pid) && proc::cmdline_matches(record.pid, &record.model_path);
             if alive {
-                let status = match health::probe(&record.host, record.port) {
+                let status = match health::probe(&record.host, record.port, &record.health_path) {
                     Health::Ready => SessionStatus::Running,
                     _ if download_percent(&record).is_some() => SessionStatus::Downloading,
                     _ => SessionStatus::Starting,
@@ -210,35 +242,15 @@ impl SessionManager {
         }
     }
 
-    /// Launch a server from `req`, resolving a free port if the preferred one is
-    /// taken. Returns the index of the new session.
+    /// Launch the already-built command in `req`, moving to a free port if the
+    /// preferred one is taken. Returns the index of the new session.
     pub fn launch(&mut self, req: LaunchRequest) -> Result<usize> {
         let port = self.resolve_port(req.port, None);
 
-        // Reflect the resolved port in the options we render into the command.
-        let mut options = req.options;
-        if let Some(opt) = options.iter_mut().find(|o| o.key == "port") {
-            opt.value = port.to_string();
-        }
-        let command = match &req.hf_repo {
-            Some(repo) => Command::build_huggingface(
-                &req.binary,
-                repo,
-                &req.model_path,
-                req.mtp_path.as_deref(),
-                req.draft_hf.as_deref(),
-                req.projector_path.as_deref(),
-                req.projector_auto,
-                &options,
-            ),
-            None => Command::build_local(
-                &req.binary,
-                &req.model_path,
-                req.mtp_path.as_deref(),
-                req.projector_path.as_deref(),
-                &options,
-            ),
-        };
+        // Every backend emits an explicit `--port`, so the resolved port can be
+        // patched into the finished argv rather than rebuilding it.
+        let mut command = req.command;
+        set_port_arg(&mut command.argv, port);
 
         let id = next_id();
         let log_file = supervisor::log_path(&self.log_dir, &id);
@@ -256,6 +268,7 @@ impl SessionManager {
             host: req.host,
             port,
             command: command.argv,
+            health_path: req.health_path,
             log_file,
             download: req.download,
             started_unix: now_unix(),
@@ -268,6 +281,15 @@ impl SessionManager {
         };
         self.sessions.push(Session::new(record, status));
         Ok(self.sessions.len() - 1)
+    }
+
+    /// The first session of `runtime` that still holds its resources — anything
+    /// not yet Stopped or Crashed, including one still downloading, since that
+    /// process is already up and will claim the device the moment it serves.
+    ///
+    /// Used to enforce [`crate::runtime::RuntimeBackend::single_session`].
+    pub fn active_for_runtime(&self, runtime: &str) -> Option<&Session> {
+        self.sessions.iter().find(|s| !s.status.is_terminal() && s.record.runtime == runtime)
     }
 
     /// The live pid that actually backs a session, re-acquiring the real server
@@ -309,6 +331,12 @@ impl SessionManager {
     /// to call on the periodic UI tick.
     pub fn refresh(&mut self) {
         for idx in 0..self.sessions.len() {
+            // A restart in flight owns this session until its replacement is up:
+            // the old pid is on its way out and the new one does not exist yet,
+            // so sampling it would only misread the gap as a crash.
+            if self.sessions[idx].restart_pending.is_some() {
+                continue;
+            }
             if self.sessions[idx].status.is_terminal() {
                 self.sessions[idx].cpu_percent = None;
                 self.sessions[idx].rss_bytes = None;
@@ -331,10 +359,18 @@ impl SessionManager {
             let prev = self.sessions[idx].last_cpu;
             let was_running = self.sessions[idx].status == SessionStatus::Running;
             let progress = download_percent(&self.sessions[idx].record);
+            let health_path = self.sessions[idx].record.health_path.clone();
 
             let rss = proc::rss_bytes(pid);
             let sample = proc::cpu_sample(pid);
-            let health = health::probe(&host, port);
+            // Once a session is Running its status no longer depends on the
+            // probe — the `was_running` arm below keeps it Running for as long
+            // as the process lives — so re-probing every tick buys nothing. It
+            // does cost something: servers that log each connection (FastFlowLM
+            // logs four lines per request) fill their own log with llmctl's
+            // health checks. Probe only while readiness is still in question.
+            let health =
+                if was_running { Health::Ready } else { health::probe(&host, port, &health_path) };
 
             let s = &mut self.sessions[idx];
             s.rss_bytes = rss;
@@ -374,18 +410,100 @@ impl SessionManager {
         }
     }
 
-    /// Stop the running process and relaunch with the stored command.
+    /// Ask the running process to stop, and arrange for the replacement to be
+    /// spawned once it is actually gone.
+    ///
+    /// The respawn is deferred rather than immediate because SIGTERM only
+    /// *starts* a shutdown: until the old server exits it still holds its port
+    /// and its device, and a replacement launched in that window either lands on
+    /// a different port or, on a single-session runtime, fails outright.
+    /// [`SessionManager::poll_restarts`] finishes the job on the caller's tick,
+    /// so nothing blocks the UI while the old process winds down.
     pub fn restart(&mut self, idx: usize) -> Result<()> {
+        if self.sessions.get(idx).is_some_and(|s| s.restart_pending.is_some()) {
+            return Err(anyhow!("already restarting"));
+        }
         let live = self.live_pid(idx);
-        let (mut command, preferred) = {
+        let (argv, preferred_port) = {
             let s = self.sessions.get(idx).ok_or_else(|| anyhow!("no such session"))?;
             (s.record.command.clone(), s.record.port)
         };
-        // Stop the old process; allow reusing its own port by excluding it.
         if let Some(pid) = live {
             let _ = self.supervisor.stop(pid);
         }
-        let port = self.resolve_port(preferred, Some(idx));
+
+        let session = &mut self.sessions[idx];
+        session.restart_pending = Some(PendingRestart {
+            argv,
+            preferred_port,
+            old_pid: live,
+            kill_at: std::time::Instant::now() + RESTART_GRACE,
+            escalated: false,
+        });
+        // Not a user-requested stop: the session is on its way back up, and must
+        // not latch as Stopped if the old process disappears before the tick.
+        session.requested_stop = false;
+        session.status = SessionStatus::Restarting;
+        session.cpu_percent = None;
+        session.rss_bytes = None;
+        session.last_cpu = None;
+        Ok(())
+    }
+
+    /// Advance every pending restart: spawn the replacement for any whose old
+    /// process has exited, and escalate to SIGKILL for any that has outstayed
+    /// [`RESTART_GRACE`]. Cheap enough for the poll loop.
+    ///
+    /// Returns one message per restart whose replacement failed to spawn — the
+    /// error the immediate-respawn version used to return from `restart` itself.
+    /// A session that stays `Restarting` is one whose old process will not die;
+    /// that is reported by showing it, not by inventing an outcome.
+    pub fn poll_restarts(&mut self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for idx in 0..self.sessions.len() {
+            let Some((old_pid, kill_at, escalated)) = self.sessions[idx]
+                .restart_pending
+                .as_ref()
+                .map(|p| (p.old_pid, p.kill_at, p.escalated))
+            else {
+                continue;
+            };
+
+            if !self.old_process_gone(idx, old_pid) {
+                if !escalated && std::time::Instant::now() >= kill_at {
+                    if let Some(pid) = old_pid {
+                        let _ = self.supervisor.kill(pid);
+                    }
+                    if let Some(pending) = self.sessions[idx].restart_pending.as_mut() {
+                        pending.escalated = true;
+                    }
+                }
+                continue;
+            }
+
+            let Some(pending) = self.sessions[idx].restart_pending.take() else { continue };
+            if let Err(error) = self.spawn_replacement(idx, pending) {
+                self.sessions[idx].status = SessionStatus::Crashed;
+                errors.push(format!("{}: {error}", self.sessions[idx].record.name));
+            }
+        }
+        errors
+    }
+
+    /// Whether the process a restart is waiting on has exited. The argv check
+    /// guards against a recycled pid looking like the old server.
+    fn old_process_gone(&self, idx: usize, old_pid: Option<i32>) -> bool {
+        let Some(pid) = old_pid else { return true };
+        let Some(session) = self.sessions.get(idx) else { return true };
+        !(proc::is_alive(pid) && proc::cmdline_matches(pid, &session.record.model_path))
+    }
+
+    /// Launch the replacement for a restart whose old process is gone, reusing
+    /// the session slot. The preferred port is now genuinely free, so a restart
+    /// normally comes back on the port it left.
+    fn spawn_replacement(&mut self, idx: usize, pending: PendingRestart) -> Result<()> {
+        let mut command = pending.argv;
+        let port = self.resolve_port(pending.preferred_port, Some(idx));
         set_port_arg(&mut command, port);
 
         let id = next_id();
@@ -554,14 +672,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The single-session guard must see a session that is still starting or
+    /// downloading (the device is spoken for) but ignore one that has ended.
+    #[test]
+    fn active_for_runtime_matches_only_live_sessions_of_that_runtime() {
+        fn record(runtime: &str) -> SessionRecord {
+            SessionRecord {
+                id: "0-0".into(),
+                name: format!("{runtime}-model"),
+                runtime: runtime.into(),
+                model: "m".into(),
+                model_path: "m".into(),
+                profile: "Default".into(),
+                pid: 1,
+                host: "127.0.0.1".into(),
+                port: 1,
+                command: vec![],
+                health_path: "/health".into(),
+                log_file: PathBuf::new(),
+                download: None,
+                started_unix: 0,
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("llmctl-active-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut mgr = SessionManager::new(dir.clone(), dir);
+        mgr.sessions = vec![
+            Session::new(record("FastFlowLM"), SessionStatus::Crashed),
+            Session::new(record("llama.cpp"), SessionStatus::Running),
+        ];
+        assert!(mgr.active_for_runtime("FastFlowLM").is_none(), "a crashed session is not live");
+        assert!(mgr.active_for_runtime("vLLM").is_none(), "unknown runtime");
+        assert!(mgr.active_for_runtime("llama.cpp").is_some());
+
+        // Downloading counts: the process is up and will claim the device.
+        mgr.sessions[0].status = SessionStatus::Downloading;
+        assert!(mgr.active_for_runtime("FastFlowLM").is_some());
+    }
+
     #[test]
     fn downloading_status_includes_percentage() {
         assert_eq!(session_status_label(SessionStatus::Downloading, Some(67)), "Downloading (67%)");
         assert_eq!(session_status_label(SessionStatus::Starting, None), "Starting");
     }
 
-    fn opt(key: &str, value: &str, cli: &str) -> OptionItem {
-        OptionItem {
+    fn opt(key: &str, value: &str, cli: &str) -> crate::domain::OptionItem {
+        crate::domain::OptionItem {
             key: key.into(),
             value: value.into(),
             default: String::new(),
@@ -608,21 +765,24 @@ mod tests {
         std::fs::set_permissions(&server, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
 
+        let command = Command::build_local(
+            &server.display().to_string(),
+            "/models/fake.gguf",
+            None,
+            None,
+            &crate::runtime::llama_cpp::SCHEMA,
+            &[opt("host", "127.0.0.1", "--host"), opt("port", "18900", "--port")],
+        );
         let req = LaunchRequest {
             runtime: "llama.cpp".into(),
-            binary: server.display().to_string(),
             model: "fake.gguf".into(),
             model_path: "/models/fake.gguf".into(),
-            mtp_path: None,
-            projector_path: None,
-            hf_repo: None,
-            draft_hf: None,
-            projector_auto: false,
+            command,
+            health_path: "/health".into(),
             download: None,
             profile: "Default".into(),
             host: "127.0.0.1".into(),
             port: 18900,
-            options: vec![opt("host", "127.0.0.1", "--host"), opt("port", "18900", "--port")],
         };
 
         let mut mgr = SessionManager::new(sess_dir.clone(), log_dir.clone());
@@ -675,6 +835,145 @@ mod tests {
         // Remove the terminated record.
         assert!(mgr.remove(idx), "terminated session removable");
         assert!(mgr.sessions.is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A restart must not spawn the replacement while the old process is still
+    /// alive: on the AMD NPU the second process loses the race for the hardware
+    /// context, and on any runtime it can be pushed off its own port.
+    #[test]
+    #[ignore = "spawns real processes; run with --ignored --test-threads=1"]
+    fn restart_waits_for_the_old_process_before_respawning() {
+        use std::thread::sleep;
+        use std::time::Duration;
+
+        let base = std::env::temp_dir().join(format!("llmctl-restart-{}", std::process::id()));
+        let sess_dir = base.join("sessions");
+        let log_dir = base.join("logs");
+        std::fs::create_dir_all(&sess_dir).unwrap();
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        // `sleep` ignores SIGTERM's urgency no more than any other process, but
+        // it takes a moment to die — which is exactly the window under test.
+        let req = LaunchRequest {
+            runtime: "FastFlowLM".into(),
+            model: "qwen3:0.6b".into(),
+            model_path: "300".into(),
+            command: Command { argv: vec!["sleep".into(), "300".into()] },
+            health_path: "/v1/models".into(),
+            download: None,
+            profile: "Default".into(),
+            host: "127.0.0.1".into(),
+            port: 18930,
+        };
+
+        let mut mgr = SessionManager::new(sess_dir.clone(), log_dir.clone());
+        let idx = mgr.launch(req).expect("launch");
+        sleep(Duration::from_millis(200)); // let exec happen
+        let old_pid = mgr.sessions[idx].record.pid;
+        let old_port = mgr.sessions[idx].record.port;
+
+        mgr.restart(idx).expect("restart");
+        assert_eq!(mgr.sessions[idx].status, SessionStatus::Restarting);
+        assert_eq!(mgr.sessions[idx].record.pid, old_pid, "respawned before the old process died");
+        // A second R while one is in flight must not stack another respawn.
+        assert!(mgr.restart(idx).is_err(), "restart should refuse to overlap itself");
+        // Refreshing mid-restart must not read the gap as a crash.
+        mgr.refresh();
+        assert_eq!(mgr.sessions[idx].status, SessionStatus::Restarting);
+
+        let mut respawned = false;
+        for _ in 0..50 {
+            mgr.poll_restarts();
+            if mgr.sessions[idx].status != SessionStatus::Restarting {
+                respawned = true;
+                break;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        assert!(respawned, "restart never completed");
+        assert!(!proc::is_alive(old_pid), "the old process outlived the restart");
+        assert_ne!(mgr.sessions[idx].record.pid, old_pid, "a new process should be running");
+        // The port was genuinely free by the time we spawned, so it is reused.
+        assert_eq!(mgr.sessions[idx].record.port, old_port, "restart moved to a different port");
+
+        let _ = mgr.kill(idx);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// With nothing left alive to wait for, the first poll respawns immediately.
+    #[test]
+    #[ignore = "spawns real processes; run with --ignored --test-threads=1"]
+    fn restarting_a_dead_session_respawns_on_the_first_poll() {
+        use std::thread::sleep;
+        use std::time::Duration;
+
+        let base = std::env::temp_dir().join(format!("llmctl-restart-dead-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut mgr = SessionManager::new(base.join("sessions"), base.join("logs"));
+        mgr.sessions.push(Session::new(
+            SessionRecord {
+                id: "0-0".into(),
+                name: "dead".into(),
+                runtime: "llama.cpp".into(),
+                model: "m".into(),
+                model_path: "300".into(),
+                profile: "Default".into(),
+                pid: -1,
+                host: "127.0.0.1".into(),
+                port: 18931,
+                command: vec!["sleep".into(), "300".into()],
+                health_path: "/health".into(),
+                log_file: base.join("dead.log"),
+                download: None,
+                started_unix: 0,
+            },
+            SessionStatus::Crashed,
+        ));
+
+        mgr.restart(0).expect("restart");
+        assert!(mgr.poll_restarts().is_empty(), "no spawn errors expected");
+        assert_eq!(mgr.sessions[0].status, SessionStatus::Starting);
+        assert!(mgr.sessions[0].record.pid > 0);
+
+        sleep(Duration::from_millis(100));
+        let _ = mgr.kill(0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A replacement that cannot be spawned at all reports the failure instead
+    /// of leaving the session stuck in `Restarting`.
+    #[test]
+    fn a_replacement_that_cannot_spawn_is_reported() {
+        let base = std::env::temp_dir().join(format!("llmctl-restart-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut mgr = SessionManager::new(base.join("sessions"), base.join("logs"));
+        mgr.sessions.push(Session::new(
+            SessionRecord {
+                id: "0-0".into(),
+                name: "broken".into(),
+                runtime: "llama.cpp".into(),
+                model: "m".into(),
+                model_path: "nothing".into(),
+                profile: "Default".into(),
+                pid: -1,
+                host: "127.0.0.1".into(),
+                port: 18932,
+                command: vec!["/nonexistent/llmctl-no-such-binary".into()],
+                health_path: "/health".into(),
+                log_file: base.join("broken.log"),
+                download: None,
+                started_unix: 0,
+            },
+            SessionStatus::Crashed,
+        ));
+
+        mgr.restart(0).expect("restart");
+        let errors = mgr.poll_restarts();
+        assert_eq!(errors.len(), 1, "the spawn failure should be reported");
+        assert!(errors[0].starts_with("broken:"), "{errors:?}");
+        assert_eq!(mgr.sessions[0].status, SessionStatus::Crashed);
+        assert!(mgr.poll_restarts().is_empty(), "a failed restart should not retry forever");
         let _ = std::fs::remove_dir_all(&base);
     }
 

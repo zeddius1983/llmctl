@@ -100,8 +100,8 @@ impl ProfileStore {
             for loaded in load_model_profiles(model, &mut instances) {
                 fallback.remove(&loaded);
             }
-            for profile in super::templates::names() {
-                instances.entry(key("llama.cpp", &model.profile_key(), profile)).or_default();
+            for profile in super::templates::names(crate::runtime::templates_for(&model.runtime)) {
+                instances.entry(key(&model.runtime, &model.profile_key(), profile)).or_default();
             }
         }
 
@@ -121,8 +121,10 @@ impl ProfileStore {
             for loaded in load_model_profiles(model, &mut self.instances) {
                 self.fallback.remove(&loaded);
             }
-            for profile in super::templates::names() {
-                self.instances.entry(key("llama.cpp", &model.profile_key(), profile)).or_default();
+            for profile in super::templates::names(crate::runtime::templates_for(&model.runtime)) {
+                self.instances
+                    .entry(key(&model.runtime, &model.profile_key(), profile))
+                    .or_default();
             }
         }
         self.persist_registered();
@@ -220,7 +222,7 @@ impl ProfileStore {
         self.instances.entry(key(runtime, model, profile)).or_insert_with(|| Instance {
             values: base.clone(),
             favorite: false,
-            custom: !super::templates::is_builtin(profile),
+            custom: !super::templates::is_builtin(crate::runtime::templates_for(runtime), profile),
         })
     }
 
@@ -354,7 +356,7 @@ fn load_model_profiles(model: &Model, instances: &mut BTreeMap<Key, Instance>) -
             .and_then(|bytes| serde_yaml::from_slice::<ProfileFile>(&bytes).ok())
         {
             Some(file) if file.schema == 1 => {
-                let entry = key("llama.cpp", &model.profile_key(), &file.name);
+                let entry = key(&model.runtime, &model.profile_key(), &file.name);
                 instances.insert(
                     entry.clone(),
                     Instance { values: file.values, favorite: file.favorite, custom: file.custom },
@@ -445,6 +447,8 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
+            flm: None,
+            runtime: crate::runtime::llama_cpp::NAME.into(),
             remote: None,
         };
         let store = ProfileStore::load(legacy.clone(), &[model]);
@@ -481,6 +485,8 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
+            flm: None,
+            runtime: crate::runtime::llama_cpp::NAME.into(),
             remote: None,
         };
         let mut store = ProfileStore::load(legacy.clone(), &[model]);

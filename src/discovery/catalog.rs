@@ -317,6 +317,8 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
+            flm: None,
+            runtime: crate::runtime::llama_cpp::NAME.into(),
             remote: None,
         }];
         let catalog = root.join("catalog");
