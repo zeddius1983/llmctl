@@ -1,4 +1,4 @@
-# llmctl v0.2.1 — device selection and benchmarking
+# v0.2.1 — device selection and benchmarking
 
 v0.2.1 adds explicit llama.cpp accelerator selection and a convenient way to
 benchmark the selected model using the same device and GPU-offload settings.

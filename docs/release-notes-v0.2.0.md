@@ -1,4 +1,4 @@
-# llmctl v0.2.0 — source-aware model catalog
+# v0.2.0 — source-aware model catalog
 
 v0.2.0 replaces the flat model list with a Yazi-style, source-aware catalog so
 identically named GGUF files from different providers remain distinguishable.

@@ -1,4 +1,4 @@
-# llmctl v0.3.0 — online Hugging Face catalog
+# v0.3.0 — online Hugging Face catalog
 
 v0.3.0 brings Hugging Face GGUF discovery and downloading into llmctl's normal
 directory-style model workflow. Browse compatible repositories, search the

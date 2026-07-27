@@ -2,8 +2,9 @@ name: Release
 
 # Create the GitHub Release for a pushed `v*` tag, then build prebuilt Linux
 # binaries and attach them to it. Can also be run manually from the Actions tab
-# against an existing tag (use the ref selector) to (re)produce its artifacts —
-# note this recreates the release, so re-apply any hand-edited notes after.
+# against an existing tag (use the ref selector) to (re)produce its artifacts;
+# this recreates the release, but the notes come from a checked-in file, so a
+# re-run reproduces them rather than losing hand-edited text.
 on:
   push:
     tags:
@@ -21,6 +22,21 @@ jobs:
       - uses: taiki-e/create-gh-release-action@v1
         with:
           title: llmctl $tag
+          # Release notes come from the per-release doc, so the release page and
+          # the repo cannot drift. `$tag` interpolates to e.g. `v0.4.0`.
+          #
+          # The action runs `parse-changelog <file> <version>` on it, which
+          # needs the H1 to parse as a version under parse-changelog's default
+          # prefix format — `# v0.4.0 — title` does, `# llmctl v0.4.0 — title`
+          # does not. The action exposes no way to override that prefix, so the
+          # heading convention is load-bearing. Everything below the H1 becomes
+          # the release body.
+          changelog: docs/release-notes-$tag.md
+          # Tags before v0.4.0 predate this convention: their checked-out docs
+          # still carry the old `# llmctl vX.Y.Z` heading, which will not parse.
+          # Without this, re-running the workflow against one of them to rebuild
+          # its artifacts would fail outright instead of just omitting notes.
+          allow-missing-changelog: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
   upload-assets:
