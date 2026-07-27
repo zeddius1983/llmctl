@@ -138,6 +138,14 @@ legacy profile migration), `~/.cache/llmctl/` (models.json, llama-server.help.tx
   **`feature/v0.1.0`** (the release umbrella), which is then merged to `main`.
   (The early `phase-*` and `docs` branches predate this policy and are
   grandfathered.)
+- **Release notes:** one `docs/release-notes-v<version>.md` per release, whose
+  H1 must be exactly `# v<version> — <title>`. `.github/workflows/release.yml`
+  feeds that file to `create-gh-release-action`, which runs `parse-changelog`
+  over it to produce the GitHub Release body; the heading has to parse as a
+  version under parse-changelog's default prefix format, and `# llmctl v0.4.0`
+  does not. Everything below the H1 becomes the release body, so the release
+  page is the file — edit the file, not the page. Tagging is the only manual
+  step: push `v<version>` and the workflow does the rest.
 - Commit only when asked. Do not add AI co-author trailers or attribution to
   commit messages unless the user explicitly requests it.
 - Don't commit the legacy Go `llmctl` binary or `/target` (see `.gitignore`).

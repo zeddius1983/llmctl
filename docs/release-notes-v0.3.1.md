@@ -1,4 +1,4 @@
-# llmctl v0.3.1 — MTP and multimodal companions
+# v0.3.1 — MTP and multimodal companions
 
 v0.3.1 teaches llmctl how GGUF companion files relate to their base models.
 Multi-Token Prediction (MTP) heads and multimodal projectors now participate in

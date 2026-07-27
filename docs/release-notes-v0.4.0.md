@@ -1,4 +1,4 @@
-# llmctl v0.4.0 — runtime backends and FastFlowLM (AMD NPU)
+# v0.4.0 — runtime backends and FastFlowLM (AMD NPU)
 
 v0.4.0 makes llmctl multi-runtime. Until now "runtime" was a string llmctl
 branched on, and every option table, launch command, and readiness check assumed
@@ -113,3 +113,7 @@ fully static), or install from source with `cargo install --path .`.
   shows progress but cannot be resumed by llmctl; press `d` to let llmctl own
   the transfer instead.
 - Phases 4 and 5 (log search, startup-failure classification) remain deferred.
+
+---
+
+**Full changelog:** https://github.com/zeddius1983/llmctl/compare/v0.3.1...v0.4.0
