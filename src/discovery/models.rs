@@ -35,6 +35,7 @@ pub fn scan(sources: &[ModelSource], cache_path: &Path) -> Vec<Model> {
     let mut fresh: HashMap<String, Model> = HashMap::new();
     let mut models: Vec<Model> = Vec::new();
     let mut mtp_sidecars: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let mut dflash_sidecars: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
     let mut projectors: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
 
     let mut catalog_paths: HashMap<Vec<String>, PathBuf> = HashMap::new();
@@ -57,6 +58,15 @@ pub fn scan(sources: &[ModelSource], cache_path: &Path) -> Vec<Model> {
             }
             if let Some(base_path) = mtp_base_path(path) {
                 mtp_sidecars.insert(base_path, path.to_path_buf());
+                continue;
+            }
+            if is_dflash(path) {
+                if let Some(parent) = path.parent() {
+                    dflash_sidecars
+                        .entry(parent.to_path_buf())
+                        .or_default()
+                        .push(path.to_path_buf());
+                }
                 continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
@@ -120,20 +130,33 @@ pub fn scan(sources: &[ModelSource], cache_path: &Path) -> Vec<Model> {
     // from that name (for example `mtp-gemma-4-12b-it.gguf` beside
     // `gemma-4-12b-it-Q4_K_M.gguf`). Walk order is unspecified, so associate
     // them only after all sources have been scanned. Orphan sidecars stay hidden:
-    // they cannot be launched without their matching base model.
+    // they cannot be launched without their matching base model. dFlash draft
+    // GGUFs (`dflash-*.gguf`) carry no base filename at all, so they are paired
+    // by directory like a projector.
     let mut model_families: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     for model in &models {
         if let (Some(parent), Some(family)) = (model.path.parent(), model_family(&model.path)) {
             model_families.entry(parent.to_path_buf()).or_default().insert(family);
         }
     }
-    for model in &mut models {
+    // One header read per drafter, not per model that pairs it.
+    let block_sizes: HashMap<PathBuf, u64> = dflash_sidecars
+        .values()
+        .flatten()
+        .filter_map(|path| Some((path.clone(), gguf::read_gguf_info(path).ok()?.block_size?)))
+        .collect();
+    let pair = |model: &mut Model| {
         model.mtp_path = matching_mtp_sidecar(&model.path, &mtp_sidecars);
+        model.dflash_path = matching_dflash_sidecar(&model.path, &dflash_sidecars, &model_families);
+        model.dflash_block_size =
+            model.dflash_path.as_ref().and_then(|path| block_sizes.get(path).copied());
         model.projector_path = matching_projector(&model.path, &projectors, &model_families);
+    };
+    for model in &mut models {
+        pair(model);
     }
     for model in fresh.values_mut() {
-        model.mtp_path = matching_mtp_sidecar(&model.path, &mtp_sidecars);
-        model.projector_path = matching_projector(&model.path, &projectors, &model_families);
+        pair(model);
     }
 
     resolve_prefix_collisions(&mut models);
@@ -226,6 +249,8 @@ fn build_model(path: &Path, size: u64, modified: Option<u64>) -> Model {
         path: path.to_path_buf(),
         shard_paths: shard_paths(path),
         mtp_path: None,
+        dflash_path: None,
+        dflash_block_size: None,
         projector_path: None,
         has_mtp: info.as_ref().is_some_and(|info| info.has_mtp) || has_mtp_filename(path),
         catalog_path: Vec::new(),
@@ -385,6 +410,48 @@ fn matching_mtp_sidecar(
     candidates.first().map(|(_, path)| (*path).clone())
 }
 
+/// dFlash draft GGUFs (`dflash-kquant.gguf`, `dflash-Q4_0.gguf`, …) are drafters
+/// for the model published beside them, not standalone models.
+fn is_dflash(path: &Path) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"(?i)(?:^|[-_.])dflash(?:[-_.]|$)").unwrap());
+    path.file_name().is_some_and(|name| re.is_match(&name.to_string_lossy()))
+}
+
+/// Select one same-directory dFlash drafter for a base model. Unlike an MTP
+/// sidecar the filename names no base model, so — as with a projector — the
+/// pairing only holds when the directory publishes a single model family. The
+/// publisher's unqualified drafter wins, then the most compact quantization: a
+/// drafter is run for speed, and its precision barely moves acceptance rate.
+fn matching_dflash_sidecar(
+    model_path: &Path,
+    sidecars: &HashMap<PathBuf, Vec<PathBuf>>,
+    model_families: &HashMap<PathBuf, HashSet<String>>,
+) -> Option<PathBuf> {
+    let parent = model_path.parent()?;
+    if model_families.get(parent)?.len() != 1 {
+        return None;
+    }
+    sidecars
+        .get(parent)?
+        .iter()
+        .max_by(|a, b| draft_rank(a).cmp(&draft_rank(b)).then_with(|| b.cmp(a)))
+        .cloned()
+}
+
+/// Preference order for a draft GGUF: the publisher's unqualified default,
+/// then ascending precision.
+fn draft_rank(path: &Path) -> u8 {
+    match path.file_name().and_then(|name| quant_from_filename(&name.to_string_lossy())) {
+        None => 6,
+        Some(quant) if quant.eq_ignore_ascii_case("Q4_0") => 5,
+        Some(quant) if quant.eq_ignore_ascii_case("Q8_0") => 4,
+        Some(quant) if quant.eq_ignore_ascii_case("BF16") => 3,
+        Some(quant) if quant.eq_ignore_ascii_case("F16") => 2,
+        Some(_) => 1,
+    }
+}
+
 fn gguf_stem(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_string_lossy();
     let display = display_name(&name);
@@ -447,6 +514,8 @@ mod tests {
             path: path.into(),
             shard_paths: vec![path.into()],
             mtp_path: None,
+            dflash_path: None,
+            dflash_block_size: None,
             projector_path: None,
             has_mtp: false,
             catalog_path: catalog_path.iter().map(|s| (*s).into()).collect(),
@@ -537,6 +606,67 @@ mod tests {
         assert!(models.iter().any(|model| model.name == "Qwen-MTP-Q4_K_M.gguf"));
         assert!(models.iter().find(|model| model.name == "Qwen-MTP-Q4_K_M.gguf").unwrap().has_mtp);
         assert!(models.iter().all(|model| !model.name.starts_with("mtp-")));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_pairs_dflash_drafter_and_hides_it_as_a_standalone_model() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("llmctl-dflash-scan-{nonce}"));
+        std::fs::create_dir_all(&root).unwrap();
+        // The Muse-Glimmer layout: one model family, one unqualified drafter,
+        // one projector.
+        for name in [
+            "Muse-Glimmer-30B-UD-Q8_K_XL.gguf",
+            "Muse-Glimmer-30B-UD-Q4_K_XL.gguf",
+            "dflash-kquant.gguf",
+            "dflash-Q8_0.gguf",
+            "mmproj-Muse-Glimmer-30B-Q8_0.gguf",
+        ] {
+            std::fs::write(root.join(name), b"not a real GGUF header").unwrap();
+        }
+        let source = ModelSource {
+            name: "models".into(),
+            root: root.clone(),
+            layout: ModelLayout::Directory,
+        };
+
+        let models = scan(&[source], &root.join("models.json"));
+        assert_eq!(models.len(), 2); // both quants; no drafter, no projector
+        for model in &models {
+            // The publisher's unqualified drafter beats the quantized variant,
+            // and every quantization of the family shares it.
+            assert_eq!(
+                model.dflash_path.as_deref(),
+                Some(root.join("dflash-kquant.gguf").as_path()),
+                "{} should pair the drafter",
+                model.name
+            );
+        }
+        assert!(models.iter().all(|model| !model.name.starts_with("dflash")));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dflash_drafter_is_not_paired_across_model_families() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("llmctl-dflash-mixed-{nonce}"));
+        std::fs::create_dir_all(&root).unwrap();
+        for name in ["Muse-Glimmer-30B-Q8_0.gguf", "Qwen-Q4_K_M.gguf", "dflash-kquant.gguf"] {
+            std::fs::write(root.join(name), b"not a real GGUF header").unwrap();
+        }
+        let source = ModelSource {
+            name: "models".into(),
+            root: root.clone(),
+            layout: ModelLayout::Directory,
+        };
+
+        let models = scan(&[source], &root.join("models.json"));
+        // Two families share the directory: the drafter names neither, so it is
+        // paired with nothing rather than guessed at.
+        assert!(models.iter().all(|model| model.dflash_path.is_none()));
 
         std::fs::remove_dir_all(root).unwrap();
     }

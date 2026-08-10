@@ -45,6 +45,10 @@ pub struct GgufInfo {
     pub file_type_label: Option<String>,
     pub has_chat_template: bool,
     pub has_mtp: bool,
+    /// `dflash.block_size` — the number of tokens a dFlash drafter emits per
+    /// forward pass. Present only in a `dflash-*.gguf` drafter, where it is the
+    /// ceiling llama.cpp clamps `--spec-draft-n-max` to.
+    pub block_size: Option<u64>,
 }
 
 /// Scalar metadata value (arrays are skipped, not stored).
@@ -106,6 +110,7 @@ pub fn read_gguf_info(path: &Path) -> Result<GgufInfo> {
                 // Only retain keys we actually consult.
                 if key == "general.architecture"
                     || key == "general.file_type"
+                    || key == "dflash.block_size"
                     || key.ends_with(".context_length")
                 {
                     kv.insert(key, scalar);
@@ -126,7 +131,16 @@ pub fn read_gguf_info(path: &Path) -> Result<GgufInfo> {
     let file_type_label =
         kv.get("general.file_type").and_then(|v| v.as_u64()).and_then(file_type_label);
 
-    Ok(GgufInfo { architecture, context_length, file_type_label, has_chat_template, has_mtp })
+    let block_size = kv.get("dflash.block_size").and_then(|v| v.as_u64());
+
+    Ok(GgufInfo {
+        architecture,
+        context_length,
+        file_type_label,
+        has_chat_template,
+        has_mtp,
+        block_size,
+    })
 }
 
 /// Read one value of the given type. Returns `None` for arrays (skipped) and
@@ -262,6 +276,30 @@ mod tests {
     fn push_string(bytes: &mut Vec<u8>, value: &str) {
         bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
         bytes.extend_from_slice(value.as_bytes());
+    }
+
+    #[test]
+    fn reads_the_dflash_block_size() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("llmctl-dflash-header-{nonce}.gguf"));
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes()); // tensor count
+        bytes.extend_from_slice(&2_u64.to_le_bytes()); // metadata count
+        push_string(&mut bytes, "general.architecture");
+        bytes.extend_from_slice(&T_STRING.to_le_bytes());
+        push_string(&mut bytes, "dflash");
+        push_string(&mut bytes, "dflash.block_size");
+        bytes.extend_from_slice(&T_UINT32.to_le_bytes());
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let info = read_gguf_info(&path).unwrap();
+        assert_eq!(info.block_size, Some(16));
+        assert_eq!(info.architecture.as_deref(), Some("dflash"));
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

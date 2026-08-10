@@ -715,6 +715,8 @@ impl Entry {
             path: if self.installed { dir } else { PathBuf::new() },
             shard_paths: Vec::new(),
             mtp_path: None,
+            dflash_path: None,
+            dflash_block_size: None,
             projector_path: None,
             has_mtp: false,
             catalog_path,

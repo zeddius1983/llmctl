@@ -26,8 +26,9 @@ and watch them from a built-in session manager.
   none are configured) well-known locations (llama.cpp cache, HuggingFace hub,
   LM Studio, `~/models`).
   Reads GGUF headers for architecture, context length, quantization, and embedded
-  chat template; detects integrated MTP heads and pairs `mtp-*.gguf` and
-  `mmproj-*.gguf` companions with their base models; dedupes multi-shard models
+  chat template; detects integrated MTP heads and pairs `mtp-*.gguf`,
+  `dflash-*.gguf`, and `mmproj-*.gguf` companions with their base models;
+  dedupes multi-shard models
   and sums their sizes. `F5` to rescan.
 - **Physical model catalog** — mirrors discovery below
   `~/.config/llmctl/models` using source-aware folders, safe manifests, model
@@ -35,7 +36,7 @@ and watch them from a built-in session manager.
   the current local catalog directory.
 - **Online Hugging Face catalog** — browse `online ▸ huggingface` like a local
   directory. It lazily caches 30 trending llama.cpp-compatible GGUF repositories
-  and their artifacts; MTP/projector companions remain attributes of their base
+  and their artifacts; drafter and projector companions remain attributes of their base
   model, and starting a remote model lets llama.cpp download it into the standard
   Hugging Face cache.
 - **Profiles & options** — built-in, read-only templates (Default, Chat, Coding,
@@ -160,15 +161,24 @@ GPU layers, device selection (`--device`, with a selector populated by
 `llama-server --list-devices`), sampling (`temperature`, `top-p`, `top-k`,
 `min-p`, `repeat-penalty`),
 threads, batch size, flash attention, reasoning, KV cache types (`--cache-type-k`
-/ `--cache-type-v`), `--no-mmap` (handy for ROCm/AMD GPUs), host/port, and
+/ `--cache-type-v`), load mode (`-lm`, replacing the deprecated `--no-mmap` —
+`none` is the ROCm/AMD-friendly setting), multi-GPU placement
+(`-sm`, `-ts`), server slots (`-np`), idle sleep (`--sleep-idle-seconds`),
+host/port, and
 speculative decoding (`--spec-type`, `--spec-draft-n-max`, `--spec-draft-n-min`).
 Local models with integrated MTP heads default to `draft-mtp`; a same-directory
 `mtp-<base>.gguf` sidecar is passed through `--spec-draft-model` automatically,
 including repositories that omit the base artifact's quantization suffix from
-the sidecar name. A compatible local `mmproj-*.gguf` is passed through
-`--mmproj`. For uncached Hub models, recent llama.cpp builds auto-discover root
-MTP and projector companions from `-hf`; downloaded companions become explicit
-local paths on subsequent launches.
+the sidecar name. A `dflash-*.gguf` drafter beside the model (as shipped for
+Muse-Glimmer) defaults `spec-type` to `draft-dflash` once downloaded and fills
+the same `--spec-draft-model` slot; `spec-draft-n-max` then starts at the
+drafter's trained block size, which is worth far more than llama.cpp's default
+of 3 (measurements in ADR-014). A compatible local `mmproj-*.gguf` is passed
+through `--mmproj`. For uncached Hub models, recent llama.cpp builds
+auto-discover root MTP and projector companions from `-hf`; downloaded
+companions become explicit local paths on subsequent launches. A dFlash drafter
+has no such remote form — `--spec-draft-hf` selects by quantization only — so
+llmctl asks you to download the model (`d`) before drafting with it.
 Any option left at its default value is omitted from the command line.
 
 #### FastFlowLM
@@ -233,10 +243,11 @@ appear as flat `provider/repository` rows with likes and download counts;
 entering one fetches its GGUF variants. Choose an artifact, configure a normal
 profile, and press `s`. llmctl launches llama.cpp with `--hf-repo` and
 `--hf-file`, then links the downloaded file from the standard Hugging Face
-cache into the managed catalog. `mtp-*` and `mmproj-*` files stay hidden as
-standalone artifacts; the publisher's root MTP default and a compatible
-projector are attached to each base model. Direct downloads include those
-companions, while native `-hf` launches use llama.cpp's companion auto-discovery.
+cache into the managed catalog. `mtp-*`, `dflash-*`, and `mmproj-*` files stay
+hidden as standalone artifacts; the publisher's root MTP default, the
+repository's dFlash drafter, and a compatible projector are attached to each base
+model. Direct downloads include those companions, while native `-hf` launches use
+llama.cpp's companion auto-discovery.
 
 Press `d` on an uncached online GGUF to download it without starting a server.
 Multiple models can download concurrently in a Downloads pane below Sessions.

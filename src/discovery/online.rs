@@ -149,6 +149,7 @@ struct ArtifactManifest<'a> {
     revision: Option<&'a str>,
     file: &'a str,
     mtp_file: Option<&'a str>,
+    dflash_file: Option<&'a str>,
     projector_file: Option<&'a str>,
     size_bytes: u64,
     cached_path: Option<&'a Path>,
@@ -385,8 +386,9 @@ fn artifacts_with_cache(
         let mut blobs: Vec<RemoteBlob> =
             files.iter().filter_map(|file| remote_blob(file)).collect();
         let mtp = matching_mtp_companion(&file.rfilename, &detail.siblings);
+        let dflash = matching_dflash_companion(&detail.siblings);
         let projector = matching_projector_companion(&detail.siblings);
-        for companion in [mtp, projector].into_iter().flatten() {
+        for companion in [mtp, dflash, projector].into_iter().flatten() {
             if let Some(blob) = remote_blob(companion)
                 && !blobs.iter().any(|existing: &RemoteBlob| existing.file == blob.file)
             {
@@ -413,6 +415,9 @@ fn artifacts_with_cache(
         let mtp_path = mtp.and_then(|companion| {
             cache.and_then(|hub| cached_file_in(hub, &detail.repository.id, &companion.rfilename))
         });
+        let dflash_path = dflash.and_then(|companion| {
+            cache.and_then(|hub| cached_file_in(hub, &detail.repository.id, &companion.rfilename))
+        });
         let projector_path = projector.and_then(|companion| {
             cache.and_then(|hub| cached_file_in(hub, &detail.repository.id, &companion.rfilename))
         });
@@ -424,6 +429,7 @@ fn artifacts_with_cache(
             revision: detail.repository.sha.as_deref(),
             file: &file.rfilename,
             mtp_file: mtp.map(|companion| companion.rfilename.as_str()),
+            dflash_file: dflash.map(|companion| companion.rfilename.as_str()),
             projector_file: projector.map(|companion| companion.rfilename.as_str()),
             size_bytes: bytes,
             cached_path: (!local_path.as_os_str().is_empty()).then_some(local_path.as_path()),
@@ -440,6 +446,8 @@ fn artifacts_with_cache(
             path: local_path,
             shard_paths,
             mtp_path,
+            dflash_block_size: dflash_path.as_deref().and_then(gguf_block_size),
+            dflash_path,
             projector_path,
             has_mtp: false,
             catalog_path: vec![
@@ -467,6 +475,7 @@ fn artifacts_with_cache(
                 file: Some(file.rfilename.clone()),
                 blobs,
                 mtp_file: mtp.map(|companion| companion.rfilename.clone()),
+                dflash_file: dflash.map(|companion| companion.rfilename.clone()),
                 projector_file: projector.map(|companion| companion.rfilename.clone()),
                 downloads: detail.repository.downloads,
                 likes: detail.repository.likes,
@@ -484,6 +493,8 @@ fn repository_directory(root: &Path, repository: &Repository) -> Model {
         path: PathBuf::new(),
         shard_paths: Vec::new(),
         mtp_path: None,
+        dflash_path: None,
+        dflash_block_size: None,
         projector_path: None,
         has_mtp: false,
         catalog_path: vec![SOURCE[0].into(), SOURCE[1].into(), repository.id.clone()],
@@ -502,6 +513,7 @@ fn repository_directory(root: &Path, repository: &Repository) -> Model {
             file: None,
             blobs: Vec::new(),
             mtp_file: None,
+            dflash_file: None,
             projector_file: None,
             downloads: repository.downloads,
             likes: repository.likes,
@@ -517,6 +529,8 @@ fn directory(path: &[&str]) -> Model {
         path: PathBuf::new(),
         shard_paths: Vec::new(),
         mtp_path: None,
+        dflash_path: None,
+        dflash_block_size: None,
         projector_path: None,
         has_mtp: false,
         catalog_path: path.iter().map(|part| (*part).into()).collect(),
@@ -535,13 +549,22 @@ fn directory(path: &[&str]) -> Model {
 
 fn is_companion(file: &str) -> bool {
     let name = file.rsplit('/').next().unwrap_or(file).to_ascii_lowercase();
-    name.starts_with("mtp-") || name.starts_with("mmproj")
+    name.starts_with("mtp-") || name.starts_with("mmproj") || is_dflash_companion(file)
 }
 
 fn is_mtp_companion(file: &str) -> bool {
     file.rsplit('/').next().is_some_and(|name| {
         name.to_ascii_lowercase().starts_with("mtp-")
             && name.to_ascii_lowercase().ends_with(".gguf")
+    })
+}
+
+/// dFlash drafters are published as `dflash-*.gguf` beside the artifacts they
+/// draft for (for example `dflash-kquant.gguf`).
+fn is_dflash_companion(file: &str) -> bool {
+    file.rsplit('/').next().is_some_and(|name| {
+        let name = name.to_ascii_lowercase();
+        name.starts_with("dflash") && name.ends_with(".gguf")
     })
 }
 
@@ -593,12 +616,34 @@ fn matching_mtp_companion<'a>(base: &str, siblings: &'a [Sibling]) -> Option<&'a
             } else {
                 1
             };
-            Some(((tier, mtp_quant_rank(quant.as_deref()), family.len()), candidate))
+            Some(((tier, draft_quant_rank(quant.as_deref()), family.len()), candidate))
         })
         .max_by(|(rank_a, a), (rank_b, b)| {
             rank_a.cmp(rank_b).then_with(|| b.rfilename.cmp(&a.rfilename))
         })
         .map(|(_, candidate)| candidate)
+}
+
+/// Select the repository's dFlash drafter. Its filename names no base artifact
+/// — one drafter serves every quantization of the model — so the choice is
+/// repository-wide, preferring the publisher's unqualified default and then the
+/// most compact quantization.
+fn matching_dflash_companion(siblings: &[Sibling]) -> Option<&Sibling> {
+    siblings.iter().filter(|candidate| is_dflash_companion(&candidate.rfilename)).max_by(|a, b| {
+        draft_quant_rank(quant_of(&a.rfilename).as_deref())
+            .cmp(&draft_quant_rank(quant_of(&b.rfilename).as_deref()))
+            .then_with(|| b.rfilename.cmp(&a.rfilename))
+    })
+}
+
+/// The drafter's trained block size, read from the cached companion. Absent
+/// until the drafter is downloaded — a repository listing does not carry it.
+fn gguf_block_size(path: &Path) -> Option<u64> {
+    super::gguf::read_gguf_info(path).ok().and_then(|info| info.block_size)
+}
+
+fn quant_of(file: &str) -> Option<String> {
+    super::models::quant_from_filename(file.rsplit('/').next().unwrap_or(file))
 }
 
 fn matching_projector_companion(siblings: &[Sibling]) -> Option<&Sibling> {
@@ -611,7 +656,7 @@ fn matching_projector_companion(siblings: &[Sibling]) -> Option<&Sibling> {
     )
 }
 
-fn mtp_quant_rank(quant: Option<&str>) -> u8 {
+fn draft_quant_rank(quant: Option<&str>) -> u8 {
     match quant {
         None => 6,
         Some(value) if value.eq_ignore_ascii_case("Q4_0") => 5,
@@ -1051,6 +1096,7 @@ mod tests {
                 file: "model.gguf".into(),
             }],
             mtp_file: None,
+            dflash_file: None,
             projector_file: None,
             downloads: 0,
             likes: 0,
@@ -1117,6 +1163,7 @@ mod tests {
                 file: "model-Q4_K_M.gguf".into(),
             }],
             mtp_file: None,
+            dflash_file: None,
             projector_file: None,
             downloads: 10,
             likes: 2,
@@ -1263,6 +1310,59 @@ mod tests {
         assert_eq!(models[0].profile_key(), "hf:owner/repo/model-Q4_K_M-00001-of-00002.gguf");
         assert!(models[0].catalog_dir.join("profiles").is_dir());
         assert!(models[0].catalog_dir.join(".llmctl-online.yml").is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The `unsloth/Muse-Glimmer-30B-GGUF` layout: many quantizations of one
+    /// model, one repository-wide dFlash drafter, two projector variants.
+    #[test]
+    fn dflash_drafter_is_paired_with_every_quantization_and_hidden() {
+        let root = std::env::temp_dir().join(format!("llmctl-online-dflash-{}", now()));
+        let sibling = |name: &str, oid: &str, size: u64| Sibling {
+            rfilename: name.into(),
+            size: Some(size),
+            lfs: Some(Lfs { oid: Some(oid.repeat(32)), size: Some(size) }),
+        };
+        let detail = RepositoryDetail {
+            schema: 1,
+            fetched_at: 42,
+            repository: Repository {
+                id: "unsloth/Muse-Glimmer-30B-GGUF".into(),
+                downloads: 12,
+                likes: 3,
+                sha: Some("abc".into()),
+                gated: false,
+            },
+            siblings: vec![
+                sibling("Muse-Glimmer-30B-UD-Q8_K_XL.gguf", "aa", 32),
+                sibling("Muse-Glimmer-30B-UD-Q4_K_XL.gguf", "bb", 17),
+                sibling("dflash-kquant.gguf", "cc", 2),
+                sibling("dflash-Q8_0.gguf", "dd", 3),
+                sibling("mmproj-Muse-Glimmer-30B-Q8_0.gguf", "ee", 1),
+                sibling("mmproj-Muse-Glimmer-30B-BF16.gguf", "ff", 2),
+            ],
+            gguf: Some(GgufInfo {
+                architecture: Some("muse-glimmer".into()),
+                context_length: Some(131072),
+                chat_template: Some("template".into()),
+            }),
+        };
+
+        let models = artifacts(&root, &detail);
+
+        // Only the launchable quantizations are artifacts; drafter and
+        // projectors are companions.
+        assert_eq!(models.len(), 2);
+        for model in &models {
+            let remote = model.remote.as_ref().unwrap();
+            assert_eq!(remote.dflash_file.as_deref(), Some("dflash-kquant.gguf"));
+            assert_eq!(remote.projector_file.as_deref(), Some("mmproj-Muse-Glimmer-30B-BF16.gguf"));
+            assert!(model.supports_dflash());
+            assert!(model.supports_multimodal());
+            assert!(remote.mtp_file.is_none());
+            // The drafter is downloaded with the model it drafts for.
+            assert!(remote.blobs.iter().any(|blob| blob.file == "dflash-kquant.gguf"));
+        }
         let _ = fs::remove_dir_all(root);
     }
 

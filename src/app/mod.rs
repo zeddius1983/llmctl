@@ -511,6 +511,7 @@ impl App {
                 remote.file.is_some()
                     && (model.path.as_os_str().is_empty()
                         || (remote.mtp_file.is_some() && model.mtp_path.is_none())
+                        || (remote.dflash_file.is_some() && model.dflash_path.is_none())
                         || (remote.projector_file.is_some() && model.projector_path.is_none()))
             })
         });
@@ -522,6 +523,7 @@ impl App {
             self.scanned_models.iter().find(|old| old.id == fresh.id).is_some_and(|old| {
                 (old.path.as_os_str().is_empty() && !fresh.path.as_os_str().is_empty())
                     || (old.mtp_path.is_none() && fresh.mtp_path.is_some())
+                    || (old.dflash_path.is_none() && fresh.dflash_path.is_some())
                     || (old.projector_path.is_none() && fresh.projector_path.is_some())
             })
         });
@@ -2568,6 +2570,9 @@ impl App {
                         if let Some(quantization) = &m.quantization {
                             meta.push(quantization.clone());
                         }
+                        if m.supports_dflash() {
+                            meta.push("dFlash".into());
+                        }
                         if remote.mtp_file.is_some() {
                             meta.push("MTP".into());
                         } else if m.has_mtp {
@@ -2604,6 +2609,10 @@ impl App {
                 }
                 if m.has_chat_template {
                     meta.push("chat-template".into());
+                }
+                if let Some(dflash) = &m.dflash_path {
+                    let name = dflash.file_name().unwrap_or_default().to_string_lossy();
+                    meta.push(format!("dFlash {name}"));
                 }
                 if let Some(mtp) = &m.mtp_path {
                     let name = mtp.file_name().unwrap_or_default().to_string_lossy();
@@ -2765,6 +2774,8 @@ fn catalog_children_of(source: &[Model], prefix: &[String]) -> Vec<Model> {
                     path: PathBuf::new(),
                     shard_paths: Vec::new(),
                     mtp_path: None,
+                    dflash_path: None,
+                    dflash_block_size: None,
                     projector_path: None,
                     has_mtp: false,
                     catalog_path: model.catalog_path[..=prefix.len()].to_vec(),
@@ -3190,6 +3201,7 @@ mod tests {
                 file: "model.gguf".into(),
             }],
             mtp_file: None,
+            dflash_file: None,
             projector_file: None,
             downloads: 0,
             likes: 0,
@@ -3264,6 +3276,8 @@ mod tests {
             path: PathBuf::new(),
             shard_paths: Vec::new(),
             mtp_path: None,
+            dflash_path: None,
+            dflash_block_size: None,
             projector_path: None,
             has_mtp: false,
             catalog_path: vec!["online".into(), label.into(), tag.into()],

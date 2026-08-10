@@ -96,6 +96,17 @@ pub trait RuntimeBackend: Send + Sync {
         value
     }
 
+    /// Recover `key`'s value from a superseded option name in a stored profile,
+    /// for the case where a renamed flag would otherwise drop a user's setting
+    /// on load. Consulted only when the profile has no value under `key`.
+    fn legacy_value(
+        &self,
+        _key: &str,
+        _stored: &std::collections::BTreeMap<String, String>,
+    ) -> Option<String> {
+        None
+    }
+
     /// Clamp a resolved value into what this model actually supports.
     fn clamp_to_model(&self, _key: &str, value: String, _model: &Model) -> String {
         value

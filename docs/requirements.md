@@ -50,11 +50,14 @@ server-side when invoked from the online hierarchy. Search results are
 transient; only the repository selected with Enter is added to the persistent
 online catalogue.
 
-Repository artifacts named `mtp-*.gguf` or `mmproj-*.gguf` are companions, not
-standalone models. The preferred MTP drafter and multimodal projector are
-associated with each compatible base artifact. Native `-hf` launches use
-llama.cpp's root-MTP and projector auto-discovery; direct downloads include the
-selected companions, and cached launches pass their local paths explicitly.
+Repository artifacts named `mtp-*.gguf`, `dflash-*.gguf`, or `mmproj-*.gguf` are
+companions, not standalone models. The preferred MTP drafter, the repository's
+dFlash drafter, and the multimodal projector are associated with each compatible
+base artifact. Native `-hf` launches use llama.cpp's root-MTP and projector
+auto-discovery; direct downloads include the selected companions, and cached
+launches pass their local paths explicitly. A dFlash drafter is only usable once
+downloaded: `--spec-draft-hf` addresses a draft model by quantization, which an
+unqualified `dflash-*.gguf` does not carry.
 
 The online repository pane title reflects its active view: `Trending`,
 `Most likes`, or `Most downloads`. A repository's GGUF files pane uses the
@@ -187,6 +190,7 @@ The Info pane displays:
 * Context length
 * Chat template information
 * Integrated or sidecar MTP availability
+* dFlash drafter availability
 * Multimodal projector availability
 * Last modified date
 
@@ -640,6 +644,7 @@ Collected metadata:
 * Architecture
 * Modification time
 * Integrated MTP metadata and matching `mtp-*.gguf` sidecars
+* Matching `dflash-*.gguf` speculative drafters
 * Matching `mmproj-*.gguf` multimodal projector sidecars
 
 Results should be cached.
@@ -651,6 +656,14 @@ Pairing accepts both an exact base filename and a base filename that extends the
 sidecar stem with a quantization suffix.
 Integrated MTP heads are detected from GGUF metadata, with the filename's MTP
 token as a compatibility fallback.
+
+A `dflash-*.gguf` is the drafter for llama.cpp's `draft-dflash` speculation and
+is likewise not a standalone catalog entry. Its filename names no base model —
+one drafter serves every quantization published beside it — so it is paired by
+directory, and locally only when that directory holds a single model family. The
+publisher's unqualified file is preferred over quantized variants. A paired,
+downloaded drafter makes `draft-dflash` the model's default `spec-type` and is
+passed to llama.cpp with `--spec-draft-model`.
 
 An `mmproj-*.gguf` is likewise an auxiliary model rather than a standalone
 catalog entry. A compatible same-directory projector is associated with an

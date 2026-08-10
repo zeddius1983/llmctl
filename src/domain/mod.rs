@@ -37,6 +37,16 @@ pub struct Model {
     /// model.
     #[serde(default)]
     pub mtp_path: Option<PathBuf>,
+    /// A same-directory `dflash-*.gguf` sidecar paired with this base model.
+    /// llama.cpp loads it as the draft model for `--spec-type draft-dflash`,
+    /// never as a standalone model.
+    #[serde(default)]
+    pub dflash_path: Option<PathBuf>,
+    /// The drafter's trained block size (`dflash.block_size`): the most tokens
+    /// it can emit per pass, and the value llama.cpp clamps
+    /// `--spec-draft-n-max` to. Known only once the drafter is on disk.
+    #[serde(default)]
+    pub dflash_block_size: Option<u64>,
     /// A compatible multimodal projector sidecar. The projector encodes image
     /// or audio inputs for the base model and is never launched by itself.
     #[serde(default)]
@@ -126,6 +136,9 @@ pub struct RemoteModel {
     /// Repository-relative companion selected for speculative MTP decoding.
     #[serde(default)]
     pub mtp_file: Option<String>,
+    /// Repository-relative companion selected for dFlash speculative decoding.
+    #[serde(default)]
+    pub dflash_file: Option<String>,
     /// Repository-relative multimodal projector selected for this artifact.
     #[serde(default)]
     pub projector_file: Option<String>,
@@ -221,6 +234,13 @@ impl Model {
         self.has_mtp
             || self.mtp_path.is_some()
             || self.remote.as_ref().is_some_and(|remote| remote.mtp_file.is_some())
+    }
+
+    /// Whether a dFlash draft companion is paired with this model, cached
+    /// locally or still only named by the remote repository.
+    pub fn supports_dflash(&self) -> bool {
+        self.dflash_path.is_some()
+            || self.remote.as_ref().is_some_and(|remote| remote.dflash_file.is_some())
     }
 
     pub fn supports_multimodal(&self) -> bool {

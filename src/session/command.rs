@@ -21,16 +21,16 @@ impl Command {
     pub fn build_local(
         binary: &str,
         model_path: &str,
-        mtp_path: Option<&str>,
+        draft_path: Option<&str>,
         projector_path: Option<&str>,
         schema: &OptionSchema,
         options: &[OptionItem],
     ) -> Self {
         let mut argv = vec![binary.to_string(), "-m".to_string(), model_path.to_string()];
 
-        if let Some(mtp_path) = mtp_path {
+        if let Some(draft_path) = draft_path {
             argv.push("--spec-draft-model".into());
-            argv.push(mtp_path.to_string());
+            argv.push(draft_path.to_string());
         }
         if let Some(projector_path) = projector_path {
             argv.push("--mmproj".into());
@@ -47,7 +47,7 @@ impl Command {
         binary: &str,
         repo: &str,
         file: &str,
-        mtp_path: Option<&str>,
+        draft_path: Option<&str>,
         draft_hf: Option<&str>,
         projector_path: Option<&str>,
         projector_auto: bool,
@@ -61,9 +61,9 @@ impl Command {
             "--hf-file".into(),
             file.to_string(),
         ];
-        if let Some(mtp_path) = mtp_path {
+        if let Some(draft_path) = draft_path {
             argv.push("--spec-draft-model".into());
-            argv.push(mtp_path.to_string());
+            argv.push(draft_path.to_string());
         } else if let Some(draft_hf) = draft_hf {
             argv.push("--spec-draft-hf".into());
             argv.push(draft_hf.to_string());
@@ -297,6 +297,56 @@ mod tests {
         assert_eq!(cmd.argv[projector + 1], "/m/mmproj-BF16.gguf");
     }
 
+    /// The published two-GPU Muse-Glimmer configuration, built from resolved
+    /// options: dFlash drafting off a `dflash-*.gguf` companion, the projector,
+    /// and an even split across both cards.
+    #[test]
+    fn dflash_multi_gpu_launch_reproduces_the_reference_command() {
+        let opts = vec![
+            opt("ctx-size", "131000", "--ctx-size"),
+            opt("gpu-layers", "99", "-ngl"),
+            opt("split-mode", "layer", "-sm"),
+            opt("tensor-split", "1,1", "-ts"),
+            opt("temperature", "1", "--temp"),
+            opt("top-p", "0.95", "--top-p"),
+            opt("top-k", "64", "--top-k"),
+            opt("spec-type", "draft-dflash", "--spec-type"),
+            opt("spec-draft-n-max", "3", "--spec-draft-n-max"),
+            opt("parallel", "1", "-np"),
+            opt("sleep-idle-seconds", "1200", "--sleep-idle-seconds"),
+            opt("host", "127.0.0.1", "--host"),
+            opt("port", "9516", "--port"),
+        ];
+        let cmd = Command::build_local(
+            "/home/m/llama.cpp/build/bin/llama-server",
+            "/m/Muse-Glimmer/Muse-Glimmer-30B-UD-Q8_K_XL.gguf",
+            Some("/m/Muse-Glimmer/dflash-kquant.gguf"),
+            Some("/m/Muse-Glimmer/mmproj-Muse-Glimmer-30B-Q8_0.gguf"),
+            &SCHEMA,
+            &opts,
+        );
+
+        for pair in [
+            ["-m", "/m/Muse-Glimmer/Muse-Glimmer-30B-UD-Q8_K_XL.gguf"],
+            ["--spec-draft-model", "/m/Muse-Glimmer/dflash-kquant.gguf"],
+            ["--mmproj", "/m/Muse-Glimmer/mmproj-Muse-Glimmer-30B-Q8_0.gguf"],
+            ["--spec-type", "draft-dflash"],
+            ["--spec-draft-n-max", "3"],
+            ["-sm", "layer"],
+            ["-ts", "1,1"],
+            ["-ngl", "99"],
+            ["--ctx-size", "131000"],
+            ["-np", "1"],
+            ["--sleep-idle-seconds", "1200"],
+            ["--port", "9516"],
+        ] {
+            assert!(cmd.argv.windows(2).any(|args| args == pair), "missing {pair:?}");
+        }
+        // Jinja templating is llama.cpp's own default, so `--jinja` is implied
+        // rather than emitted.
+        assert!(!cmd.argv.iter().any(|arg| arg == "--no-jinja"));
+    }
+
     #[test]
     fn remote_companions_use_draft_hf_and_projector_auto() {
         let cmd = Command::build_huggingface(
@@ -380,19 +430,18 @@ mod tests {
     }
 
     #[test]
-    fn mmap_off_emits_bare_no_mmap_flag_and_on_is_omitted() {
+    fn load_mode_emits_its_value_and_is_omitted_at_default() {
         let mut opts = sample_options();
-        opts.push(opt("mmap", "off", "--no-mmap"));
+        opts.push(opt("load-mode", "none", "-lm"));
         let cmd = local("/m/x.gguf", &opts);
-        let i = cmd.argv.iter().position(|a| a == "--no-mmap").unwrap();
-        // The bare flag is last (or followed by another flag) — no value token,
-        // so its "off" value never reaches the command line.
-        assert!(cmd.argv.get(i + 1).map(|a| a.starts_with("--")).unwrap_or(true));
+        let i = cmd.argv.iter().position(|a| a == "-lm").unwrap();
+        assert_eq!(cmd.argv[i + 1], "none"); // takes a value, unlike the old --no-mmap
+        assert!(!cmd.argv.iter().any(|a| a == "--no-mmap"));
 
         opts.pop();
-        opts.push(opt("mmap", "on", "--no-mmap")); // omit token: mmap on is llama default
+        opts.push(opt("load-mode", registry::DEFAULT, "-lm"));
         let cmd = local("/m/x.gguf", &opts);
-        assert!(!cmd.argv.iter().any(|a| a == "--no-mmap"));
+        assert!(!cmd.argv.iter().any(|a| a == "-lm"));
     }
 
     #[test]
