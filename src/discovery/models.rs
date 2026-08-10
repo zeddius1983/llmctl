@@ -412,10 +412,14 @@ fn matching_mtp_sidecar(
 
 /// dFlash draft GGUFs (`dflash-kquant.gguf`, `dflash-Q4_0.gguf`, …) are drafters
 /// for the model published beside them, not standalone models.
+///
+/// Matched by prefix, exactly as the online catalog does: a `dflash` token
+/// anywhere in the name would hide a real model that merely mentions it
+/// (`model-dflash-tuned-Q4.gguf`), and a companion that cannot be launched is
+/// far more costly than one extra artifact in the list.
 fn is_dflash(path: &Path) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"(?i)(?:^|[-_.])dflash(?:[-_.]|$)").unwrap());
-    path.file_name().is_some_and(|name| re.is_match(&name.to_string_lossy()))
+    path.file_name()
+        .is_some_and(|name| name.to_string_lossy().to_ascii_lowercase().starts_with("dflash"))
 }
 
 /// Select one same-directory dFlash drafter for a base model. Unlike an MTP
@@ -647,6 +651,16 @@ mod tests {
         assert!(models.iter().all(|model| !model.name.starts_with("dflash")));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_model_merely_named_after_dflash_stays_in_the_catalog() {
+        // Only the `dflash-*` prefix marks a drafter. A fine-tune that mentions
+        // the token is a launchable model and must not be hidden.
+        assert!(is_dflash(Path::new("/m/dflash-kquant.gguf")));
+        assert!(is_dflash(Path::new("/m/DFlash-Q8_0.gguf")));
+        assert!(!is_dflash(Path::new("/m/model-dflash-tuned-Q4.gguf")));
+        assert!(!is_dflash(Path::new("/m/Qwen-dflash.gguf")));
     }
 
     #[test]

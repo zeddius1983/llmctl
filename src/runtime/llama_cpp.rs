@@ -415,6 +415,9 @@ pub struct LlamaCppBackend {
     /// `--load-mode` superseded `--no-mmap`/`--mlock`/`--direct-io`; older
     /// builds only understand the deprecated flags.
     pub load_mode_supported: bool,
+    /// Whether `--spec-type` accepts `draft-dflash`. A drafter on disk must not
+    /// turn an untouched profile into a launch an older binary rejects.
+    pub dflash_supported: bool,
 }
 
 impl LlamaCppBackend {
@@ -451,6 +454,8 @@ impl LlamaCppBackend {
             draft_hf_supported: advertises("--spec-draft-hf"),
             mmproj_auto_supported: advertises("--mmproj-auto"),
             load_mode_supported: advertises("--load-mode"),
+            // `--help` prints the accepted values inline on the --spec-type line.
+            dflash_supported: advertises("draft-dflash"),
         }
     }
 }
@@ -499,7 +504,7 @@ impl RuntimeBackend for LlamaCppBackend {
         // companion is on disk (a remote dFlash drafter is not addressable, so
         // it only becomes the default once downloaded).
         if spec.key == "spec-type" {
-            if model.dflash_path.is_some() {
+            if model.dflash_path.is_some() && self.dflash_supported {
                 return "draft-dflash".into();
             }
             if model.supports_mtp() {
@@ -513,6 +518,7 @@ impl RuntimeBackend for LlamaCppBackend {
         // 30B target). llama.cpp clamps above the block size anyway.
         if spec.key == "spec-draft-n-max"
             && model.dflash_path.is_some()
+            && self.dflash_supported
             && let Some(block_size) = model.dflash_block_size
         {
             return block_size.to_string();
@@ -654,6 +660,13 @@ impl RuntimeBackend for LlamaCppBackend {
             );
         }
         let drafter = drafter(ctx.options);
+        // A profile saved against a newer binary, or a downgraded llama.cpp.
+        if drafter == Some(Drafter::DFlash) && !self.dflash_supported {
+            return Some(
+                "this llama-server does not accept --spec-type draft-dflash; upgrade llama.cpp or set spec-type to none"
+                    .into(),
+            );
+        }
         let remote = remote_launch(ctx.model, drafter)?;
         if !self.hf_supported {
             return Some(
@@ -910,6 +923,7 @@ mod tests {
             draft_hf_supported: true,
             mmproj_auto_supported: true,
             load_mode_supported: true,
+            dflash_supported: true,
         }
     }
 
@@ -1077,6 +1091,44 @@ mod tests {
         // A downloaded dFlash drafter outranks an MTP head.
         model.dflash_path = Some("/m/dflash-kquant.gguf".into());
         assert_eq!(backend.spec_default(spec, &model, &defaults), "draft-dflash");
+    }
+
+    /// A drafter on disk must not rewrite the default for a binary that cannot
+    /// run it: that would turn a working undrafted launch into a server error.
+    #[test]
+    fn an_older_binary_keeps_the_undrafted_defaults() {
+        let mut backend = test_backend();
+        backend.dflash_supported = false;
+        let defaults = Defaults::default();
+        let mut model = test_model();
+        model.dflash_path = Some("/m/dflash-kquant.gguf".into());
+        model.dflash_block_size = Some(16);
+
+        assert_eq!(
+            backend.spec_default(SCHEMA.spec("spec-type").unwrap(), &model, &defaults),
+            "none"
+        );
+        assert_eq!(
+            backend.spec_default(SCHEMA.spec("spec-draft-n-max").unwrap(), &model, &defaults),
+            DEFAULT
+        );
+
+        // An explicit draft-dflash — from a profile saved against a newer
+        // llama.cpp — is refused with an explanation rather than launched.
+        let selected = OptionItem {
+            key: "spec-type".into(),
+            value: "draft-dflash".into(),
+            default: "none".into(),
+            range: None,
+            cli: "--spec-type".into(),
+            description: String::new(),
+        };
+        let ctx = LaunchContext {
+            binary: "llama-server",
+            model: &model,
+            options: std::slice::from_ref(&selected),
+        };
+        assert!(backend.launch_blocker(&ctx).unwrap().contains("draft-dflash"));
     }
 
     #[test]

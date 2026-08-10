@@ -509,9 +509,14 @@ impl App {
         let has_incomplete_remote = self.scanned_models.iter().any(|model| {
             model.remote.as_ref().is_some_and(|remote| {
                 remote.file.is_some()
+                    // A dFlash drafter is deliberately absent here: a native
+                    // `-hf` launch cannot fetch an unqualified companion, so
+                    // waiting on one would keep this true — and rerun the
+                    // catalog load — for the whole life of the session. It
+                    // arrives through llmctl's own download, which refreshes
+                    // via `refresh_downloaded_online_models`.
                     && (model.path.as_os_str().is_empty()
                         || (remote.mtp_file.is_some() && model.mtp_path.is_none())
-                        || (remote.dflash_file.is_some() && model.dflash_path.is_none())
                         || (remote.projector_file.is_some() && model.projector_path.is_none()))
             })
         });

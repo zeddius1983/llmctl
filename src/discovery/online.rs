@@ -360,6 +360,13 @@ fn artifacts_with_cache(
 ) -> Vec<Model> {
     let shard = Regex::new(r"(?i)-([0-9]{5})-of-([0-9]{5})\.gguf$").unwrap();
     let mut result = Vec::new();
+    // The drafter is a property of the repository, not of any one artifact, so
+    // select it and read its header once rather than per quantization.
+    let dflash = matching_dflash_companion(&detail.siblings);
+    let dflash_path = dflash.and_then(|companion| {
+        cache.and_then(|hub| cached_file_in(hub, &detail.repository.id, &companion.rfilename))
+    });
+    let dflash_block_size = dflash_path.as_deref().and_then(gguf_block_size);
     for file in &detail.siblings {
         let lower = file.rfilename.to_ascii_lowercase();
         if !lower.ends_with(".gguf") || is_companion(&file.rfilename) {
@@ -386,7 +393,6 @@ fn artifacts_with_cache(
         let mut blobs: Vec<RemoteBlob> =
             files.iter().filter_map(|file| remote_blob(file)).collect();
         let mtp = matching_mtp_companion(&file.rfilename, &detail.siblings);
-        let dflash = matching_dflash_companion(&detail.siblings);
         let projector = matching_projector_companion(&detail.siblings);
         for companion in [mtp, dflash, projector].into_iter().flatten() {
             if let Some(blob) = remote_blob(companion)
@@ -413,9 +419,6 @@ fn artifacts_with_cache(
             .unwrap_or_default();
         let shard_paths = if local_path.as_os_str().is_empty() { Vec::new() } else { cached_paths };
         let mtp_path = mtp.and_then(|companion| {
-            cache.and_then(|hub| cached_file_in(hub, &detail.repository.id, &companion.rfilename))
-        });
-        let dflash_path = dflash.and_then(|companion| {
             cache.and_then(|hub| cached_file_in(hub, &detail.repository.id, &companion.rfilename))
         });
         let projector_path = projector.and_then(|companion| {
@@ -446,8 +449,8 @@ fn artifacts_with_cache(
             path: local_path,
             shard_paths,
             mtp_path,
-            dflash_block_size: dflash_path.as_deref().and_then(gguf_block_size),
-            dflash_path,
+            dflash_path: dflash_path.clone(),
+            dflash_block_size,
             projector_path,
             has_mtp: false,
             catalog_path: vec![

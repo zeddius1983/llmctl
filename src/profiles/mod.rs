@@ -319,8 +319,24 @@ mod tests {
     fn dflash_sidecar_enables_dflash_speculation_by_default() {
         let mut m = model();
         m.dflash_path = Some("/tmp/dflash-kquant.gguf".into());
+
+        // Only for a binary that accepts the spec type: the discovered backend
+        // here has no llama-server at all, so the default stays undrafted
+        // rather than resolving to a launch it could not run.
+        let mut backend = backend();
+        assert!(!backend.dflash_supported);
+        let undrafted = resolve_options(
+            &backend,
+            &m,
+            &profile("Default"),
+            &empty_store(),
+            &Defaults::default(),
+        );
+        assert_eq!(value_of(&undrafted, "spec-type"), "none");
+
+        backend.dflash_supported = true;
         let opts = resolve_options(
-            &backend(),
+            &backend,
             &m,
             &profile("Default"),
             &empty_store(),

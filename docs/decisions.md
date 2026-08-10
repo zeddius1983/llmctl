@@ -553,7 +553,12 @@ gets the same drafter. Where several variants exist, the publisher's unqualified
 file wins, then the most compact quantization — a drafter is run for speed.
 
 `spec-type` becomes `draft-dflash` by model-aware default when a drafter is on
-disk, outranking `draft-mtp` if a model somehow offers both; the resolved
+disk **and** the configured `llama-server` advertises that spec type — a
+model-aware default must never turn a working undrafted launch into one the
+binary rejects, so the capability is sniffed from the cached `--help` like
+`--hf-repo` and `--mmproj-auto` already are, and an explicitly saved
+`draft-dflash` on an older binary is refused by `launch_blocker`. It outranks
+`draft-mtp` if a model somehow offers both; the resolved
 `spec-type` (not the model) then decides which companion fills
 `--spec-draft-model`, so the two drafters can coexist in one catalog.
 
