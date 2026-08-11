@@ -210,6 +210,34 @@ through the launcher script. `CatalogCtx.reload` marks the callers that need
 fresh data (`F5`, and a finished download); switching arrangement does not, and
 went from ~155 ms to ~60 µs (ADR-012).
 
+## In progress
+
+### dFlash speculative decoding and multi-GPU options (`feature/dflash-speculation`)
+`--spec-type` gains llama.cpp's `draft-dflash` and `draft-dspark` variants.
+A `dflash-*.gguf` drafter is discovered as a companion of the model published
+beside it — by directory locally (single model family only, as for a generic
+projector) and repository-wide on Hugging Face, so every quantization of e.g.
+`unsloth/Muse-Glimmer-30B-GGUF` pairs the one `dflash-kquant.gguf`. It is hidden
+as a standalone artifact, downloaded with the model it drafts for, and passed
+through `--spec-draft-model`; a cached drafter makes `draft-dflash` the
+model-aware `spec-type` default. Because `--spec-draft-hf` accepts only a
+`repo[:quant]` selector, an unqualified drafter must be downloaded before use —
+`launch_blocker` says so instead of letting llama-server fail (ADR-014).
+`spec-draft-n-max` defaults to the drafter's `dflash.block_size` (parsed from
+the companion header) instead of llama.cpp's 3 — worth ~12 t/s on a 30B target
+(see ADR-014 for the measurements).
+New llama.cpp options: `split-mode` (`-sm`), `tensor-split` (`-ts`),
+`parallel` (`-np`), `sleep-idle-seconds`, and `load-mode` (`-lm`) replacing the
+deprecated `--no-mmap`, with `mmap: off` profiles migrated via the new
+`RuntimeBackend::legacy_value` hook.
+
+Measured on the maintainer's Radeon 8060S (llama.cpp b10353): dFlash **aborts on
+the Vulkan backend** — `pre-allocated tensor (output.weight) in a buffer
+(Vulkan0) that cannot run the operation (NONE)`, with or without
+`--spec-draft-ngl 0` — but works on ROCm. Undrafted throughput is the same on
+both backends, so the 2.5x is dFlash, not the backend. Not an llmctl bug;
+noted here because the failure looks like one.
+
 ## Next (post-v0.3.1)
 
 ### Online Hugging Face follow-ups

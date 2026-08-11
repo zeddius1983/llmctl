@@ -43,6 +43,8 @@ struct Artifact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mtp_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    dflash_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     projector_path: Option<PathBuf>,
     #[serde(default)]
     has_mtp: bool,
@@ -175,6 +177,7 @@ pub fn reconcile(root: &Path, models: &mut [Model]) {
                 modified: model.modified,
                 shards: model.shard_paths.clone(),
                 mtp_path: model.mtp_path.clone(),
+                dflash_path: model.dflash_path.clone(),
                 projector_path: model.projector_path.clone(),
                 has_mtp: model.has_mtp,
             },
@@ -307,6 +310,8 @@ mod tests {
             path: source.clone(),
             shard_paths: vec![source.clone()],
             mtp_path: None,
+            dflash_path: None,
+            dflash_block_size: None,
             projector_path: None,
             has_mtp: false,
             catalog_path: vec!["local".into(), "Test".into()],

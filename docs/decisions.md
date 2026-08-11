@@ -528,3 +528,74 @@ tracking record points at a sentinel `complete_file` that never exists, keeping
 progress tied to byte growth; the `Downloading` state ends when the health probe
 reports ready. A `DownloadRecord::Directory` variant would express this more
 honestly and is noted as a follow-up.
+
+---
+
+## ADR-014: dFlash drafters are directory-scoped companions, downloaded first
+
+**Status:** Accepted
+
+**Context:** llama.cpp's `--spec-type` gained `draft-dflash`, a drafter loaded
+from a separate GGUF through the same `--spec-draft-model` slot MTP uses.
+Publishers ship it beside the model it drafts for under an unqualified name —
+`unsloth/Muse-Glimmer-30B-GGUF` carries one `dflash-kquant.gguf` for all
+fourteen quantizations of the model. That breaks the two assumptions the MTP
+pairing rests on: the companion filename names its base model, and llama.cpp can
+find or fetch the companion itself from an `-hf` launch.
+
+**Decision:** A dFlash drafter is a companion attribute of a base model, like an
+MTP sidecar or a projector, recorded as `Model::dflash_path` (and
+`RemoteModel::dflash_file`) rather than as its own catalog leaf. Because its
+name identifies no base model, it is paired the way a generic projector is: by
+directory, and only when that directory publishes a single model family. In a
+Hugging Face repository the pairing is repository-wide, so every quantization
+gets the same drafter. Where several variants exist, the publisher's unqualified
+file wins, then the most compact quantization — a drafter is run for speed.
+
+`spec-type` becomes `draft-dflash` by model-aware default when a drafter is on
+disk **and** the configured `llama-server` advertises that spec type — a
+model-aware default must never turn a working undrafted launch into one the
+binary rejects, so the capability is sniffed from the cached `--help` like
+`--hf-repo` and `--mmproj-auto` already are, and an explicitly saved
+`draft-dflash` on an older binary is refused by `launch_blocker`. It outranks
+`draft-mtp` if a model somehow offers both; the resolved
+`spec-type` (not the model) then decides which companion fills
+`--spec-draft-model`, so the two drafters can coexist in one catalog.
+
+A dFlash drafter must be downloaded before it can be used. `--spec-draft-hf`
+takes only a `repo[:quant]` selector — there is no `--hf-file` equivalent for
+the draft model — so an unqualified `dflash-*.gguf` cannot be addressed
+remotely. llmctl includes the drafter in the blobs it downloads with the model,
+and a launch that selects `draft-dflash` without a cached drafter is refused by
+`launch_blocker` with that instruction rather than being started and failing
+inside llama-server.
+
+Reproducing a published multi-GPU configuration also needs options llmctl did
+not expose, so `split-mode`, `tensor-split`, `parallel`, and
+`sleep-idle-seconds` join the llama.cpp option table, all omitted at the
+`default` sentinel.
+
+`--spec-draft-n-max` defaults to the drafter's `dflash.block_size` (read from
+the companion's GGUF header) rather than llama.cpp's 3. dFlash emits a whole
+block per forward pass, so throughput keeps climbing to the block size even as
+the acceptance *rate* falls — measured on a Radeon 8060S with
+Muse-Glimmer-30B-Q4_K_XL: 11.2 t/s undrafted, then 16.3 / 27.4 / 28.5 t/s at
+n-max 3 / 8 / 16, with acceptance 0.66 / 0.35 / 0.24 and mean accepted length
+3.0 / 3.9 / 4.5. llama.cpp clamps above the block size anyway, so the default is
+also the ceiling.
+
+The deprecated `--no-mmap` switch is replaced by the `load-mode` option
+(`-lm {none,mmap,mlock,mmap+mlock,dio}`), which supersedes `--mmap`, `--mlock`,
+and `--direct-io` upstream. A profile saved as `mmap: off` is recovered as
+`load-mode: none` through a new `RuntimeBackend::legacy_value` hook — a
+key-level counterpart to `normalize_legacy`, consulted only when the profile
+carries no value under the current key — so a renamed flag never silently drops
+a user's setting. Binaries too old to advertise `--load-mode` are refused by
+`launch_blocker` unless the option sits at its omitted default.
+
+**Consequences:** A model whose directory mixes families gets no drafter rather
+than a guessed one; that is deliberate, and a per-model companion selector
+(already a noted follow-up for MTP/projector precision) would cover it. The
+`Drafter` enum is the single place that maps a `spec-type` value to the
+companion it needs, so `draft-eagle3`/`draft-dspark` can be paired later without
+touching the command builder.

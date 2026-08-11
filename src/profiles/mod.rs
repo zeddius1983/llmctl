@@ -66,6 +66,7 @@ pub fn resolve_options(
 
             let value = instance
                 .and_then(|i| i.values.get(spec.key).cloned())
+                .or_else(|| instance.and_then(|i| backend.legacy_value(spec.key, &i.values)))
                 .or_else(|| template.and_then(|t| t.override_value(spec.key)))
                 .unwrap_or_else(|| default.clone());
             let value = backend.clamp_to_model(spec.key, value, model);
@@ -148,6 +149,8 @@ mod tests {
             path: "/tmp/x.gguf".into(),
             shard_paths: vec!["/tmp/x.gguf".into()],
             mtp_path: None,
+            dflash_path: None,
+            dflash_block_size: None,
             projector_path: None,
             has_mtp: false,
             catalog_path: vec!["test-model".into()],
@@ -267,10 +270,10 @@ mod tests {
         for key in ["batch-size", "gpu-layers", "threads", "reasoning-effort", "chat-template"] {
             assert_eq!(value_of(&opts, key), registry::DEFAULT, "{key} should start at default");
         }
-        // The valueless flags start at "on" (llama.cpp's defaults, omitted).
-        for key in ["mmap", "jinja"] {
-            assert_eq!(value_of(&opts, key), "on", "{key} should start at on");
-        }
+        // The valueless flag starts at "on" (llama.cpp's default, omitted), and
+        // load-mode at its in-band "default" variant.
+        assert_eq!(value_of(&opts, "jinja"), "on");
+        assert_eq!(value_of(&opts, "load-mode"), registry::DEFAULT);
         // A profile that explicitly sets one still carries a concrete value.
         let server = resolve_options(
             &backend(),
@@ -310,6 +313,36 @@ mod tests {
             &Defaults::default(),
         );
         assert_eq!(value_of(&opts, "spec-type"), "draft-mtp");
+    }
+
+    #[test]
+    fn dflash_sidecar_enables_dflash_speculation_by_default() {
+        let mut m = model();
+        m.dflash_path = Some("/tmp/dflash-kquant.gguf".into());
+
+        // Only for a binary that accepts the spec type: the discovered backend
+        // here has no llama-server at all, so the default stays undrafted
+        // rather than resolving to a launch it could not run.
+        let mut backend = backend();
+        assert!(!backend.dflash_supported);
+        let undrafted = resolve_options(
+            &backend,
+            &m,
+            &profile("Default"),
+            &empty_store(),
+            &Defaults::default(),
+        );
+        assert_eq!(value_of(&undrafted, "spec-type"), "none");
+
+        backend.dflash_supported = true;
+        let opts = resolve_options(
+            &backend,
+            &m,
+            &profile("Default"),
+            &empty_store(),
+            &Defaults::default(),
+        );
+        assert_eq!(value_of(&opts, "spec-type"), "draft-dflash");
     }
 
     #[test]

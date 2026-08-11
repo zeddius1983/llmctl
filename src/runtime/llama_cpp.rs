@@ -107,6 +107,24 @@ pub static SPECS: &[OptionSpec] = &[
                       ('default' lets llama.cpp choose).",
     },
     OptionSpec {
+        key: "split-mode",
+        cli: "-sm",
+        kind: Enum(&["default", "none", "layer", "row", "tensor"]),
+        default: "default",
+        step: 1.0,
+        description: "How to split the model across multiple GPUs \
+                      (default = llama.cpp's 'layer'; none keeps it on one GPU).",
+    },
+    OptionSpec {
+        key: "tensor-split",
+        cli: "-ts",
+        kind: Str,
+        default: "default",
+        step: 0.0,
+        description: "Fraction of the model to place on each GPU, comma-separated \
+                      (e.g. '1,1' for two equal GPUs; 'default' splits proportionally).",
+    },
+    OptionSpec {
         key: "temperature",
         cli: "--temp",
         kind: Float { min: Some(0.0), max: Some(2.0) },
@@ -213,13 +231,14 @@ pub static SPECS: &[OptionSpec] = &[
                       reasoning-effort).",
     },
     OptionSpec {
-        key: "mmap",
-        cli: "--no-mmap",
-        kind: Enum(&["on", "off"]),
-        default: "on",
+        key: "load-mode",
+        cli: "-lm",
+        kind: Enum(&["default", "none", "mmap", "mlock", "mmap+mlock", "dio"]),
+        default: "default",
         step: 1.0,
-        description: "Memory-map the model (on = llama.cpp default; turn off to add \
-                      --no-mmap for ROCm/AMD GPU compatibility).",
+        description: "How the model is loaded into memory (default = llama.cpp's mmap; \
+                      none replaces the deprecated --no-mmap, useful for ROCm/AMD GPUs; \
+                      mlock pins it in RAM; dio uses DirectIO).",
     },
     OptionSpec {
         key: "cache-type-k",
@@ -247,6 +266,8 @@ pub static SPECS: &[OptionSpec] = &[
             "draft-simple",
             "draft-eagle3",
             "draft-mtp",
+            "draft-dflash",
+            "draft-dspark",
             "ngram-simple",
             "ngram-map-k",
             "ngram-map-k4v",
@@ -256,7 +277,8 @@ pub static SPECS: &[OptionSpec] = &[
         default: "none",
         step: 1.0,
         description: "Speculative decoding type (none = disabled; draft-mtp uses the model's \
-                      integrated or companion MTP head).",
+                      integrated or companion MTP head, draft-dflash its dflash-*.gguf \
+                      drafter).",
     },
     OptionSpec {
         key: "spec-draft-n-max",
@@ -274,6 +296,24 @@ pub static SPECS: &[OptionSpec] = &[
         default: "0",
         step: 1.0,
         description: "Min draft tokens for speculative decoding ('default' = llama.cpp's 0).",
+    },
+    OptionSpec {
+        key: "parallel",
+        cli: "-np",
+        kind: Int { min: Some(1), max: None },
+        default: "1",
+        step: 1.0,
+        description: "Server slots served concurrently; each one gets ctx-size/N of the \
+                      context ('default' = llama.cpp's auto).",
+    },
+    OptionSpec {
+        key: "sleep-idle-seconds",
+        cli: "--sleep-idle-seconds",
+        kind: Int { min: Some(0), max: None },
+        default: "600",
+        step: 60.0,
+        description: "Release the model from memory after this many idle seconds, \
+                      reloading it on the next request ('default' = never sleep).",
     },
     OptionSpec {
         key: "host",
@@ -300,9 +340,6 @@ pub static SPECS: &[OptionSpec] = &[
 fn omit_token(key: &str) -> Option<&'static str> {
     match key {
         "flash-attn" | "reasoning" => Some("auto"),
-        // `mmap=on` is llama.cpp's default (omitted); `off` adds the bare
-        // `--no-mmap` flag (see [`is_flag`]).
-        "mmap" => Some("on"),
         // Speculative decoding is off by default.
         "spec-type" => Some("none"),
         // `jinja=on` is llama.cpp's default (omitted); `off` adds the bare
@@ -310,7 +347,8 @@ fn omit_token(key: &str) -> Option<&'static str> {
         "jinja" => Some("on"),
         "batch-size" | "device" | "gpu-layers" | "threads" | "cache-type-k" | "cache-type-v"
         | "spec-draft-n-max" | "spec-draft-n-min" | "reasoning-effort" | "chat-template"
-        | "ctx-size" | "temperature" | "top-p" | "top-k" | "min-p" | "repeat-penalty" => {
+        | "ctx-size" | "temperature" | "top-p" | "top-k" | "min-p" | "repeat-penalty"
+        | "split-mode" | "tensor-split" | "parallel" | "sleep-idle-seconds" | "load-mode" => {
             Some(DEFAULT)
         }
         // host/port are never omitted: llmctl itself needs the concrete
@@ -319,10 +357,10 @@ fn omit_token(key: &str) -> Option<&'static str> {
     }
 }
 
-/// Whether the option is a valueless boolean flag (e.g. `mmap` → `--no-mmap`):
+/// Whether the option is a valueless boolean flag (e.g. `jinja` → `--no-jinja`):
 /// when not at its [`omit_token`] it emits the bare flag with no value token.
 fn is_flag(key: &str) -> bool {
-    matches!(key, "mmap" | "jinja")
+    matches!(key, "jinja")
 }
 
 /// Most options pass their value through verbatim; `reasoning-effort` has no
@@ -374,6 +412,12 @@ pub struct LlamaCppBackend {
     pub hf_supported: bool,
     pub draft_hf_supported: bool,
     pub mmproj_auto_supported: bool,
+    /// `--load-mode` superseded `--no-mmap`/`--mlock`/`--direct-io`; older
+    /// builds only understand the deprecated flags.
+    pub load_mode_supported: bool,
+    /// Whether `--spec-type` accepts `draft-dflash`. A drafter on disk must not
+    /// turn an untouched profile into a launch an older binary rejects.
+    pub dflash_supported: bool,
 }
 
 impl LlamaCppBackend {
@@ -409,6 +453,9 @@ impl LlamaCppBackend {
             hf_supported: advertises("--hf-repo") && advertises("--hf-file"),
             draft_hf_supported: advertises("--spec-draft-hf"),
             mmproj_auto_supported: advertises("--mmproj-auto"),
+            load_mode_supported: advertises("--load-mode"),
+            // `--help` prints the accepted values inline on the --spec-type line.
+            dflash_supported: advertises("draft-dflash"),
         }
     }
 }
@@ -450,11 +497,31 @@ impl RuntimeBackend for LlamaCppBackend {
     /// 'default' means the model's full trained context, which can exhaust
     /// memory, so it begins at the ctx/8 heuristic instead.
     fn spec_default(&self, spec: &OptionSpec, model: &Model, defaults: &Defaults) -> String {
-        // An integrated or sidecar MTP head is only useful when llama.cpp's MTP
+        // A companion drafter is only useful when the matching llama.cpp
         // drafter is enabled. Make that the model-aware default while still
-        // allowing a saved profile value to override it.
-        if spec.key == "spec-type" && model.supports_mtp() {
-            return "draft-mtp".into();
+        // allowing a saved profile value to override it. dFlash wins over MTP
+        // when a model ships both: it is the newer, faster drafter, and its
+        // companion is on disk (a remote dFlash drafter is not addressable, so
+        // it only becomes the default once downloaded).
+        if spec.key == "spec-type" {
+            if model.dflash_path.is_some() && self.dflash_supported {
+                return "draft-dflash".into();
+            }
+            if model.supports_mtp() {
+                return "draft-mtp".into();
+            }
+        }
+        // llama.cpp's own default is 3, which for a dFlash drafter throws away
+        // most of the speedup: it emits a whole block per pass, and measured
+        // throughput keeps climbing to the trained block size even as the
+        // acceptance *rate* falls (11.2 → 16.3 → 28.5 t/s at 3/8/16 on a
+        // 30B target). llama.cpp clamps above the block size anyway.
+        if spec.key == "spec-draft-n-max"
+            && model.dflash_path.is_some()
+            && self.dflash_supported
+            && let Some(block_size) = model.dflash_block_size
+        {
+            return block_size.to_string();
         }
         match SCHEMA.omit_token(spec.key) {
             Some(token) if spec.key != "ctx-size" => token.to_string(),
@@ -483,6 +550,18 @@ impl RuntimeBackend for LlamaCppBackend {
         }
     }
 
+    /// `--no-mmap` was deprecated in favour of `--load-mode`, so a profile
+    /// saved as `mmap: off` becomes `load-mode: none` — the same launch. Stored
+    /// `mmap: on` was llama.cpp's default and needs no carrying over.
+    fn legacy_value(
+        &self,
+        key: &str,
+        stored: &std::collections::BTreeMap<String, String>,
+    ) -> Option<String> {
+        (key == "load-mode" && stored.get("mmap").is_some_and(|value| value == "off"))
+            .then(|| "none".to_string())
+    }
+
     /// Clamp `ctx-size` down to the model's trained context length so no
     /// resolved value ever exceeds what the model supports.
     fn clamp_to_model(&self, key: &str, value: String, model: &Model) -> String {
@@ -497,18 +576,17 @@ impl RuntimeBackend for LlamaCppBackend {
 
     fn build_command(&self, ctx: &LaunchContext) -> Command {
         let model = ctx.model;
-        let mtp_enabled = mtp_enabled(ctx.options);
-        let mtp_path =
-            mtp_enabled.then(|| model.mtp_path.as_ref().map(|p| p.display().to_string())).flatten();
+        let drafter = drafter(ctx.options);
+        let draft_path = draft_path(model, drafter).map(|p| p.display().to_string());
         let projector_path = model.projector_path.as_ref().map(|p| p.display().to_string());
 
-        match remote_launch(model, mtp_enabled) {
+        match remote_launch(model, drafter) {
             Some(remote) => Command::build_huggingface(
                 ctx.binary,
                 &remote.repo,
                 remote.file.as_deref().unwrap_or_default(),
-                mtp_path.as_deref(),
-                draft_hf(remote, mtp_enabled, &mtp_path).as_deref(),
+                draft_path.as_deref(),
+                draft_hf(remote, drafter, draft_path.is_some()).as_deref(),
                 projector_path.as_deref(),
                 projector_path.is_none() && remote.projector_file.is_some(),
                 &SCHEMA,
@@ -517,7 +595,7 @@ impl RuntimeBackend for LlamaCppBackend {
             None => Command::build_local(
                 ctx.binary,
                 &model.path.display().to_string(),
-                mtp_path.as_deref(),
+                draft_path.as_deref(),
                 projector_path.as_deref(),
                 &SCHEMA,
                 ctx.options,
@@ -558,7 +636,7 @@ impl RuntimeBackend for LlamaCppBackend {
     /// A remote launch names the repo-relative filename that llama.cpp will
     /// fetch; a local one names the GGUF path.
     fn process_token(&self, ctx: &LaunchContext) -> String {
-        match remote_launch(ctx.model, mtp_enabled(ctx.options)) {
+        match remote_launch(ctx.model, drafter(ctx.options)) {
             Some(remote) => remote.file.clone().unwrap_or_default(),
             None => ctx.model.path.display().to_string(),
         }
@@ -568,22 +646,55 @@ impl RuntimeBackend for LlamaCppBackend {
     /// older builds do not have. Checking here turns an opaque server error into
     /// an explanation.
     fn launch_blocker(&self, ctx: &LaunchContext) -> Option<String> {
-        let mtp_enabled = mtp_enabled(ctx.options);
-        let remote = remote_launch(ctx.model, mtp_enabled)?;
+        // Applies to every launch, local or remote: the flag itself is too new
+        // for the binary.
+        if !self.load_mode_supported
+            && ctx
+                .options
+                .iter()
+                .any(|o| o.key == "load-mode" && SCHEMA.omit_token("load-mode") != Some(&o.value))
+        {
+            return Some(
+                "this llama-server does not advertise --load-mode; upgrade llama.cpp or leave load-mode at default"
+                    .into(),
+            );
+        }
+        let drafter = drafter(ctx.options);
+        // A profile saved against a newer binary, or a downgraded llama.cpp.
+        if drafter == Some(Drafter::DFlash) && !self.dflash_supported {
+            return Some(
+                "this llama-server does not accept --spec-type draft-dflash; upgrade llama.cpp or set spec-type to none"
+                    .into(),
+            );
+        }
+        let remote = remote_launch(ctx.model, drafter)?;
         if !self.hf_supported {
             return Some(
                 "this llama-server does not advertise --hf-repo/--hf-file; upgrade llama.cpp"
                     .into(),
             );
         }
-        let mtp_path = mtp_enabled.then_some(ctx.model.mtp_path.as_ref()).flatten();
-        if draft_hf(remote, mtp_enabled, &mtp_path.map(|p| p.display().to_string())).is_some()
-            && !self.draft_hf_supported
-        {
-            return Some(
-                "this llama-server does not advertise --spec-draft-hf; upgrade llama.cpp or download the MTP companion first"
-                    .into(),
-            );
+        let cached = draft_path(ctx.model, drafter).is_some();
+        match draft_hf(remote, drafter, cached) {
+            Some(_) if !self.draft_hf_supported => {
+                return Some(
+                    "this llama-server does not advertise --spec-draft-hf; upgrade llama.cpp or download the draft companion first"
+                        .into(),
+                );
+            }
+            // A companion llama.cpp cannot address remotely: only `--hf-repo`
+            // takes a quant selector, and dFlash drafters are published under
+            // an unqualified name. It has to be on disk first.
+            None if drafter == Some(Drafter::DFlash)
+                && !cached
+                && draft_file(remote, drafter).is_some() =>
+            {
+                return Some(
+                    "the dFlash draft model is not downloaded; press d to download this model, or set spec-type to none"
+                        .into(),
+                );
+            }
+            _ => {}
         }
         if ctx.model.projector_path.is_none()
             && remote.projector_file.is_some()
@@ -600,12 +711,13 @@ impl RuntimeBackend for LlamaCppBackend {
     /// The Hub blobs llama.cpp will pull, so the session shows download
     /// progress rather than sitting in `Starting` for minutes.
     fn launch_download(&self, ctx: &LaunchContext) -> Option<DownloadRecord> {
-        let remote = remote_launch(ctx.model, mtp_enabled(ctx.options))?;
+        let remote = remote_launch(ctx.model, drafter(ctx.options))?;
         let blobs: Vec<DownloadBlob> = remote
             .blobs
             .iter()
             .filter(|blob| {
                 remote.mtp_file.as_deref() != Some(blob.file.as_str())
+                    && remote.dflash_file.as_deref() != Some(blob.file.as_str())
                     && remote.projector_file.as_deref() != Some(blob.file.as_str())
             })
             .filter_map(|blob| {
@@ -633,9 +745,42 @@ impl RuntimeBackend for LlamaCppBackend {
     }
 }
 
-/// Is llama.cpp's MTP drafter selected in the resolved options?
-fn mtp_enabled(options: &[OptionItem]) -> bool {
-    options.iter().any(|o| o.key == "spec-type" && o.value == "draft-mtp")
+/// A speculative-decoding type that needs a companion draft GGUF, and which
+/// companion that is. llama.cpp loads either through the same
+/// `--spec-draft-model` slot, so at most one can be selected at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drafter {
+    /// `draft-mtp`: an `mtp-*.gguf` sidecar (or the base model's own heads).
+    Mtp,
+    /// `draft-dflash`: a `dflash-*.gguf` sidecar.
+    DFlash,
+}
+
+/// Which companion drafter the resolved options select, if any. The other
+/// `--spec-type` values (ngram-*, and the draft types llmctl does not pair a
+/// companion for) need no artifact from the catalog.
+fn drafter(options: &[OptionItem]) -> Option<Drafter> {
+    options.iter().find(|o| o.key == "spec-type").and_then(|o| match o.value.as_str() {
+        "draft-mtp" => Some(Drafter::Mtp),
+        "draft-dflash" => Some(Drafter::DFlash),
+        _ => None,
+    })
+}
+
+/// The locally available draft GGUF for the selected drafter.
+fn draft_path(model: &Model, drafter: Option<Drafter>) -> Option<&PathBuf> {
+    match drafter? {
+        Drafter::Mtp => model.mtp_path.as_ref(),
+        Drafter::DFlash => model.dflash_path.as_ref(),
+    }
+}
+
+/// The repository-relative draft companion for the selected drafter.
+fn draft_file(remote: &RemoteModel, drafter: Option<Drafter>) -> Option<&str> {
+    match drafter? {
+        Drafter::Mtp => remote.mtp_file.as_deref(),
+        Drafter::DFlash => remote.dflash_file.as_deref(),
+    }
 }
 
 /// Registry default, overridden by config for host/port.
@@ -649,20 +794,25 @@ fn config_default(spec: &OptionSpec, defaults: &Defaults) -> String {
 
 /// The remote identity to launch from, when one or more required artifacts are
 /// not in the local cache and llama.cpp must fetch them itself.
-fn remote_launch(model: &Model, mtp_enabled: bool) -> Option<&RemoteModel> {
+fn remote_launch(model: &Model, drafter: Option<Drafter>) -> Option<&RemoteModel> {
     let remote = model.remote.as_ref()?;
     let base_missing = model.path.as_os_str().is_empty();
-    let mtp_missing = mtp_enabled && model.mtp_path.is_none() && remote.mtp_file.is_some();
+    let draft_missing =
+        draft_path(model, drafter).is_none() && draft_file(remote, drafter).is_some();
     let projector_missing = model.projector_path.is_none() && remote.projector_file.is_some();
-    (base_missing || mtp_missing || projector_missing).then_some(remote)
+    (base_missing || draft_missing || projector_missing).then_some(remote)
 }
 
-/// The `--spec-draft-hf` repository for an MTP companion that has to be fetched.
-fn draft_hf(remote: &RemoteModel, mtp_enabled: bool, mtp_path: &Option<String>) -> Option<String> {
-    if !mtp_enabled || mtp_path.is_some() {
+/// The `--spec-draft-hf` repository for a draft companion that has to be
+/// fetched. `None` when the companion is already cached, when none is selected,
+/// or when its filename carries no quantization to address it by — llama.cpp
+/// has no `--hf-file` equivalent for the draft model, so an unqualified
+/// companion can only be found by llama.cpp itself (MTP) or downloaded first.
+fn draft_hf(remote: &RemoteModel, drafter: Option<Drafter>, cached: bool) -> Option<String> {
+    if cached {
         return None;
     }
-    draft_hf_repository(&remote.repo, remote.mtp_file.as_deref()?)
+    draft_hf_repository(&remote.repo, draft_file(remote, drafter)?)
 }
 
 /// Prefer `llama-bench` beside `llama-server`, then fall back to PATH for
@@ -755,6 +905,53 @@ fn draft_hf_repository(repo: &str, file: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A backend with nothing discovered but every capability advertised — the
+    /// dialect logic never touches the binary.
+    fn test_backend() -> LlamaCppBackend {
+        LlamaCppBackend {
+            runtime: Runtime {
+                name: NAME.into(),
+                description: String::new(),
+                version: None,
+                binary_path: None,
+                bench_path: None,
+                formats: Vec::new(),
+                devices: Vec::new(),
+            },
+            hf_supported: true,
+            draft_hf_supported: true,
+            mmproj_auto_supported: true,
+            load_mode_supported: true,
+            dflash_supported: true,
+        }
+    }
+
+    /// A bare local GGUF with no companions and no remote identity.
+    fn test_model() -> Model {
+        Model {
+            id: "models:1".into(),
+            name: "model.gguf".into(),
+            path: "/m/model.gguf".into(),
+            shard_paths: vec!["/m/model.gguf".into()],
+            mtp_path: None,
+            dflash_path: None,
+            dflash_block_size: None,
+            projector_path: None,
+            has_mtp: false,
+            catalog_path: Vec::new(),
+            catalog_dir: PathBuf::new(),
+            size_bytes: 1,
+            quantization: None,
+            architecture: None,
+            context_length: None,
+            modified: None,
+            has_chat_template: false,
+            remote: None,
+            flm: None,
+            runtime: NAME.into(),
+        }
+    }
 
     #[test]
     fn int_range_is_enforced() {
@@ -855,6 +1052,129 @@ mod tests {
     }
 
     #[test]
+    fn dflash_is_a_spec_type_variant_that_selects_the_dflash_companion() {
+        let spec = SCHEMA.spec("spec-type").unwrap();
+        assert_eq!(spec.kind.validate("draft-dflash").unwrap(), "draft-dflash");
+
+        let opts = vec![OptionItem {
+            key: "spec-type".into(),
+            value: "draft-dflash".into(),
+            default: "none".into(),
+            range: None,
+            cli: "--spec-type".into(),
+            description: String::new(),
+        }];
+        assert_eq!(drafter(&opts), Some(Drafter::DFlash));
+
+        let mut model = test_model();
+        model.mtp_path = Some("/m/mtp-model.gguf".into());
+        model.dflash_path = Some("/m/dflash-kquant.gguf".into());
+        // Both companions exist; the selected spec-type decides which is loaded.
+        assert_eq!(
+            draft_path(&model, drafter(&opts)).map(|p| p.display().to_string()),
+            Some("/m/dflash-kquant.gguf".into())
+        );
+    }
+
+    #[test]
+    fn a_dflash_companion_makes_dflash_the_default_speculation() {
+        let backend = test_backend();
+        let spec = SCHEMA.spec("spec-type").unwrap();
+        let defaults = Defaults::default();
+
+        let mut model = test_model();
+        assert_eq!(backend.spec_default(spec, &model, &defaults), "none");
+
+        model.has_mtp = true;
+        assert_eq!(backend.spec_default(spec, &model, &defaults), "draft-mtp");
+
+        // A downloaded dFlash drafter outranks an MTP head.
+        model.dflash_path = Some("/m/dflash-kquant.gguf".into());
+        assert_eq!(backend.spec_default(spec, &model, &defaults), "draft-dflash");
+    }
+
+    /// A drafter on disk must not rewrite the default for a binary that cannot
+    /// run it: that would turn a working undrafted launch into a server error.
+    #[test]
+    fn an_older_binary_keeps_the_undrafted_defaults() {
+        let mut backend = test_backend();
+        backend.dflash_supported = false;
+        let defaults = Defaults::default();
+        let mut model = test_model();
+        model.dflash_path = Some("/m/dflash-kquant.gguf".into());
+        model.dflash_block_size = Some(16);
+
+        assert_eq!(
+            backend.spec_default(SCHEMA.spec("spec-type").unwrap(), &model, &defaults),
+            "none"
+        );
+        assert_eq!(
+            backend.spec_default(SCHEMA.spec("spec-draft-n-max").unwrap(), &model, &defaults),
+            DEFAULT
+        );
+
+        // An explicit draft-dflash — from a profile saved against a newer
+        // llama.cpp — is refused with an explanation rather than launched.
+        let selected = OptionItem {
+            key: "spec-type".into(),
+            value: "draft-dflash".into(),
+            default: "none".into(),
+            range: None,
+            cli: "--spec-type".into(),
+            description: String::new(),
+        };
+        let ctx = LaunchContext {
+            binary: "llama-server",
+            model: &model,
+            options: std::slice::from_ref(&selected),
+        };
+        assert!(backend.launch_blocker(&ctx).unwrap().contains("draft-dflash"));
+    }
+
+    #[test]
+    fn draft_count_defaults_to_the_drafters_block_size() {
+        let backend = test_backend();
+        let n_max = SCHEMA.spec("spec-draft-n-max").unwrap();
+        let defaults = Defaults::default();
+
+        // Without a drafter the flag stays omitted (llama.cpp's own 3).
+        let mut model = test_model();
+        assert_eq!(backend.spec_default(n_max, &model, &defaults), DEFAULT);
+
+        // A drafter whose header we could not read stays at the sentinel too.
+        model.dflash_path = Some("/m/dflash-kquant.gguf".into());
+        assert_eq!(backend.spec_default(n_max, &model, &defaults), DEFAULT);
+
+        // With the block size known, drafting starts at a full block.
+        model.dflash_block_size = Some(16);
+        assert_eq!(backend.spec_default(n_max, &model, &defaults), "16");
+
+        // It is a dFlash property: an MTP companion does not adopt it.
+        let mut mtp = test_model();
+        mtp.mtp_path = Some("/m/mtp-model.gguf".into());
+        mtp.dflash_block_size = Some(16);
+        assert_eq!(backend.spec_default(n_max, &mtp, &defaults), DEFAULT);
+    }
+
+    #[test]
+    fn multi_gpu_and_server_options_are_omitted_at_the_sentinel() {
+        for key in ["tensor-split", "parallel", "sleep-idle-seconds"] {
+            assert_eq!(SCHEMA.omit_token(key), Some(DEFAULT), "{key} should fold the sentinel");
+            assert!(SCHEMA.uses_sentinel(key), "{key} should get sentinel affordances");
+        }
+        assert_eq!(SCHEMA.spec("tensor-split").unwrap().cli, "-ts");
+        assert_eq!(SCHEMA.spec("parallel").unwrap().cli, "-np");
+
+        // split-mode's omitted state is an in-band enum variant, so it cycles.
+        let split = SCHEMA.spec("split-mode").unwrap();
+        assert_eq!(split.cli, "-sm");
+        assert_eq!(SCHEMA.omit_token("split-mode"), Some(DEFAULT));
+        assert!(!SCHEMA.uses_sentinel("split-mode"));
+        assert_eq!(SCHEMA.bump(split, &split.kind, "default", 1), Some("none".into()));
+        assert_eq!(split.kind.validate("LAYER").unwrap(), "layer");
+    }
+
+    #[test]
     fn reasoning_effort_is_a_json_kwarg_enum_omitted_at_default() {
         // "default" is the omitted state, an in-band enum variant (no sentinel
         // affordances) — it cycles like the cache types.
@@ -870,11 +1190,61 @@ mod tests {
     }
 
     #[test]
-    fn mmap_is_a_flag_omitted_when_on() {
-        assert!(SCHEMA.is_flag("mmap"));
-        assert_eq!(SCHEMA.omit_token("mmap"), Some("on")); // on = llama default, omitted
-        let s = SCHEMA.spec("mmap").unwrap();
-        assert_eq!(SCHEMA.bump(s, &s.kind, "on", 1), Some("off".into())); // `e` toggles
+    fn load_mode_replaces_the_deprecated_mmap_flag() {
+        // It takes a value now, so it is no longer a bare flag, and its omitted
+        // state is the in-band "default" variant (llama.cpp's own mmap).
+        assert!(!SCHEMA.is_flag("load-mode"));
+        assert_eq!(SCHEMA.omit_token("load-mode"), Some(DEFAULT));
+        assert!(!SCHEMA.uses_sentinel("load-mode")); // enum variant, so it cycles
+        let s = SCHEMA.spec("load-mode").unwrap();
+        assert_eq!(s.cli, "-lm");
+        assert_eq!(SCHEMA.bump(s, &s.kind, "default", 1), Some("none".into()));
+        assert!(s.kind.validate("mmap+mlock").is_ok());
+        assert!(s.kind.validate("off").is_err()); // the old vocabulary is gone
+    }
+
+    #[test]
+    fn a_saved_no_mmap_profile_migrates_to_load_mode_none() {
+        let backend = test_backend();
+        let stored = std::collections::BTreeMap::from([("mmap".to_string(), "off".to_string())]);
+        assert_eq!(backend.legacy_value("load-mode", &stored), Some("none".into()));
+
+        // `mmap: on` was llama.cpp's default, so there is nothing to carry over,
+        // and no other option adopts the legacy value.
+        let on = std::collections::BTreeMap::from([("mmap".to_string(), "on".to_string())]);
+        assert_eq!(backend.legacy_value("load-mode", &on), None);
+        assert_eq!(backend.legacy_value("ctx-size", &stored), None);
+    }
+
+    #[test]
+    fn load_mode_on_an_older_binary_is_a_launch_blocker() {
+        let mut backend = test_backend();
+        backend.load_mode_supported = false;
+        let model = test_model();
+        let none = OptionItem {
+            key: "load-mode".into(),
+            value: "none".into(),
+            default: DEFAULT.into(),
+            range: None,
+            cli: "-lm".into(),
+            description: String::new(),
+        };
+        let ctx = LaunchContext {
+            binary: "llama-server",
+            model: &model,
+            options: std::slice::from_ref(&none),
+        };
+        assert!(backend.launch_blocker(&ctx).unwrap().contains("--load-mode"));
+
+        // At its omitted default the flag never reaches the command line, so an
+        // older binary launches fine.
+        let default = OptionItem { value: DEFAULT.into(), ..none };
+        let ctx = LaunchContext {
+            binary: "llama-server",
+            model: &model,
+            options: std::slice::from_ref(&default),
+        };
+        assert!(backend.launch_blocker(&ctx).is_none());
     }
 
     #[test]
