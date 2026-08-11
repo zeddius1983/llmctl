@@ -58,6 +58,15 @@ label, NPU-specific option set and templates, `flm serve` sessions with
 is modelled as `RuntimeBackend::single_session`. See
 [release notes](release-notes-v0.4.0.md).
 
+**v0.4.1 — Muse Glimmer 30B and dFlash speculative decoding** — adds support for
+Meta's Muse Glimmer 30B (drafter and projector attached automatically, launched
+with speculation on by default; needs llama.cpp b10353+), via llama.cpp's
+`draft-dflash` speculation with `dflash-*.gguf` drafters paired as companions of
+the model they draft for (ADR-014). Defaults `spec-draft-n-max` to the drafter's block size
+(~2.5x undrafted on a 30B target), exposes `split-mode`, `tensor-split`,
+`parallel`, and `sleep-idle-seconds`, and replaces the deprecated `--no-mmap`
+with `load-mode`. See [release notes](release-notes-v0.4.1.md).
+
 Branching: each remaining phase is built on its own `feature/<task>` branch.
 When a batch is ready to ship, the feature branches merge into a release umbrella
 (e.g. **`feature/v0.1.0`**), which then merges to `main` and is tagged. (Early
@@ -210,9 +219,12 @@ through the launcher script. `CatalogCtx.reload` marks the callers that need
 fresh data (`F5`, and a finished download); switching arrangement does not, and
 went from ~155 ms to ~60 µs (ADR-012).
 
-## In progress
+### v0.4.1 — Muse Glimmer 30B, dFlash speculative decoding, multi-GPU options
+Meta's Muse Glimmer 30B is supported end to end: its dFlash drafter and
+multimodal projector are attached automatically, downloaded with the model, and
+launched with speculation on by default (llama.cpp b10353+, which is where the
+`muse-glimmer` architecture landed upstream).
 
-### dFlash speculative decoding and multi-GPU options (`feature/dflash-speculation`)
 `--spec-type` gains llama.cpp's `draft-dflash` and `draft-dspark` variants.
 A `dflash-*.gguf` drafter is discovered as a companion of the model published
 beside it — by directory locally (single model family only, as for a generic
@@ -237,6 +249,10 @@ the Vulkan backend** — `pre-allocated tensor (output.weight) in a buffer
 `--spec-draft-ngl 0` — but works on ROCm. Undrafted throughput is the same on
 both backends, so the 2.5x is dFlash, not the backend. Not an llmctl bug;
 noted here because the failure looks like one.
+
+## In progress
+
+Nothing in flight — v0.4.1 is tagged and the next batch has not started.
 
 ## Next (post-v0.3.1)
 
