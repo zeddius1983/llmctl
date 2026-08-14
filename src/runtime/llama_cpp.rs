@@ -10,7 +10,9 @@ use crate::config::{Defaults, LlamaCppConfig};
 use crate::domain::{Model, OptionItem, RemoteModel, Runtime};
 use crate::profiles::registry::{DEFAULT, OptionKind, OptionSchema, OptionSpec};
 use crate::profiles::templates::Template;
-use crate::runtime::{CatalogCtx, LaunchContext, RuntimeBackend};
+use crate::runtime::{
+    CatalogCtx, Deletion, LaunchContext, RuntimeBackend, canonical, file_bytes, link_target,
+};
 use crate::session::command::Command;
 use crate::session::record::{DownloadBlob, DownloadRecord};
 use crate::session::supervisor;
@@ -168,6 +170,15 @@ pub static SPECS: &[OptionSpec] = &[
         step: 0.05,
         description: "Penalty applied to repeated tokens \
                       (1.0 = disabled; 'default' = llama.cpp's 1.0).",
+    },
+    OptionSpec {
+        key: "presence-penalty",
+        cli: "--presence-penalty",
+        kind: Float { min: Some(-2.0), max: Some(2.0) },
+        default: "0.0",
+        step: 0.05,
+        description: "Repeat alpha presence penalty: a flat penalty on tokens that already \
+                      appeared (0.0 = disabled; 'default' = llama.cpp's 0.0).",
     },
     OptionSpec {
         key: "threads",
@@ -348,9 +359,8 @@ fn omit_token(key: &str) -> Option<&'static str> {
         "batch-size" | "device" | "gpu-layers" | "threads" | "cache-type-k" | "cache-type-v"
         | "spec-draft-n-max" | "spec-draft-n-min" | "reasoning-effort" | "chat-template"
         | "ctx-size" | "temperature" | "top-p" | "top-k" | "min-p" | "repeat-penalty"
-        | "split-mode" | "tensor-split" | "parallel" | "sleep-idle-seconds" | "load-mode" => {
-            Some(DEFAULT)
-        }
+        | "presence-penalty" | "split-mode" | "tensor-split" | "parallel"
+        | "sleep-idle-seconds" | "load-mode" => Some(DEFAULT),
         // host/port are never omitted: llmctl itself needs the concrete
         // endpoint for health checks and the Session Manager display.
         _ => None,
@@ -481,6 +491,17 @@ impl RuntimeBackend for LlamaCppBackend {
         crate::discovery::reconcile(ctx.models_dir, &mut models);
         models.extend(crate::discovery::online::load_cached(ctx.models_dir));
         models
+    }
+
+    /// A GGUF lives in one of two places: a scanned model directory, where it
+    /// is the file the user put there, or the Hugging Face cache, where it is a
+    /// set of hash-named blobs. Both are removable; only the second needs the
+    /// cache layout unpicked for it.
+    fn deletion(&self, model: &Model, catalog: &[Model]) -> Option<Deletion> {
+        match model.remote {
+            Some(_) => crate::discovery::online::deletion(model, catalog),
+            None => local_deletion(model, catalog),
+        }
     }
 
     /// `ctx-size` gains an upper bound equal to the model's trained context
@@ -745,6 +766,91 @@ impl RuntimeBackend for LlamaCppBackend {
     }
 }
 
+/// A GGUF scanned from a configured model directory: its shards, plus the
+/// sidecars no other scanned model is using.
+///
+/// The catalog leaf under `~/.config/llmctl/models/` is left standing apart
+/// from its now-dangling `model.gguf` link — the per-model profiles in it
+/// should survive putting the same GGUF back.
+fn local_deletion(model: &Model, catalog: &[Model]) -> Option<Deletion> {
+    if model.path.as_os_str().is_empty() {
+        return None;
+    }
+    // Paths held by any *other* model. The Hugging Face cache is one of the
+    // directories llmctl scans, so the same GGUF can also be in the catalog as
+    // an online artifact; that twin is the same file under another name, not
+    // another model laying claim to it.
+    let identity = canonical(&model.path);
+    let claimed: Vec<PathBuf> = catalog
+        .iter()
+        .filter(|other| {
+            !other.path.as_os_str().is_empty()
+                && other.id != model.id
+                && canonical(&other.path) != identity
+        })
+        .flat_map(occupied_paths)
+        .collect();
+
+    let mut plan = Deletion::default();
+    for path in occupied_paths(model) {
+        if std::fs::symlink_metadata(&path).is_err() || plan.files.contains(&path) {
+            continue;
+        }
+        if claimed.contains(&path) {
+            continue;
+        }
+        plan.bytes += file_bytes(&path);
+        plan.files.push(path);
+    }
+    if plan.is_empty() {
+        return None;
+    }
+
+    // A GGUF scanned out of the Hugging Face cache leaves that cache's
+    // directories behind; clear the ones this model emptied.
+    if let Some(repo_dir) = crate::discovery::online::hub_repo_dir(&identity) {
+        plan.prune = vec![repo_dir.join("blobs"), repo_dir.join("snapshots")];
+        plan.husk = Some(crate::runtime::Husk { empty_first: plan.prune.clone(), dir: repo_dir });
+        if let Some(snapshot) = model.path.parent() {
+            plan.prune.insert(0, snapshot.to_path_buf());
+        }
+    }
+
+    let leaf_link = model.catalog_dir.join("model.gguf");
+    if std::fs::symlink_metadata(&leaf_link).is_ok_and(|meta| meta.is_symlink()) {
+        plan.files.push(leaf_link);
+    }
+    Some(plan)
+}
+
+/// Every file a model occupies: its shards and companions, plus — for each one
+/// that is a symlink — the file the link points at.
+///
+/// Following the link is the difference between reclaiming a model and
+/// reclaiming nothing. In the Hugging Face cache a GGUF *is* a link into
+/// `blobs/`, so the bytes are all in the target and unlinking the name alone
+/// frees zero.
+fn occupied_paths(model: &Model) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = if model.shard_paths.is_empty() {
+        vec![model.path.clone()]
+    } else {
+        model.shard_paths.clone()
+    };
+    paths.extend(
+        [&model.mtp_path, &model.dflash_path, &model.projector_path].into_iter().flatten().cloned(),
+    );
+    // Normalized, because the same blob is reached through an absolute link
+    // from one entry and a `../../blobs/…` one from another, and these paths
+    // are compared to decide what is shared.
+    for target in paths.clone().iter().filter_map(|path| link_target(path)) {
+        let target = canonical(&target);
+        if !paths.contains(&target) {
+            paths.push(target);
+        }
+    }
+    paths
+}
+
 /// A speculative-decoding type that needs a companion draft GGUF, and which
 /// companion that is. llama.cpp loads either through the same
 /// `--spec-draft-model` slot, so at most one can be selected at a time.
@@ -954,6 +1060,99 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_local_gguf_keeps_a_drafter_another_quantization_shares() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("llmctl-local-delete-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let drafter = dir.join("dflash-model.gguf");
+        std::fs::write(&drafter, vec![0_u8; 4]).unwrap();
+
+        let quant = |name: &str, size: usize| {
+            let path = dir.join(name);
+            std::fs::write(&path, vec![0_u8; size]).unwrap();
+            Model {
+                id: format!("models:{name}"),
+                name: name.into(),
+                path: path.clone(),
+                shard_paths: vec![path],
+                dflash_path: Some(drafter.clone()),
+                ..test_model()
+            }
+        };
+        let q4 = quant("model-Q4.gguf", 10);
+        let q8 = quant("model-Q8.gguf", 20);
+
+        // Both quantizations are on disk, so the drafter they share stays.
+        let plan = local_deletion(&q4, &[q4.clone(), q8.clone()]).expect("a local plan");
+        assert_eq!(plan.files, vec![q4.path.clone()]);
+        assert_eq!(plan.bytes, 10);
+        assert!(!plan.files.contains(&drafter), "a drafter in use is not planned for removal");
+        plan.execute().unwrap();
+        assert!(drafter.is_file());
+
+        // With the last quantization gone, so is the drafter.
+        let plan = local_deletion(&q8, std::slice::from_ref(&q8)).expect("a local plan");
+        assert_eq!(plan.bytes, 24);
+        plan.execute().unwrap();
+        assert!(!drafter.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Regression: the Hugging Face cache is one of the directories llmctl
+    /// scans, and a GGUF in it is a symlink into `blobs/`. Deleting the link
+    /// alone unlinked a name and freed nothing.
+    #[test]
+    fn deleting_a_gguf_scanned_out_of_the_hub_cache_takes_the_blob_behind_it() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let hub = std::env::temp_dir().join(format!("llmctl-scanned-hub-{nonce}"));
+        let repo = hub.join("models--owner--repo");
+        let snapshot = repo.join("snapshots/abc");
+        std::fs::create_dir_all(repo.join("blobs")).unwrap();
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(repo.join("refs"), b"").unwrap();
+        let blob = repo.join("blobs").join("aa".repeat(32));
+        std::fs::write(&blob, vec![0_u8; 4096]).unwrap();
+        // Both link styles occur in a real cache: llmctl writes absolute
+        // targets, `huggingface_hub` relative ones.
+        let link = snapshot.join("model-Q4.gguf");
+        std::os::unix::fs::symlink(PathBuf::from("../../blobs").join("aa".repeat(32)), &link)
+            .unwrap();
+
+        let scanned = Model {
+            id: "models:scanned".into(),
+            name: "model-Q4.gguf".into(),
+            path: link.clone(),
+            shard_paths: vec![link.clone()],
+            ..test_model()
+        };
+        // The same file also reachable through the online catalog: a twin, not
+        // a second model with a claim on the blob.
+        let twin = Model { id: "hf:owner/repo/model-Q4.gguf".into(), ..scanned.clone() };
+
+        let plan = local_deletion(&scanned, &[scanned.clone(), twin]).expect("a local plan");
+        assert_eq!(plan.bytes, 4096, "the blob is where the bytes are");
+        // The twin is the same file under another catalog name, not a second
+        // model with a claim on the blob.
+        assert!(plan.files.contains(&link) && plan.files.contains(&blob));
+
+        plan.execute().unwrap();
+        assert!(!blob.exists(), "the blob must go");
+        assert!(!repo.exists(), "an emptied repository cache is a husk");
+        let _ = std::fs::remove_dir_all(hub);
+    }
+
+    #[test]
+    fn a_model_whose_file_is_gone_has_nothing_to_delete() {
+        assert!(local_deletion(&test_model(), &[test_model()]).is_none());
+    }
+
+    #[test]
     fn int_range_is_enforced() {
         let kind = SCHEMA.spec("gpu-layers").unwrap().kind;
         assert_eq!(kind.validate("50").unwrap(), "50");
@@ -985,7 +1184,15 @@ mod tests {
         assert_eq!(SCHEMA.omit_token("batch-size"), Some(DEFAULT));
         assert_eq!(SCHEMA.omit_token("threads"), Some(DEFAULT));
         // The sampling params and ctx-size are omittable too.
-        for key in ["ctx-size", "temperature", "top-p", "top-k", "min-p", "repeat-penalty"] {
+        for key in [
+            "ctx-size",
+            "temperature",
+            "top-p",
+            "top-k",
+            "min-p",
+            "repeat-penalty",
+            "presence-penalty",
+        ] {
             assert_eq!(SCHEMA.omit_token(key), Some(DEFAULT), "{key} should fold the sentinel");
             assert!(SCHEMA.uses_sentinel(key), "{key} should get sentinel affordances");
         }

@@ -55,6 +55,10 @@ and watch them from a built-in session manager.
   bench` benchmarking. Downloads are llmctl's own, so they resume. The XDNA
   driver grants a single hardware context, so llmctl runs one FastFlowLM model
   at a time and says which session holds the device.
+- **Storage you can take back** — `D` removes a model's files from disk, asking
+  once and quoting what it frees. It identifies the hash-named blobs behind a
+  Hugging Face artifact, keeps companions another quantization still needs, and
+  keeps your profiles.
 - **Detached sessions** — `s` launches a server in its own process group
   (`setsid`), with stdout/stderr redirected to a per-session log file and
   automatic port-conflict resolution. Sessions are rediscovered across restarts.
@@ -125,6 +129,7 @@ overlay.
 | `/` | Search recursively in the current catalog directory |
 | `s` | Sort online models: Trending / Most likes / Most downloads |
 | `d` | Download the selected online GGUF file |
+| `D` | Delete the selected model from disk (asks first) |
 | **Profiles** | |
 | `a` | Create profile |
 | `r` | Rename (custom profiles only) |
@@ -159,7 +164,7 @@ llama.cpp, then FastFlowLM.
 A curated set of `llama-server` flags, including context size,
 GPU layers, device selection (`--device`, with a selector populated by
 `llama-server --list-devices`), sampling (`temperature`, `top-p`, `top-k`,
-`min-p`, `repeat-penalty`),
+`min-p`, `repeat-penalty`, `presence-penalty`),
 threads, batch size, flash attention, reasoning, KV cache types (`--cache-type-k`
 / `--cache-type-v`), load mode (`-lm`, replacing the deprecated `--no-mmap` —
 `none` is the ROCm/AMD-friendly setting), multi-GPU placement
@@ -234,6 +239,26 @@ The generated file explicitly lists the standard locations so they are easy to
 inspect and extend. Older `[models].paths` arrays remain supported, but named
 `[[models.sources]]` entries provide stable catalog names and layout control.
 Your `$HOME` is never scanned wholesale.
+
+### Removing a model
+
+`D` on a model in the browser removes its files from local storage — the
+mirror image of `d`. It asks first, quoting the model and the space it frees:
+`Remove Muse-Glimmer-30B-UD-Q4_K_XL.gguf (15.1 GB) from disk?`. `y` or Enter
+goes ahead, any other key cancels.
+
+This matters most for the Hugging Face cache, where a model is a set of
+hash-named blobs that cannot be identified by eye: `D` maps the artifact you
+selected in the browser onto the exact blobs, snapshot links, and — once the
+repository holds nothing else — the whole `models--org--repo` directory. It
+works the same way on scanned GGUFs and on FastFlowLM's model directories —
+including a GGUF llmctl found by *scanning* the Hub cache, where the file is a
+symlink and the bytes are in the blob behind it.
+
+A projector or dFlash drafter shared with another quantization you still have
+is kept, and the quoted size excludes it. Profiles for the model are kept too,
+so re-downloading it restores your settings. A model with a live session, or one
+currently downloading, is refused until you stop it.
 
 ### Online models
 

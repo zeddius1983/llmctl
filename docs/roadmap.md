@@ -252,7 +252,16 @@ noted here because the failure looks like one.
 
 ## In progress
 
-Nothing in flight — v0.4.1 is tagged and the next batch has not started.
+### Model storage management
+- [x] `D` in the Model pane removes the selected model from disk, behind a
+      one-line confirmation quoting the model and the space freed (ADR-015).
+      Covers scanned GGUFs, the Hugging Face blob cache (where the hash-named
+      files are otherwise unreadable, and a scanned GGUF is a symlink whose
+      bytes live in the blob behind it), and FastFlowLM model directories.
+      Companions shared with another stored quantization survive; profiles are
+      kept.
+- [x] `presence-penalty` (`--presence-penalty`) added to the llama.cpp option
+      table, omitted at the `default` sentinel like the other sampling params.
 
 ## Next (post-v0.3.1)
 
@@ -276,7 +285,8 @@ Nothing in flight — v0.4.1 is tagged and the next batch has not started.
 ### FastFlowLM follow-ups
 - [ ] `DownloadRecord::Directory` variant, replacing the sentinel `complete_file`
       used to track `flm serve`'s own native downloads (ADR-013)
-- [ ] `flm remove` for installed models (the CLI supports it; no llmctl binding yet)
+- [x] Removing an installed model — done by llmctl rather than by `flm remove`,
+      for the same reason it downloads them itself (ADR-013, ADR-015)
 - [ ] Surface `think` / `think_toggleable` from the catalog as a profile option
 - [x] `flm bench` — it was a hidden subcommand of v0.9.45 all along, not a
       missing one; `b` now benchmarks the selected FastFlowLM model (ADR-012)

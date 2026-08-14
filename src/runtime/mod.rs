@@ -12,7 +12,10 @@
 pub mod flm;
 pub mod llama_cpp;
 
-use std::path::Path;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
 
 use crate::config::{Config, Paths};
 use crate::discovery::ModelSource;
@@ -58,6 +61,129 @@ pub struct LaunchContext<'a> {
     pub options: &'a [OptionItem],
 }
 
+/// A directory that is worth nothing once the directories it depends on are
+/// empty, and can then be removed whole.
+///
+/// This exists for the Hugging Face cache: removing the last artifact of a
+/// repository empties `blobs/` and `snapshots/` but leaves a `refs/main`
+/// pointer naming a revision whose files are gone. Pruning empty directories
+/// alone would never clear it, and only the runtime knows the combination is a
+/// husk rather than someone else's data.
+pub struct Husk {
+    /// The directory to remove recursively.
+    pub dir: PathBuf,
+    /// Removal happens only if each of these is absent or empty.
+    pub empty_first: Vec<PathBuf>,
+}
+
+/// What removing a model from local storage would delete, computed before
+/// anything is unlinked.
+///
+/// Nothing is unlinked until the user agrees to the plan, and then it is this
+/// plan that runs rather than a fresh one — so what happens is what was
+/// confirmed. `bytes` is the net figure the prompt quotes: files held back for
+/// another model are excluded, because they are not what the user gets back.
+#[derive(Default)]
+pub struct Deletion {
+    /// Files and symlinks to unlink.
+    pub files: Vec<PathBuf>,
+    /// Directory trees to remove wholesale (a FastFlowLM model directory).
+    pub trees: Vec<PathBuf>,
+    /// Directories to remove afterwards, deepest first, and only if unlinking
+    /// left them empty. Never recursive: anything still in them is not ours.
+    pub prune: Vec<PathBuf>,
+    /// A directory that becomes meaningless once the deletion lands.
+    pub husk: Option<Husk>,
+    /// Bytes the deletion frees. Excludes anything left behind for another
+    /// model, so it is what the user actually gets back.
+    pub bytes: u64,
+}
+
+impl Deletion {
+    /// Whether this plan would remove nothing, i.e. the model is not stored.
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.trees.is_empty()
+    }
+
+    /// Unlink everything, then clear the directories that emptied out.
+    ///
+    /// An already-missing path is not an error: the plan is a snapshot, and
+    /// something else having removed a file first is the outcome asked for.
+    pub fn execute(&self) -> Result<()> {
+        for path in &self.files {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err).with_context(|| format!("removing {}", path.display()));
+                }
+            }
+        }
+        for tree in &self.trees {
+            match std::fs::remove_dir_all(tree) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err).with_context(|| format!("removing {}", tree.display()));
+                }
+            }
+        }
+        // Best-effort tidying: `remove_dir` fails on a non-empty directory,
+        // which is exactly the "leave what is not ours" rule.
+        for dir in &self.prune {
+            let _ = std::fs::remove_dir(dir);
+        }
+        if let Some(husk) = &self.husk
+            && husk.empty_first.iter().all(|dir| is_empty_dir(dir))
+        {
+            let _ = std::fs::remove_dir_all(&husk.dir);
+        }
+        Ok(())
+    }
+}
+
+/// Whether `dir` is absent or holds no entries.
+fn is_empty_dir(dir: &Path) -> bool {
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(err) => err.kind() == ErrorKind::NotFound,
+    }
+}
+
+/// Size on disk of one path, without following symlinks: a Hugging Face
+/// snapshot link costs nothing, and the blob it points at is counted once in
+/// its own right.
+pub(crate) fn file_bytes(path: &Path) -> u64 {
+    std::fs::symlink_metadata(path)
+        .map(|meta| if meta.is_symlink() { 0 } else { meta.len() })
+        .unwrap_or(0)
+}
+
+/// What a symlink points at, resolved against the link's own directory:
+/// `huggingface_hub` writes relative links, llmctl absolute ones, and the same
+/// Hub cache holds both. `None` for anything that is not a symlink.
+pub(crate) fn link_target(link: &Path) -> Option<PathBuf> {
+    let target = std::fs::read_link(link).ok()?;
+    if target.is_absolute() { Some(target) } else { Some(link.parent()?.join(target)) }
+}
+
+/// A path with every symlink resolved, or the path itself if it cannot be.
+/// Used as file identity: two catalog entries that resolve here are one model.
+pub(crate) fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Total size of every regular file under `dir`.
+pub(crate) fn tree_bytes(dir: &Path) -> u64 {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|meta| meta.len())
+        .sum()
+}
+
 /// One inference runtime: discovery result plus its dialect and behavior.
 pub trait RuntimeBackend: Send + Sync {
     /// Identity and probe result, rendered in the Runtime column.
@@ -74,6 +200,18 @@ pub trait RuntimeBackend: Send + Sync {
     /// the FastFlowLM label groups), in which case `profile_key` keeps them one
     /// logical model.
     fn models(&self, ctx: &CatalogCtx) -> Vec<Model>;
+
+    /// The on-disk footprint of `model`, so the user can reclaim it. `None`
+    /// when this runtime stores nothing for the model — it was never
+    /// downloaded, or the runtime has no notion of local storage at all.
+    ///
+    /// `catalog` is this runtime's full model list. A companion file shared
+    /// with another stored model — the projector or dFlash drafter paired with
+    /// every quantization of a repository — has to survive the deletion, and
+    /// nothing but the catalog can say whether it is still spoken for.
+    fn deletion(&self, _model: &Model, _catalog: &[Model]) -> Option<Deletion> {
+        None
+    }
 
     /// A spec's kind specialized for a model — used to bound context length by
     /// what the model was trained for. Most options are model-independent.

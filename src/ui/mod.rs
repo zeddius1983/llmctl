@@ -20,7 +20,8 @@ use ratatui::widgets::{
 };
 
 use crate::app::{
-    App, Message, ModelDownload, ModelDownloadStatus, ModelSearch, Pane, Prompt, Screen, Selector,
+    App, Confirm, Message, ModelDownload, ModelDownloadStatus, ModelSearch, Pane, Prompt, Screen,
+    Selector,
 };
 use crate::domain::human_size;
 use crate::session::{Session, SessionStatus, format_uptime};
@@ -74,6 +75,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Some(search) = &app.model_search {
         render_model_search(frame, frame.area(), app, search);
+    }
+    if let Some(confirm) = &app.confirm {
+        render_confirm(frame, frame.area(), confirm);
     }
     if let Some(message) = &app.message {
         render_message(frame, frame.area(), message);
@@ -346,6 +350,9 @@ fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
             }
             if app.download_available() {
                 keys.push(("d", "download"));
+            }
+            if app.delete_available() {
+                keys.push(("D", "delete"));
             }
             if app.benchmark_available() {
                 keys.push(("b", "benchmark"));
@@ -747,6 +754,32 @@ fn render_message(frame: &mut Frame, area: Rect, message: &Message) {
     frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), popup);
 }
 
+/// A destructive action's confirmation. Red-bordered rather than accented, and
+/// the footer names the two answers explicitly: this is the one dialog where
+/// dismissing by reflex must not be the same as agreeing.
+fn render_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm) {
+    let mut lines: Vec<Line> = confirm.lines.iter().map(|line| Line::raw(line.clone())).collect();
+    lines.push(Line::raw(""));
+    lines.push(Line::from("y / Enter delete · any other key cancel".dim().italic()));
+
+    let longest = confirm.lines.iter().map(|line| line.chars().count()).max().unwrap_or(40);
+    // Never wider than the terminal: a long model name wraps instead.
+    let width = (longest as u16 + 4).clamp(44, area.width.saturating_sub(4).max(24));
+    let inner = width.saturating_sub(4).max(1) as usize;
+    let wrapped: usize =
+        confirm.lines.iter().map(|line| line.chars().count().div_ceil(inner) - 1).sum();
+    let height = ((lines.len() + wrapped) as u16 + 2).min(area.height);
+    let popup = center(area, Constraint::Length(width), Constraint::Length(height));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Red))
+        .title(format!(" {} ", confirm.title));
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), popup);
+}
+
 fn render_help(frame: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from("llmctl — keybindings".bold().fg(ACCENT)),
@@ -759,6 +792,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         help_row("/", "search models"),
         help_row("s", "sort online models / switch catalog grouping"),
         help_row("d", "download the selected model"),
+        help_row("D", "delete the selected model from disk"),
         Line::raw(""),
         Line::from("Profiles".bold()),
         help_row("a", "create profile"),
@@ -967,8 +1001,36 @@ fn center(area: Rect, horizontal: Constraint, vertical: Constraint) -> Rect {
 mod tests {
     use super::{
         ICON_CLOUD, ICON_DIRECTORY, compact_count, download_progress, model_artifact_columns,
-        model_icon, truncate_download_name,
+        model_icon, render_confirm, truncate_download_name,
     };
+    use crate::app::Confirm;
+
+    /// Regression: the confirmation sized itself to its content and ran off
+    /// the side of the terminal.
+    #[test]
+    fn a_delete_confirmation_stays_inside_the_terminal() {
+        let confirm = Confirm::preview(
+            "Delete model",
+            vec!["Remove Muse-Glimmer-30B-UD-Q4_K_XL.gguf (15.1 GB) from disk?".into()],
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|frame| render_confirm(frame, frame.area(), &confirm)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        // Narrower than the question, so it wraps rather than overflowing, and
+        // both halves are on screen.
+        assert!(rows.iter().any(|row| row.contains("Remove Muse-Glimmer-30B-UD")));
+        assert!(rows.iter().any(|row| row.contains("disk?")), "the wrapped tail stays on screen");
+        assert!(rows.iter().any(|row| row.contains("y / Enter delete")));
+    }
 
     #[test]
     fn counts_use_compact_repository_badges() {

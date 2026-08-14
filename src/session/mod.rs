@@ -292,6 +292,14 @@ impl SessionManager {
         self.sessions.iter().find(|s| !s.status.is_terminal() && s.record.runtime == runtime)
     }
 
+    /// A live session of `runtime` currently serving `model`, if any. Used to
+    /// refuse deleting the files a running server has open.
+    pub fn active_for_model(&self, runtime: &str, model: &str) -> Option<&Session> {
+        self.sessions.iter().find(|s| {
+            !s.status.is_terminal() && s.record.runtime == runtime && s.record.model == model
+        })
+    }
+
     /// The live pid that actually backs a session, re-acquiring the real server
     /// if a launcher wrapper re-exec'd or daemonized it under a different pid
     /// (and possibly its own session). Persists the record when the pid changes.

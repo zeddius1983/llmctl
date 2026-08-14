@@ -599,3 +599,74 @@ than a guessed one; that is deliberate, and a per-model companion selector
 `Drafter` enum is the single place that maps a `spec-type` value to the
 companion it needs, so `draft-eagle3`/`draft-dspark` can be paired later without
 touching the command builder.
+
+---
+
+## ADR-015: Deleting a model is a planned, confirmed, share-aware unlink
+
+**Status:** Accepted — implemented (`D` in the Model pane)
+
+**Context:** llmctl could put models on disk and never take them off. That is
+worst for the Hugging Face cache, which is the storage llmctl fills fastest and
+the one a user cannot manage by hand: `models--org--repo/blobs/` holds files
+named by content hash, so "which of these is the quantization I stopped using"
+is not a question the filesystem can answer. `huggingface-cli delete-cache`
+exists but works on revisions, not on the artifact the browser selected, and
+knows nothing about llmctl's own scanned model directories or `flm`'s.
+
+**Decision:** `RuntimeBackend::deletion` returns a `Deletion` — a plan holding
+the exact paths and the bytes they occupy — which the app confirms before
+anything is unlinked. `y`/Enter proceeds; every other key cancels, unlike the
+message overlay that any key dismisses. What executes is the plan the user
+agreed to, not a recomputation.
+
+The prompt is one line — `Remove <model> (<size>) from disk?`. The plan's paths
+are llmctl's bookkeeping, not the user's decision: the size is what they weigh,
+and a wall of Hub cache paths in a modal is noise that also does not fit. The
+size is the *net* figure, excluding anything held back for another model, so it
+is what actually comes back.
+
+Three storage shapes sit behind the one trait method:
+
+- **Scanned GGUFs** — the shards, plus the sidecars no other scanned model
+  points at, each followed through any symlink. This is not a nicety: the Hub
+  cache is one of the directories llmctl scans, and a GGUF in it *is* a link
+  into `blobs/`, so unlinking the name alone frees nothing. The same cache
+  holds absolute links (llmctl's) and relative ones (`huggingface_hub`'s), so
+  targets are canonicalized before being compared — otherwise two spellings of
+  one blob read as two files and the sharing rule misfires.
+- **The Hugging Face cache** — the blobs behind the artifact, their snapshot
+  links, and the repository directory once nothing else in it is cached. Blobs
+  are found both by the oid llmctl recorded and by resolving the snapshot link,
+  so a cache written by `huggingface_hub` is handled as well as llmctl's own.
+- **FastFlowLM** — the model directory `flm` gives each model, removed whole.
+
+Two rules make the plan safe. **Shared companions survive:** a projector or
+dFlash drafter is paired with every quantization of its repository, so it is
+deleted only with the last one that uses it.
+**Directories are pruned, not razed:** `remove_dir` on an empty directory leaves
+anything llmctl did not put there. The one exception is the `Husk` — a Hub
+repository directory whose `blobs/` and `snapshots/` are empty, where the
+surviving `refs/main` names a revision that no longer exists.
+
+Model **profiles are kept**. They are cheap YAML, and re-downloading a model the
+user had tuned should not cost them the tuning.
+
+A live session serving the model, or an in-flight download of it, blocks the
+deletion with a message rather than pulling files out from under a running
+server.
+
+A model reachable both by scanning and through the online catalog is one file
+under two catalog names, not two models: entries whose paths canonicalize to the
+same file are excluded from the share check, or a model would always look
+spoken-for by its own twin and nothing would ever be freed.
+
+**Consequences:** Removing a model is `D`, symmetric with `d` to download it,
+and reports what it freed. A runtime that adds local storage implements one
+method. The share-detection reads the catalog, so a companion whose only other
+user is a model outside the current catalog view would still be removed — the
+catalog is the whole runtime's model list, not the visible subtree, which makes
+that narrow to the case of two configured source directories holding the same
+sidecar path. `flm remove` stays unused: llmctl downloads FastFlowLM models
+itself (ADR-013), so it removes them itself too, and the plan is visible in the
+same way as every other runtime's.

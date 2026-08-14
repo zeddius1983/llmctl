@@ -20,7 +20,7 @@ use crate::discovery;
 use crate::discovery::ModelSource;
 use crate::domain::{Model, OptionItem, Profile, format_unix_date, human_size};
 use crate::profiles::{self, ProfileStore};
-use crate::runtime::{CatalogCtx, LaunchContext, RuntimeBackend};
+use crate::runtime::{CatalogCtx, Deletion, LaunchContext, RuntimeBackend};
 use crate::session::{self, LaunchRequest, SessionManager};
 use crate::ui;
 
@@ -46,6 +46,35 @@ pub struct Prompt {
 pub struct Message {
     pub title: String,
     pub lines: Vec<String>,
+}
+
+/// A destructive action held back until the user says yes.
+///
+/// Unlike [`Message`], which any key dismisses, this one distinguishes assent
+/// from everything else: `y`/Enter goes through, any other key walks away.
+pub struct Confirm {
+    pub title: String,
+    pub lines: Vec<String>,
+    action: ConfirmAction,
+}
+
+impl Confirm {
+    /// A confirmation carrying an empty plan, for rendering tests: the layout
+    /// is about the lines, and agreeing to it would delete nothing.
+    #[cfg(test)]
+    pub fn preview(title: &str, lines: Vec<String>) -> Self {
+        Self {
+            title: title.into(),
+            lines,
+            action: ConfirmAction::DeleteModel { model: String::new(), plan: Deletion::default() },
+        }
+    }
+}
+
+enum ConfirmAction {
+    /// Remove a model's files from local storage. Carries the plan computed
+    /// when the prompt opened, so what is deleted is exactly what was shown.
+    DeleteModel { model: String, plan: Deletion },
 }
 
 /// Enums with more variants than this open a [`Selector`] popup on `e`/Enter
@@ -310,6 +339,8 @@ pub struct App {
     pub model_search: Option<ModelSearch>,
     /// A read-only modal message overlay, if any.
     pub message: Option<Message>,
+    /// A destructive action waiting on a yes/no answer, if any.
+    pub confirm: Option<Confirm>,
     /// Which top-level screen is active.
     pub screen: Screen,
     /// Running/known inference sessions.
@@ -410,6 +441,7 @@ impl App {
             selector: None,
             model_search: None,
             message: None,
+            confirm: None,
             screen: Screen::Browser,
             sessions,
             session_sel: ListState::default(),
@@ -861,6 +893,20 @@ impl App {
             self.message = None;
             return;
         }
+        // A pending destructive action takes assent or nothing: `y`/Enter goes
+        // ahead, every other key backs out. Deliberately not "any key
+        // dismisses" like a message — that would make a stray keystroke an
+        // answer.
+        if self.confirm.is_some() {
+            if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter)
+                && let Some(confirm) = self.confirm.take()
+            {
+                self.run_confirmed(confirm.action);
+            } else {
+                self.confirm = None;
+            }
+            return;
+        }
         // A text prompt is modal: it consumes all input until closed.
         if self.prompt.is_some() {
             self.prompt_key(key);
@@ -961,6 +1007,9 @@ impl App {
             // selected option to its resolved default instead.
             KeyCode::Char('a') => self.prompt_new_profile(),
             KeyCode::Char('r') => self.prompt_rename_profile(),
+            // In the Model pane the pair is symmetric: `d` fetches the model,
+            // `D` gives the disk space back. Elsewhere `D` duplicates a profile.
+            KeyCode::Char('D') if self.focus == Pane::Model => self.prompt_delete_model(),
             KeyCode::Char('D') => self.prompt_duplicate_profile(),
             KeyCode::Char('d') if self.focus == Pane::Model && self.download_available() => {
                 self.download_selected_model()
@@ -2309,6 +2358,127 @@ impl App {
             })
     }
 
+    /// Whether `D` can remove the selection from local storage.
+    ///
+    /// Deliberately the cheap test — a stored model is one with a local path,
+    /// true of a scanned GGUF, a cached Hub artifact, and an installed
+    /// FastFlowLM tag alike. The footer asks this on every 250 ms redraw, so
+    /// the plan itself (which stats every blob) waits until `D` is pressed.
+    pub fn delete_available(&self) -> bool {
+        self.focus == Pane::Model
+            && self.selected_model().is_some_and(|model| !model.path.as_os_str().is_empty())
+    }
+
+    /// What deleting the selected model would remove, or `None` if the runtime
+    /// stores nothing for it.
+    fn deletion_plan(&self) -> Option<Deletion> {
+        let model = self.selected_model()?;
+        let backend = self.runtimes.selected()?;
+        backend.deletion(model, self.catalog_source()).filter(|plan| !plan.is_empty())
+    }
+
+    /// Ask before removing the selected model's files. The plan is computed
+    /// here and carried into the confirmation, so what the user agreed to is
+    /// exactly what gets unlinked.
+    fn prompt_delete_model(&mut self) {
+        let Some(model) = self.selected_model().cloned() else { return };
+        if let Some(blocker) = self.deletion_blocker(&model) {
+            self.message = Some(Message { title: "Cannot delete".into(), lines: vec![blocker] });
+            return;
+        }
+        let Some(plan) = self.deletion_plan() else {
+            self.message = Some(Message {
+                title: "Nothing to delete".into(),
+                lines: vec![format!("{} is not stored locally.", model.name)],
+            });
+            return;
+        };
+
+        // One line: the model, and what removing it buys back. The paths are
+        // llmctl's business, and the size is the only part the user weighs.
+        let lines = vec![format!("Remove {} ({}) from disk?", model.name, human_size(plan.bytes))];
+        self.confirm = Some(Confirm {
+            title: "Delete model".into(),
+            lines,
+            action: ConfirmAction::DeleteModel { model: model.name.clone(), plan },
+        });
+    }
+
+    /// Why the selected model must not be deleted right now: something is using
+    /// the very files the deletion would pull out from under it.
+    fn deletion_blocker(&self, model: &Model) -> Option<String> {
+        let runtime = self.runtimes.selected()?.descriptor().name.clone();
+        if self.sessions.active_for_model(&runtime, &model.name).is_some() {
+            return Some(format!("{} is serving a live session; stop it first.", model.name));
+        }
+        if self.model_downloads.iter().any(|download| {
+            download.model_id == model.id
+                && matches!(
+                    download.status,
+                    ModelDownloadStatus::Downloading | ModelDownloadStatus::Cancelling
+                )
+        }) {
+            return Some(format!("{} is downloading; cancel it first.", model.name));
+        }
+        None
+    }
+
+    fn run_confirmed(&mut self, action: ConfirmAction) {
+        match action {
+            ConfirmAction::DeleteModel { model, plan } => self.delete_model(&model, plan),
+        }
+    }
+
+    fn delete_model(&mut self, model: &str, plan: Deletion) {
+        let freed = human_size(plan.bytes);
+        let result = plan.execute();
+        self.reload_catalog_in_place();
+        self.message = Some(match result {
+            Ok(()) => Message {
+                title: "Model removed".into(),
+                lines: vec![format!("{model} deleted from disk, freeing {freed}.")],
+            },
+            Err(error) => {
+                Message { title: "Delete failed".into(), lines: vec![format!("{error:#}")] }
+            }
+        });
+    }
+
+    /// Re-read the catalog after a deletion without moving the browser.
+    ///
+    /// `F5` would also work, but it resets to the catalog root and — in the
+    /// online view — re-queries the Hub, which is a lot of upheaval for "one
+    /// artifact is no longer on disk".
+    fn reload_catalog_in_place(&mut self) {
+        if self.runtimes.selected().is_some_and(|backend| backend.supports_online_browse()) {
+            self.scanned_models = discovery::scan_models(&self.model_sources, &self.model_cache);
+            discovery::reconcile(&self.models_dir, &mut self.scanned_models);
+            self.scanned_models.extend(discovery::online::load_cached(&self.models_dir));
+            self.store.sync_models(&self.scanned_models);
+        } else {
+            self.refresh_flm_models(true);
+        }
+
+        let prefixes: Vec<Vec<String>> =
+            self.catalog_history.iter().map(|(_, _, prefix)| prefix.clone()).collect();
+        let rebuilt: Vec<Vec<Model>> =
+            prefixes.iter().map(|prefix| self.catalog_children(prefix)).collect();
+        for (level, items) in self.catalog_history.iter_mut().zip(rebuilt) {
+            level.0 = items;
+        }
+
+        let selected = self.selected_model().map(|model| model.id.clone());
+        let cursor = self.models.state.selected().unwrap_or(0);
+        self.models.replace(self.catalog_children(&self.catalog_prefix.clone()));
+        let restored = selected
+            .and_then(|id| self.models.items.iter().position(|model| model.id == id))
+            .unwrap_or_else(|| cursor.min(self.models.items.len().saturating_sub(1)));
+        if !self.models.items.is_empty() {
+            self.models.state.select(Some(restored));
+        }
+        self.rebuild_below(Pane::Model);
+    }
+
     /// Whether the selected runtime ships a benchmark tool for this model.
     /// The model must be present locally: llama.cpp needs a GGUF to point
     /// `llama-bench` at, and `flm bench` on an un-pulled tag would turn a
@@ -3504,6 +3674,65 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         assert!(app.single_session_conflict(flm).is_none(), "guard stuck after the session ended");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Drives the real app: `D` on a local GGUF must ask first, must not touch
+    /// the file when the answer is anything but yes, and must remove it when it
+    /// is. Deleting is irreversible, so the "any stray key cancels" half of the
+    /// contract matters as much as the delete itself.
+    #[test]
+    #[ignore = "builds a SessionManager; run with --ignored --test-threads=1"]
+    fn deleting_a_model_asks_first_and_only_yes_removes_the_file() {
+        let stamp =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("llmctl-delete-{stamp}"));
+        let paths = Paths {
+            config_file: root.join("config.toml"),
+            models_dir: root.join("models"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+            sessions_dir: root.join("sessions"),
+        };
+        paths.ensure_dirs().unwrap();
+        let source = root.join("gguf");
+        std::fs::create_dir_all(&source).unwrap();
+        let gguf = source.join("test-model.gguf");
+        std::fs::write(&gguf, vec![0_u8; 2048]).unwrap();
+
+        let mut config = Config::default();
+        config.models.paths = vec![source.clone()];
+        let mut app = App::new(config, paths);
+        let llama = app
+            .runtimes
+            .items
+            .iter()
+            .position(|backend| backend.supports_online_browse())
+            .expect("llama.cpp backend");
+        app.runtimes.state.select(Some(llama));
+        app.rebuild_below(Pane::Runtime);
+        app.focus = Pane::Model;
+        // Walk down to the GGUF leaf, wherever the scan filed it.
+        while app.selected_model().is_none() && !app.models.is_empty() {
+            app.on_key(KeyEvent::from(KeyCode::Char('l')));
+        }
+        assert_eq!(app.selected_model().map(|m| m.name.clone()), Some("test-model.gguf".into()));
+        assert!(app.delete_available(), "a scanned GGUF is deletable");
+
+        // Asked, answered with a stray key: the file stays.
+        app.on_key(KeyEvent::from(KeyCode::Char('D')));
+        assert!(app.confirm.is_some(), "D must open a confirmation");
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        assert!(app.confirm.is_none());
+        assert!(gguf.is_file(), "a stray key must not delete anything");
+
+        // Asked, answered yes.
+        app.on_key(KeyEvent::from(KeyCode::Char('D')));
+        app.on_key(KeyEvent::from(KeyCode::Char('y')));
+        assert!(!gguf.exists(), "y must delete the file");
+        assert!(app.message.is_some(), "the outcome is reported");
 
         let _ = std::fs::remove_dir_all(&root);
     }

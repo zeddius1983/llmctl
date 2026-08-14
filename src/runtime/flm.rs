@@ -24,7 +24,7 @@ use crate::discovery::hf;
 use crate::domain::{FlmModel, Model, OptionItem, Runtime};
 use crate::profiles::registry::{OptionKind, OptionSchema, OptionSpec};
 use crate::profiles::templates::Template;
-use crate::runtime::{CatalogCtx, LaunchContext, RuntimeBackend};
+use crate::runtime::{CatalogCtx, Deletion, LaunchContext, RuntimeBackend, tree_bytes};
 use crate::session::command::Command;
 use crate::session::record::{DownloadBlob, DownloadRecord};
 use crate::session::supervisor;
@@ -338,6 +338,27 @@ impl RuntimeBackend for FlmBackend {
             }
         }
         models
+    }
+
+    /// `flm` gives each model a directory of its own under its model root, so
+    /// removing one is removing that directory — including any `.llmctl-part`
+    /// scratch a cancelled download left in it.
+    fn deletion(&self, model: &Model, catalog: &[Model]) -> Option<Deletion> {
+        let dir = model_dir(model)?;
+        if !dir.is_dir() {
+            return None;
+        }
+        // A directory is named after the repository, not the tag. Two installed
+        // tags resolving to one directory would make this a shared deletion;
+        // the catalog has no such pair today, but do not find out the hard way.
+        let tag = model.flm.as_ref().map(|flm| flm.tag.as_str());
+        if catalog.iter().any(|other| {
+            other.flm.as_ref().is_some_and(|flm| flm.installed && Some(flm.tag.as_str()) != tag)
+                && model_dir(other).as_ref() == Some(&dir)
+        }) {
+            return None;
+        }
+        Some(Deletion { bytes: tree_bytes(&dir), trees: vec![dir], ..Deletion::default() })
     }
 
     /// `ctx-len` is bounded by the model's trained context.
