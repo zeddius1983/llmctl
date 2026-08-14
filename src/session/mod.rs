@@ -279,7 +279,7 @@ impl SessionManager {
 
         let record = SessionRecord {
             id,
-            name: session_name(&req.model, &req.profile),
+            name: session_name(&req.model),
             runtime: req.runtime,
             model: req.model,
             model_path: req.model_path,
@@ -618,9 +618,10 @@ fn next_id() -> String {
 }
 
 /// Derive a session name like `qwen3-32b-q6_k-coding` from model + profile.
-fn session_name(model: &str, profile: &str) -> String {
-    let model = model.strip_suffix(".gguf").unwrap_or(model);
-    format!("{}-{}", slug(model), slug(profile))
+/// A session's display name: the model alone. The profile is a column of its
+/// own in the Session Manager, so folding it in here would say it twice.
+fn session_name(model: &str) -> String {
+    slug(model.strip_suffix(".gguf").unwrap_or(model))
 }
 
 /// Lowercase, replacing runs of non-alphanumeric characters with a single dash.
@@ -668,7 +669,8 @@ mod tests {
     fn slug_and_session_name() {
         assert_eq!(slug("Qwen3-32B-Q6_K"), "qwen3-32b-q6_k");
         assert_eq!(slug("Long Context"), "long-context");
-        assert_eq!(session_name("Gemma-27B-Q4_K_M.gguf", "Coding"), "gemma-27b-q4_k_m-coding");
+        // The profile is its own column and is deliberately not folded in.
+        assert_eq!(session_name("Gemma-27B-Q4_K_M.gguf"), "gemma-27b-q4_k_m");
     }
 
     #[test]

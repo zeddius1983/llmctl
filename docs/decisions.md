@@ -746,6 +746,13 @@ profile, port, size, backend, `tg`, `pp`, uptime — shedding the least useful
 first (size, backend, profile, `pp`, uptime) as the pane narrows, rather than
 right-to-left; the Detail pane always carries all of them.
 
+Within a row, no column is ever omitted: a session with no measurement yet shows
+`tg --.-- t/s` and `pp --- t/s`, and a record with no size or backend shows a
+dash. A cell that disappeared would shift every cell after it out of line with
+the rows above and below, which defeats having columns at all. The figures
+themselves are right-aligned in a fixed field so their digits stack. The model
+name no longer folds in the profile, which is now a column of its own.
+
 The size and compute backend shown per session are recorded at launch
 (`SessionRecord::size_bytes` and `device`), because neither can be recovered
 afterwards: the backend appears in no endpoint and, when `device` is left at

@@ -175,6 +175,10 @@ Columns are model, profile, port, size, compute backend, `tg`, `pp`, uptime. A
 narrow pane sheds the least useful first — size, then backend, then profile,
 then `pp` — so the list never wraps; the Detail pane always has all of them.
 
+Within a row nothing is ever omitted: a session that has served no requests
+shows `tg --.-- t/s` and `pp --- t/s`, so its columns still line up with those
+of a busy one.
+
 ### Launch options
 
 Each runtime exposes its own curated option set; the sections below cover

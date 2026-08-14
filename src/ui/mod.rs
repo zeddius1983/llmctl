@@ -548,6 +548,12 @@ const COL_SIZE: usize = 8; // "11.3 GB"
 const COL_DEVICE: usize = 6; // "Vulkan"
 const COL_RATE: usize = 12; // "tg 67.73 t/s"
 const COL_UPTIME: usize = 8; // "2h 34m"; four-digit hours push the row, not wrap it
+/// Width of the numeric field inside a rate cell, so `67.73` and `1425` line
+/// their digits up against each other.
+const RATE_FIGURE: usize = 5;
+/// Shown where a session has no value for a column — an older record with no
+/// size or backend, or a stopped session with no uptime.
+const MISSING: &str = "—";
 /// Gap between columns.
 const COL_GAP: usize = 2;
 /// Below this much room for the model name, a column is not worth its space.
@@ -579,23 +585,24 @@ enum Column {
 }
 
 impl Column {
-    /// This column's text for a session, or `None` when it has nothing to say.
-    fn cell(self, session: &Session) -> Option<String> {
-        let rate = |phase, label: &str| {
-            session.throughput.rate(phase).map(|rate| format!("{label} {} t/s", format_rate(rate)))
-        };
+    /// This column's text for a session.
+    ///
+    /// Always something: a column that vanished when a session had no figure
+    /// for it would shift every column after it out of line with the rows above
+    /// and below, which is the whole point of having columns.
+    fn cell(self, session: &Session) -> String {
         match self {
+            // Truncated rather than allowed to widen the column: a long profile
+            // name must not shift every row below it.
             Column::Profile => {
-                // Truncated rather than allowed to widen the column: a long
-                // profile name must not shift every row below it.
-                Some(format!("[{}]", truncate_right(&session.record.profile, COL_PROFILE - 2)))
+                format!("[{}]", truncate_right(&session.record.profile, COL_PROFILE - 2))
             }
-            Column::Port => Some(format!(":{}", session.record.port)),
-            Column::Size => session.record.size_bytes.map(human_size),
-            Column::Device => session.record.device.clone(),
-            Column::Decode => rate(Phase::Decode, "tg"),
-            Column::Prefill => rate(Phase::Prefill, "pp"),
-            Column::Uptime => session.uptime_secs().map(format_uptime),
+            Column::Port => format!(":{}", session.record.port),
+            Column::Size => session.record.size_bytes.map(human_size).unwrap_or(MISSING.into()),
+            Column::Device => session.record.device.clone().unwrap_or(MISSING.into()),
+            Column::Decode => rate_cell("tg", session, Phase::Decode),
+            Column::Prefill => rate_cell("pp", session, Phase::Prefill),
+            Column::Uptime => session.uptime_secs().map(format_uptime).unwrap_or(MISSING.into()),
         }
     }
 
@@ -611,15 +618,32 @@ impl Column {
     }
 
     /// Numbers read better right-aligned against the column that follows them.
+    /// The rate cells align internally instead, so they are left as they are.
     fn pad(self, text: &str) -> String {
         let width = self.width();
         match self {
-            Column::Size | Column::Uptime | Column::Decode | Column::Prefill => {
-                format!("{text:>width$}")
-            }
+            Column::Size | Column::Uptime => format!("{text:>width$}"),
+            Column::Decode | Column::Prefill => format!("{text:<width$}"),
             _ => format!("{text:<width$}"),
         }
     }
+}
+
+/// A `tg`/`pp` cell: label, the figure right-aligned in a fixed field so the
+/// digits line up down the pane, then the unit.
+///
+/// A session that has served nothing yet shows the shape of the number rather
+/// than a blank, so a fresh server sits in the same columns as a busy one.
+fn rate_cell(label: &str, session: &Session, phase: Phase) -> String {
+    let value = session.throughput.rate(phase).map(format_rate).unwrap_or_else(|| {
+        match phase {
+            // Decode is reported to two decimals and prefill whole, so their
+            // placeholders differ too — each is the shape of what will replace it.
+            Phase::Decode => "--.--".into(),
+            Phase::Prefill => "---".into(),
+        }
+    });
+    format!("{label} {value:>RATE_FIGURE$} t/s")
 }
 
 /// One session row: status, model, then the columns that fit.
@@ -636,12 +660,10 @@ fn session_row(session: &Session, width: usize) -> Line<'static> {
         Column::Uptime,
     ];
 
-    // Everything that has something to say, then drop by priority until the
-    // model name has room to be readable.
-    let mut cells: Vec<(Column, String)> = order
-        .iter()
-        .filter_map(|column| column.cell(session).map(|text| (*column, text)))
-        .collect();
+    // Every column, then drop by priority until the model name has room to be
+    // readable.
+    let mut cells: Vec<(Column, String)> =
+        order.iter().map(|column| (*column, column.cell(session))).collect();
     let cost = |cells: &[(Column, String)]| -> usize {
         cells.iter().map(|(column, _)| column.width() + COL_GAP).sum()
     };
@@ -1388,11 +1410,13 @@ mod tests {
     /// The point of the columns: they line up regardless of name length.
     #[test]
     fn session_columns_align_across_rows() {
-        // A 160-column terminal, where every column fits.
+        // A 160-column terminal, where every column fits. The last row has
+        // served nothing: a session without figures must still line up with one
+        // that has them, which is why no column is ever omitted.
         let width = 108;
-        let rows: Vec<String> = ["a", "gpt-oss-20b-q8_0", "qwen3-8-27b-q4_k_m-inquisitor"]
+        let rows: Vec<String> = [("a", true), ("gpt-oss-20b-q8_0", true), ("fresh", false)]
             .iter()
-            .map(|name| row_text(&probe_session(name, true), width))
+            .map(|(name, rates)| row_text(&probe_session(name, *rates), width))
             .collect();
 
         for row in &rows {
@@ -1400,9 +1424,9 @@ mod tests {
         }
         // Same starting column for every cell, whatever the name did. Counted
         // in characters, not bytes: the glyph and the ellipsis are multibyte.
-        for cell in
-            ["[inquisitor]", ":8001", "11.3 GB", "ROCm", "tg 67.73 t/s", "pp 1425 t/s", "2h 34m"]
-        {
+        // Anchored on the labels, since the last row's figures are placeholders
+        // — that they still start in the same column is exactly the point.
+        for cell in ["[inquisitor]", ":8001", "11.3 GB", "ROCm", "tg ", "pp ", "2h 34m"] {
             let columns: Vec<Option<usize>> = rows
                 .iter()
                 .map(|row| row.find(cell).map(|byte| row[..byte].chars().count()))
@@ -1457,12 +1481,25 @@ mod tests {
         assert!(!row_text(&session, 4).is_empty());
     }
 
-    /// A session that has served nothing has no rates to show, and those
-    /// columns simply are not there.
+    /// A session that has served nothing shows the shape of the figures rather
+    /// than nothing at all, so its row occupies the same columns as the others.
     #[test]
-    fn a_session_with_no_requests_shows_no_rates() {
+    fn a_session_with_no_requests_shows_placeholder_rates() {
         let row = row_text(&probe_session("fresh", false), 108);
-        assert!(row.contains(":8001"));
-        assert!(!row.contains("t/s"), "{row}");
+        assert!(row.contains("tg --.-- t/s"), "{row}");
+        assert!(row.contains("pp   --- t/s"), "{row}");
+    }
+
+    /// An older session record carries no size or backend; those cells hold a
+    /// dash rather than collapsing and dragging the row out of line.
+    #[test]
+    fn a_record_without_size_or_backend_keeps_its_columns() {
+        let mut session = probe_session("legacy", true);
+        session.record.size_bytes = None;
+        session.record.device = None;
+        let row = row_text(&session, 108);
+        let full = row_text(&probe_session("legacy", true), 108);
+        assert_eq!(row.chars().count(), full.chars().count(), "{row:?}");
+        assert_eq!(row.matches('—').count(), 2, "one dash for each missing cell: {row}");
     }
 }
