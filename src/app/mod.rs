@@ -1355,6 +1355,8 @@ impl App {
             runtime: backend.descriptor().name.clone(),
             model: model.name.clone(),
             model_path: backend.process_token(&ctx),
+            size_bytes: (model.size_bytes > 0).then_some(model.size_bytes),
+            device: backend.device_label(&options),
             command: backend.build_command(&ctx),
             health_path: backend.health_path().to_string(),
             download: backend.launch_download(&ctx),
@@ -3679,6 +3681,8 @@ mod tests {
             health_path: "/v1/models".into(),
             download: None,
             profile: "Default".into(),
+            size_bytes: None,
+            device: None,
             host: "127.0.0.1".into(),
             port: 52625,
         };

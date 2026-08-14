@@ -63,9 +63,10 @@ and watch them from a built-in session manager.
   (`setsid`), with stdout/stderr redirected to a per-session log file and
   automatic port-conflict resolution. Sessions are rediscovered across restarts.
 - **Session manager** (`t`) — aligned columns of live status (Downloading /
-  Starting / Running / Crashed), name, port, uptime, and throughput: `tg`
-  (token generation) and `pp` (prompt processing) in tokens per second,
-  averaged over the last 30 seconds. Plus PID and `/proc`-sampled CPU & memory;
+  Starting / Running / Crashed), model, profile, port, size, compute backend
+  (ROCm / Vulkan / CUDA / NPU), throughput (`tg` and `pp` in tokens per second,
+  as the server last reported them), and uptime. Plus PID and `/proc`-sampled
+  CPU & memory;
   a `/health` probe promotes Downloading → Starting → Running. Stop (`x`),
   kill (`K`), restart (`R`), copy endpoint (`c`), and tail logs (`L`).
 
@@ -162,17 +163,17 @@ its own log — nothing to enable, and it works for sessions llmctl rediscovered
 after a restart:
 
 ```
-● qwen3-8-27b-q4_k_m-inquisitor   port:8000    25m 49s  tg 17.58 t/s    pp 481 t/s
+● gpt-oss-20b-q8_0      [inquisitor]  :8001    11.3 GB  ROCm    tg 67.73 t/s   pp 1425 t/s    2h 34m
 ```
 
-`tg` is token generation (decode), `pp` is prompt processing (prefill), each
-averaged over the requests that finished in the last 30 seconds — tokens over
-*active* seconds, so an idle gap does not drag the figure down. Once the window
-empties, the last measurement stays on screen dimmed. The Detail pane adds the
-request count behind the average and the last request's tokens and duration.
+`tg` is token generation (decode) and `pp` is prompt processing (prefill), each
+the runtime's own figure for its most recent request rather than an average
+llmctl computed — only the server knows how much of the elapsed time was work
+rather than idling. The Detail pane adds the tokens and duration behind each.
 
-Columns are shed from the right on a narrow pane (`pp`, then `tg`, then the
-uptime), so the list never wraps; the Detail pane always has all of them.
+Columns are model, profile, port, size, compute backend, `tg`, `pp`, uptime. A
+narrow pane sheds the least useful first — size, then backend, then profile,
+then `pp` — so the list never wraps; the Detail pane always has all of them.
 
 ### Launch options
 

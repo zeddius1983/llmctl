@@ -28,6 +28,13 @@ pub struct SessionRecord {
     pub model: String,
     pub model_path: String,
     pub profile: String,
+    /// Total size of the model's files, recorded at launch. Sessions written by
+    /// an older llmctl have none, and show nothing rather than a wrong figure.
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
+    /// The compute backend this server runs on (`ROCm`, `Vulkan`, `NPU`, …).
+    #[serde(default)]
+    pub device: Option<String>,
     pub pid: i32,
     pub host: String,
     pub port: u16,

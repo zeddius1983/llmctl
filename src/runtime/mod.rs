@@ -211,6 +211,14 @@ pub trait RuntimeBackend: Send + Sync {
     /// logical model.
     fn models(&self, ctx: &CatalogCtx) -> Vec<Model>;
 
+    /// Which compute backend a launch with these options will run on —
+    /// `ROCm`, `Vulkan`, `CUDA`, `NPU`, `CPU`. Shown per session, because on a
+    /// machine with several it is the difference between a fast server and a
+    /// slow one, and nothing in the process list says which was chosen.
+    fn device_label(&self, _options: &[OptionItem]) -> Option<String> {
+        None
+    }
+
     /// The on-disk footprint of `model`, so the user can reclaim it. `None`
     /// when this runtime stores nothing for the model — it was never
     /// downloaded, or the runtime has no notion of local storage at all.

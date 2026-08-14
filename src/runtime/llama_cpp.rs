@@ -494,6 +494,22 @@ impl RuntimeBackend for LlamaCppBackend {
         models
     }
 
+    /// The `device` option names it outright (`ROCm0` → `ROCm`). Left at
+    /// `default`, llama.cpp picks the first device it discovered, so that is
+    /// what gets reported — and `CPU` when it found none.
+    fn device_label(&self, options: &[OptionItem]) -> Option<String> {
+        let selected = options
+            .iter()
+            .find(|option| option.key == "device")
+            .map(|option| option.value.as_str())
+            .filter(|value| *value != DEFAULT && !value.is_empty());
+        let device = match selected {
+            Some(device) => device,
+            None => self.runtime.devices.first().map(String::as_str).unwrap_or("CPU"),
+        };
+        Some(backend_of(device))
+    }
+
     /// A GGUF lives in one of two places: a scanned model directory, where it
     /// is the file the user put there, or the Hugging Face cache, where it is a
     /// set of hash-named blobs. Both are removable; only the second needs the
@@ -850,6 +866,15 @@ fn occupied_paths(model: &Model) -> Vec<PathBuf> {
         }
     }
     paths
+}
+
+/// The backend behind a llama.cpp device identifier: `ROCm0` → `ROCm`, and a
+/// comma-separated list keeps only the first, since the label names the kind of
+/// hardware rather than how many of it there are.
+fn backend_of(device: &str) -> String {
+    let first = device.split(',').next().unwrap_or(device).trim();
+    let name = first.trim_end_matches(|c: char| c.is_ascii_digit());
+    if name.is_empty() { first.to_string() } else { name.to_string() }
 }
 
 /// Per-request timings from a `llama-server` log line, if it carries any.

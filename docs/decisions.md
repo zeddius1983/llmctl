@@ -689,7 +689,7 @@ same way as every other runtime's.
 
 ---
 
-## ADR-016: Throughput is read from the server's log, and averaged over active seconds
+## ADR-016: Throughput is read from the server's own log
 
 **Status:** Accepted — implemented (`tg`/`pp` columns in the Session Manager)
 
@@ -703,7 +703,7 @@ answers `501 … Start it with --metrics`. Depending on it would mean every user
 adding a flag and restarting every session before a number appeared, and llmctl
 cannot add it to sessions it merely rediscovered. `/slots` *is* enabled by
 default but carries no timings (only `id`, `n_ctx`, `speculative`,
-`is_processing`).
+`is_processing`), and `/props` has no device or timing fields either.
 
 **Decision:** Read the per-request timings both runtimes already write to the
 session log llmctl creates and owns. llama.cpp prints them on completion:
@@ -719,20 +719,18 @@ token counts and durations behind them. Each runtime parses its own dialect;
 `templates_for` and for the same reason — session records are read off disk long
 before any backend is in hand.
 
-Rates are averaged over a 30-second window by summing tokens and **active
-seconds** and dividing once, not by dividing tokens by the window's span. Wall
-clock cannot tell generating from idling: a server that produced 20 tokens in
-one second and then sat quiet for twenty-nine is running at 20 t/s, not 0.7.
-Summing both sides also weights a long request above a two-token one, which
-averaging per-request rates would not. When the window empties, the last
-measurement stays on screen dimmed — on a personal server the window is empty
-most of the time, and a blank column would be the normal state.
+What is shown is the **latest** measurement, unaveraged: the runtime's own
+summary of the last request it served, which is what the log view would tell you
+and what a benchmark would report. llmctl times nothing itself, and could not
+usefully — wall-clock timing cannot tell generating from idling, so a server
+that produced 20 tokens in a second and then sat quiet would appear to slow
+down while doing nothing. Only the runtimes know how much of the elapsed time
+was work.
 
 The mid-request progress lines llama.cpp also emits (`n_decoded = 1653,
-tg = 18.51 t/s, tg_3s = 19.09 t/s`) are deliberately not parsed. They carry a
-rate but no duration, so they cannot join a token-weighted average, and a
-session's speed is a property of the requests it served rather than of the
-instant it is looked at.
+tg = 18.51 t/s, tg_3s = 19.09 t/s`) are not parsed. They report a rate but no
+duration, so they cannot be combined with the completion lines, and the
+completion figures already say what the last request achieved.
 
 Reading is incremental (`session::logtail`): the manager polls every tick and
 these logs reach tens of megabytes, so a `LogTail` remembers its offset and
@@ -743,6 +741,16 @@ rate immediately instead of waiting for the next request.
 **Consequences:** No new flags, no restart, no HTTP polling, and a runtime that
 logs its timings needs one function to join in. The figures update when a
 request *finishes*, so a long generation shows the previous request's rate until
-it completes — the price of refusing to average a duration-less number. Session
-rows became columnar to fit the two new fields, shedding `pp`, then `tg`, then
-the uptime as the pane narrows; the Detail pane always carries all of them.
+it completes. Session rows became columnar to carry the new fields — model,
+profile, port, size, backend, `tg`, `pp`, uptime — shedding the least useful
+first (size, backend, profile, `pp`, uptime) as the pane narrows, rather than
+right-to-left; the Detail pane always carries all of them.
+
+The size and compute backend shown per session are recorded at launch
+(`SessionRecord::size_bytes` and `device`), because neither can be recovered
+afterwards: the backend appears in no endpoint and, when `device` is left at
+`default`, in no argv either. `RuntimeBackend::device_label` resolves it — the
+selected device with its ordinal stripped (`ROCm0` → `ROCm`), else the first
+device the runtime discovered, which is the one llama.cpp itself would pick.
+Records written by an older llmctl carry neither and show nothing rather than a
+guess.

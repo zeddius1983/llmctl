@@ -24,7 +24,7 @@ use crate::app::{
     Selector,
 };
 use crate::domain::human_size;
-use crate::session::throughput::{Phase, WINDOW, format_rate};
+use crate::session::throughput::{Phase, format_rate};
 use crate::session::{Session, SessionStatus, format_uptime};
 
 const ACCENT: Color = Color::Yellow;
@@ -496,8 +496,10 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
     ]);
     frame.render_widget(Paragraph::new(title), header);
 
+    // The session list carries seven columns now; the detail pane is a stack of
+    // short key/value rows and needs less.
     let [jobs, detail] =
-        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(body);
+        Layout::horizontal([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(body);
     let [sessions, downloads] =
         Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(jobs);
     render_session_list(frame, sessions, app);
@@ -535,73 +537,135 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
     render_keyline(frame, footer, &keys);
 }
 
-/// Column widths for a session row. Columns are dropped from the right when the
-/// pane cannot hold them all — `pp` first, then `tg`, then the uptime — because
-/// the Detail pane carries every one of them in full.
-const COL_PORT: usize = 9; // "port:65535"
-const COL_UPTIME: usize = 9; // "25m 49s", up to "1008h 30m"
-const COL_RATE: usize = 12; // "tg 17.57 t/s"
+/// Session-row columns, in display order, with the width each is padded to.
+///
+/// `Model` takes whatever is left. The rest are fixed so that they line up down
+/// the pane — that alignment is the point, and it is why every cell is padded
+/// even when its content is shorter.
+const COL_PROFILE: usize = 12; // "[inquisitor]"
+const COL_PORT: usize = 6; // ":65535"
+const COL_SIZE: usize = 8; // "11.3 GB"
+const COL_DEVICE: usize = 6; // "Vulkan"
+const COL_RATE: usize = 12; // "tg 67.73 t/s"
+const COL_UPTIME: usize = 8; // "2h 34m"; four-digit hours push the row, not wrap it
 /// Gap between columns.
 const COL_GAP: usize = 2;
-/// Below this much room for the name, a column is not worth its space.
-const MIN_NAME: usize = 16;
+/// Below this much room for the model name, a column is not worth its space.
+const MIN_NAME: usize = 12;
 
-/// One session row, laid out in columns that line up down the pane.
+/// Which column to give up first when the pane cannot hold them all.
 ///
-/// `width` is the room inside the pane's border and selection marker. Columns
-/// are added while they fit and the name keeps [`MIN_NAME`], so a narrow
-/// terminal loses the speeds, then the uptime, rather than wrapping.
+/// Deliberately not right-to-left: the uptime sits at the far right but is
+/// worth more than the size or the backend, which never change once a session
+/// is up. The Detail pane carries every one of them regardless.
+const DROP_ORDER: [Column; 6] = [
+    Column::Size,
+    Column::Device,
+    Column::Profile,
+    Column::Prefill,
+    Column::Uptime,
+    Column::Decode,
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Column {
+    Profile,
+    Port,
+    Size,
+    Device,
+    Decode,
+    Prefill,
+    Uptime,
+}
+
+impl Column {
+    /// This column's text for a session, or `None` when it has nothing to say.
+    fn cell(self, session: &Session) -> Option<String> {
+        let rate = |phase, label: &str| {
+            session.throughput.rate(phase).map(|rate| format!("{label} {} t/s", format_rate(rate)))
+        };
+        match self {
+            Column::Profile => {
+                // Truncated rather than allowed to widen the column: a long
+                // profile name must not shift every row below it.
+                Some(format!("[{}]", truncate_right(&session.record.profile, COL_PROFILE - 2)))
+            }
+            Column::Port => Some(format!(":{}", session.record.port)),
+            Column::Size => session.record.size_bytes.map(human_size),
+            Column::Device => session.record.device.clone(),
+            Column::Decode => rate(Phase::Decode, "tg"),
+            Column::Prefill => rate(Phase::Prefill, "pp"),
+            Column::Uptime => session.uptime_secs().map(format_uptime),
+        }
+    }
+
+    fn width(self) -> usize {
+        match self {
+            Column::Profile => COL_PROFILE,
+            Column::Port => COL_PORT,
+            Column::Size => COL_SIZE,
+            Column::Device => COL_DEVICE,
+            Column::Decode | Column::Prefill => COL_RATE,
+            Column::Uptime => COL_UPTIME,
+        }
+    }
+
+    /// Numbers read better right-aligned against the column that follows them.
+    fn pad(self, text: &str) -> String {
+        let width = self.width();
+        match self {
+            Column::Size | Column::Uptime | Column::Decode | Column::Prefill => {
+                format!("{text:>width$}")
+            }
+            _ => format!("{text:<width$}"),
+        }
+    }
+}
+
+/// One session row: status, model, then the columns that fit.
+///
+/// `width` is the room inside the pane's border and selection marker.
 fn session_row(session: &Session, width: usize) -> Line<'static> {
-    let dim = Style::default().fg(Color::DarkGray);
-    // A stale figure is still the truth about this server, just not about this
-    // moment. Dimming says so without taking the column away.
-    let stale = Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM);
+    let order = [
+        Column::Profile,
+        Column::Port,
+        Column::Size,
+        Column::Device,
+        Column::Decode,
+        Column::Prefill,
+        Column::Uptime,
+    ];
 
-    let mut cells: Vec<(String, Style)> = Vec::new();
-    let mut budget = width.saturating_sub(2); // status glyph and its space
-    let mut afford = |text: String| -> bool {
-        let cost = text.chars().count() + COL_GAP;
-        let room = budget >= cost + MIN_NAME;
-        if room {
-            budget -= cost;
-        }
-        room
+    // Everything that has something to say, then drop by priority until the
+    // model name has room to be readable.
+    let mut cells: Vec<(Column, String)> = order
+        .iter()
+        .filter_map(|column| column.cell(session).map(|text| (*column, text)))
+        .collect();
+    let cost = |cells: &[(Column, String)]| -> usize {
+        cells.iter().map(|(column, _)| column.width() + COL_GAP).sum()
     };
-
-    let port = format!("{:<COL_PORT$}", format!("port:{}", session.record.port));
-    if afford(port.clone()) {
-        cells.push((port, dim));
-    }
-    if let Some(uptime) = session.uptime_secs().map(format_uptime) {
-        let uptime = format!("{uptime:>COL_UPTIME$}");
-        if afford(uptime.clone()) {
-            cells.push((uptime, dim));
+    let room = width.saturating_sub(2); // status glyph and its space
+    for dropped in DROP_ORDER {
+        if room >= cost(&cells) + MIN_NAME + COL_GAP {
+            break;
         }
-    }
-    // Decode first: it is the speed a generation is actually felt at, so when
-    // only one column fits it should be this one.
-    for (label, phase) in [("tg", Phase::Decode), ("pp", Phase::Prefill)] {
-        let Some(rate) = session.throughput.rate(phase) else { continue };
-        let cell = format!(
-            "{:>COL_RATE$}",
-            format!("{label} {} t/s", format_rate(rate.tokens_per_second))
-        );
-        if afford(cell.clone()) {
-            cells.push((cell, if rate.stale { stale } else { dim }));
-        }
+        cells.retain(|(column, _)| *column != dropped);
     }
 
-    let name_width = budget.saturating_sub(COL_GAP);
-    let name = truncate_right(&session.record.name, name_width);
+    let name_width = room.saturating_sub(cost(&cells) + COL_GAP).max(1);
     let mut spans = vec![
         Span::styled(
             format!("{} ", session.status.glyph()),
             Style::default().fg(status_color(session.status)),
         ),
-        Span::raw(format!("{name:<name_width$}")),
+        Span::raw(format!("{:<name_width$}", truncate_right(&session.record.name, name_width))),
     ];
-    for (cell, style) in cells {
-        spans.push(Span::styled(format!("{}{cell}", " ".repeat(COL_GAP)), style));
+    for (column, text) in cells {
+        spans.push(Span::styled(
+            format!("{}{}", " ".repeat(COL_GAP), column.pad(&text)),
+            Style::default().fg(Color::DarkGray),
+        ));
     }
     Line::from(spans)
 }
@@ -720,32 +784,22 @@ fn download_detail_lines(download: &ModelDownload) -> Text<'static> {
     ])
 }
 
-/// One `pp`/`tg` line for the Detail pane: the window average, how many
-/// requests are behind it, and the last request it saw.
+/// One `pp`/`tg` line for the Detail pane: the rate, and the request it came
+/// from — the server's own summary of the last thing it did.
 fn rate_line(label: &str, session: &Session, phase: Phase) -> Line<'static> {
-    let Some(rate) = session.throughput.rate(phase) else {
+    let Some(last) = session.throughput.last(phase) else {
         return kv(label, "—");
     };
-    let mut detail = if rate.stale {
-        // Outside the window there is nothing to average; it is one past
-        // measurement, and saying "1 request" would imply recency.
-        "last seen".to_string()
-    } else {
-        format!("{}s avg, {} request{}", WINDOW.as_secs(), rate.requests, plural(rate.requests))
-    };
-    if let Some(last) = session.throughput.last(phase) {
-        detail.push_str(&format!("; last {} tok in {:.1}s", last.tokens, last.seconds));
-    }
-    let value = format!("{} t/s  ({detail})", format_rate(rate.tokens_per_second));
-    let style = if rate.stale { Style::default().fg(Color::DarkGray) } else { Style::default() };
+    let Some(rate) = last.rate() else { return kv(label, "—") };
     Line::from(vec![
         Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
-        Span::styled(value, style),
+        Span::raw(format!(
+            "{} t/s  ({} tok in {:.2}s)",
+            format_rate(rate),
+            last.tokens,
+            last.seconds
+        )),
     ])
-}
-
-fn plural(count: usize) -> &'static str {
-    if count == 1 { "" } else { "s" }
 }
 
 fn session_detail_lines(session: &Session) -> Text<'static> {
@@ -1292,8 +1346,8 @@ mod tests {
         use crate::session::throughput::{Phase, Sample, Throughput};
         let mut throughput = Throughput::default();
         if rates {
-            throughput.record(Sample { phase: Phase::Prefill, tokens: 3266, seconds: 6.79 });
-            throughput.record(Sample { phase: Phase::Decode, tokens: 174, seconds: 9.9 });
+            throughput.record(Sample { phase: Phase::Prefill, tokens: 3266, seconds: 2.292 });
+            throughput.record(Sample { phase: Phase::Decode, tokens: 174, seconds: 2.569 });
         }
         crate::session::Session::probe(
             SessionRecord {
@@ -1302,10 +1356,12 @@ mod tests {
                 runtime: "llama.cpp".into(),
                 model: "m".into(),
                 model_path: "m".into(),
-                profile: "Default".into(),
+                profile: "inquisitor".into(),
+                size_bytes: Some(12_100_000_000),
+                device: Some("ROCm".into()),
                 pid: 1,
                 host: "127.0.0.1".into(),
-                port: 8000,
+                port: 8001,
                 command: vec![],
                 health_path: "/health".into(),
                 log_file: Default::default(),
@@ -1314,7 +1370,7 @@ mod tests {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_secs()
-                    - 1549,
+                    - 9_240,
             },
             crate::session::SessionStatus::Running,
             throughput,
@@ -1332,51 +1388,81 @@ mod tests {
     /// The point of the columns: they line up regardless of name length.
     #[test]
     fn session_columns_align_across_rows() {
-        let width = 68;
-        let rows: Vec<String> = ["a", "qwen3-8-27b-q4_k_m-inquisitor", "mid-length-name"]
+        // A 160-column terminal, where every column fits.
+        let width = 108;
+        let rows: Vec<String> = ["a", "gpt-oss-20b-q8_0", "qwen3-8-27b-q4_k_m-inquisitor"]
             .iter()
             .map(|name| row_text(&probe_session(name, true), width))
             .collect();
 
         for row in &rows {
             assert_eq!(row.chars().count(), rows[0].chars().count(), "ragged row: {row:?}");
-            assert!(row.contains("port:8000") && row.contains("tg 17.58 t/s"), "{row}");
         }
         // Same starting column for every cell, whatever the name did. Counted
         // in characters, not bytes: the glyph and the ellipsis are multibyte.
-        for cell in ["port:8000", "25m 49s", "tg 17.58 t/s", "pp 481 t/s"] {
+        for cell in
+            ["[inquisitor]", ":8001", "11.3 GB", "ROCm", "tg 67.73 t/s", "pp 1425 t/s", "2h 34m"]
+        {
             let columns: Vec<Option<usize>> = rows
                 .iter()
                 .map(|row| row.find(cell).map(|byte| row[..byte].chars().count()))
                 .collect();
+            assert!(columns.iter().all(|at| at.is_some()), "{cell} missing: {rows:#?}");
             assert!(columns.iter().all(|at| *at == columns[0]), "{cell} drifts: {columns:?}");
         }
     }
 
-    /// A narrow pane sheds columns from the right rather than wrapping, and the
-    /// decode rate outlives the prefill rate because it is the one felt.
+    /// The requested order, left to right.
     #[test]
-    fn narrow_panes_shed_columns_from_the_right() {
-        let session = probe_session("qwen3-8-27b-q4_k_m-inquisitor", true);
+    fn session_columns_are_in_the_documented_order() {
+        let row = row_text(&probe_session("gpt-oss-20b-q8_0", true), 108);
+        let order = [
+            "gpt-oss-20b-q8_0",
+            "[inquisitor]",
+            ":8001",
+            "11.3 GB",
+            "ROCm",
+            "tg ",
+            "pp ",
+            "2h 34m",
+        ];
+        let mut at = 0;
+        for cell in order {
+            let found =
+                row[at..].find(cell).unwrap_or_else(|| panic!("{cell} out of order in {row:?}"));
+            at += found + cell.len();
+        }
+    }
+
+    /// A narrow pane sheds columns by worth, not by position: the size and the
+    /// backend go before the uptime, and the decode rate outlives them all.
+    #[test]
+    fn narrow_panes_shed_the_least_useful_columns_first() {
+        let session = probe_session("gpt-oss-20b-q8_0", true);
         let kept = |width: usize| {
             let row = row_text(&session, width);
             assert!(row.chars().count() <= width, "{width}: overflowed with {row:?}");
-            (row.contains("tg "), row.contains("pp "), row.contains("25m 49s"))
+            row
         };
-        assert_eq!(kept(96), (true, true, true));
-        assert_eq!(kept(56), (true, false, true), "pp goes first");
-        assert_eq!(kept(44), (false, false, true), "then tg");
-        assert_eq!(kept(30), (false, false, false), "then the uptime");
-        // Even absurdly narrow, it renders something rather than panicking.
+        assert!(kept(108).contains("11.3 GB"), "everything fits on a wide pane");
+        // Narrower: the size and the backend go before the uptime does.
+        let tight = kept(80);
+        assert!(!tight.contains("11.3 GB") && !tight.contains("ROCm"), "{tight}");
+        assert!(tight.contains("2h 34m") && tight.contains("pp "), "{tight}");
+        // Narrower still: only the decode rate survives beside port and uptime.
+        let tighter = kept(52);
+        assert!(!tighter.contains("pp "), "{tighter}");
+        assert!(tighter.contains("tg ") && tighter.contains(":8001"), "{tighter}");
+        // Even absurdly narrow it renders something rather than panicking.
         assert!(!row_text(&session, 4).is_empty());
     }
 
-    /// A session that has served nothing has no rates to show, and the columns
-    /// simply are not there.
+    /// A session that has served nothing has no rates to show, and those
+    /// columns simply are not there.
     #[test]
     fn a_session_with_no_requests_shows_no_rates() {
-        let row = row_text(&probe_session("fresh", false), 96);
-        assert!(row.contains("port:8000"));
+        let row = row_text(&probe_session("fresh", false), 108);
+        assert!(row.contains(":8001"));
         assert!(!row.contains("t/s"), "{row}");
     }
 }

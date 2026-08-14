@@ -341,6 +341,12 @@ impl RuntimeBackend for FlmBackend {
         models
     }
 
+    /// FastFlowLM only ever runs on the XDNA2 NPU; that is the whole point of
+    /// the runtime.
+    fn device_label(&self, _options: &[OptionItem]) -> Option<String> {
+        Some("NPU".into())
+    }
+
     /// `flm` gives each model a directory of its own under its model root, so
     /// removing one is removing that directory — including any `.llmctl-part`
     /// scratch a cancelled download left in it.
@@ -1425,6 +1431,8 @@ mod tests {
                 health_path: backend.health_path().into(),
                 download: None,
                 profile: "Default".into(),
+                size_bytes: None,
+                device: None,
                 host: "127.0.0.1".into(),
                 port,
             })
