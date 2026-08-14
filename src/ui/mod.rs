@@ -24,6 +24,7 @@ use crate::app::{
     Selector,
 };
 use crate::domain::human_size;
+use crate::session::throughput::{Phase, WINDOW, format_rate};
 use crate::session::{Session, SessionStatus, format_uptime};
 
 const ACCENT: Color = Color::Yellow;
@@ -534,24 +535,93 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
     render_keyline(frame, footer, &keys);
 }
 
+/// Column widths for a session row. Columns are dropped from the right when the
+/// pane cannot hold them all — `pp` first, then `tg`, then the uptime — because
+/// the Detail pane carries every one of them in full.
+const COL_PORT: usize = 9; // "port:65535"
+const COL_UPTIME: usize = 9; // "25m 49s", up to "1008h 30m"
+const COL_RATE: usize = 12; // "tg 17.57 t/s"
+/// Gap between columns.
+const COL_GAP: usize = 2;
+/// Below this much room for the name, a column is not worth its space.
+const MIN_NAME: usize = 16;
+
+/// One session row, laid out in columns that line up down the pane.
+///
+/// `width` is the room inside the pane's border and selection marker. Columns
+/// are added while they fit and the name keeps [`MIN_NAME`], so a narrow
+/// terminal loses the speeds, then the uptime, rather than wrapping.
+fn session_row(session: &Session, width: usize) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    // A stale figure is still the truth about this server, just not about this
+    // moment. Dimming says so without taking the column away.
+    let stale = Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM);
+
+    let mut cells: Vec<(String, Style)> = Vec::new();
+    let mut budget = width.saturating_sub(2); // status glyph and its space
+    let mut afford = |text: String| -> bool {
+        let cost = text.chars().count() + COL_GAP;
+        let room = budget >= cost + MIN_NAME;
+        if room {
+            budget -= cost;
+        }
+        room
+    };
+
+    let port = format!("{:<COL_PORT$}", format!("port:{}", session.record.port));
+    if afford(port.clone()) {
+        cells.push((port, dim));
+    }
+    if let Some(uptime) = session.uptime_secs().map(format_uptime) {
+        let uptime = format!("{uptime:>COL_UPTIME$}");
+        if afford(uptime.clone()) {
+            cells.push((uptime, dim));
+        }
+    }
+    // Decode first: it is the speed a generation is actually felt at, so when
+    // only one column fits it should be this one.
+    for (label, phase) in [("tg", Phase::Decode), ("pp", Phase::Prefill)] {
+        let Some(rate) = session.throughput.rate(phase) else { continue };
+        let cell = format!(
+            "{:>COL_RATE$}",
+            format!("{label} {} t/s", format_rate(rate.tokens_per_second))
+        );
+        if afford(cell.clone()) {
+            cells.push((cell, if rate.stale { stale } else { dim }));
+        }
+    }
+
+    let name_width = budget.saturating_sub(COL_GAP);
+    let name = truncate_right(&session.record.name, name_width);
+    let mut spans = vec![
+        Span::styled(
+            format!("{} ", session.status.glyph()),
+            Style::default().fg(status_color(session.status)),
+        ),
+        Span::raw(format!("{name:<name_width$}")),
+    ];
+    for (cell, style) in cells {
+        spans.push(Span::styled(format!("{}{cell}", " ".repeat(COL_GAP)), style));
+    }
+    Line::from(spans)
+}
+
+/// Truncate to `max` columns, keeping the head and marking the cut.
+fn truncate_right(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    if max <= 1 {
+        return "…".repeat(max);
+    }
+    text.chars().take(max - 1).collect::<String>() + "…"
+}
+
 fn render_session_list(frame: &mut Frame, area: Rect, app: &mut App) {
-    let items: Vec<ListItem> = app
-        .sessions
-        .sessions
-        .iter()
-        .map(|s| {
-            let color = status_color(s.status);
-            let uptime = s.uptime_secs().map(format_uptime).unwrap_or_else(|| "—".into());
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{} ", s.status.glyph()), Style::default().fg(color)),
-                Span::raw(s.record.name.clone()),
-                Span::styled(
-                    format!("   port:{}  {}", s.record.port, uptime),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]))
-        })
-        .collect();
+    // Two columns of border, two of selection marker.
+    let width = area.width.saturating_sub(4) as usize;
+    let items: Vec<ListItem> =
+        app.sessions.sessions.iter().map(|s| ListItem::new(session_row(s, width))).collect();
     let focused = app.selected_server_session().is_some() || app.async_job_count() == 0;
     let mut state = ListState::default();
     state.select(app.session_sel.selected().filter(|index| *index < app.sessions.sessions.len()));
@@ -650,6 +720,34 @@ fn download_detail_lines(download: &ModelDownload) -> Text<'static> {
     ])
 }
 
+/// One `pp`/`tg` line for the Detail pane: the window average, how many
+/// requests are behind it, and the last request it saw.
+fn rate_line(label: &str, session: &Session, phase: Phase) -> Line<'static> {
+    let Some(rate) = session.throughput.rate(phase) else {
+        return kv(label, "—");
+    };
+    let mut detail = if rate.stale {
+        // Outside the window there is nothing to average; it is one past
+        // measurement, and saying "1 request" would imply recency.
+        "last seen".to_string()
+    } else {
+        format!("{}s avg, {} request{}", WINDOW.as_secs(), rate.requests, plural(rate.requests))
+    };
+    if let Some(last) = session.throughput.last(phase) {
+        detail.push_str(&format!("; last {} tok in {:.1}s", last.tokens, last.seconds));
+    }
+    let value = format!("{} t/s  ({detail})", format_rate(rate.tokens_per_second));
+    let style = if rate.stale { Style::default().fg(Color::DarkGray) } else { Style::default() };
+    Line::from(vec![
+        Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
+        Span::styled(value, style),
+    ])
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
 fn session_detail_lines(session: &Session) -> Text<'static> {
     let r = &session.record;
     let color = status_color(session.status);
@@ -676,6 +774,10 @@ fn session_detail_lines(session: &Session) -> Text<'static> {
         kv("Uptime", &uptime),
         kv("Memory", &mem),
         kv("CPU", &cpu),
+        Line::raw(""),
+        Line::from("Throughput".bold()),
+        rate_line("Prefill", session, Phase::Prefill),
+        rate_line("Decode", session, Phase::Decode),
         Line::raw(""),
         kv("Endpoint", &r.endpoint()),
         kv("Log", &r.log_file.display().to_string()),
@@ -1183,5 +1285,98 @@ mod tests {
 
         model.catalog_path = vec!["local-models".into()];
         assert_eq!(model_icon(&model), ICON_DIRECTORY);
+    }
+
+    fn probe_session(name: &str, rates: bool) -> crate::session::Session {
+        use crate::session::record::SessionRecord;
+        use crate::session::throughput::{Phase, Sample, Throughput};
+        let mut throughput = Throughput::default();
+        if rates {
+            throughput.record(Sample { phase: Phase::Prefill, tokens: 3266, seconds: 6.79 });
+            throughput.record(Sample { phase: Phase::Decode, tokens: 174, seconds: 9.9 });
+        }
+        crate::session::Session::probe(
+            SessionRecord {
+                id: "1".into(),
+                name: name.into(),
+                runtime: "llama.cpp".into(),
+                model: "m".into(),
+                model_path: "m".into(),
+                profile: "Default".into(),
+                pid: 1,
+                host: "127.0.0.1".into(),
+                port: 8000,
+                command: vec![],
+                health_path: "/health".into(),
+                log_file: Default::default(),
+                download: None,
+                started_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    - 1549,
+            },
+            crate::session::SessionStatus::Running,
+            throughput,
+        )
+    }
+
+    fn row_text(session: &crate::session::Session, width: usize) -> String {
+        super::session_row(session, width)
+            .spans
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect()
+    }
+
+    /// The point of the columns: they line up regardless of name length.
+    #[test]
+    fn session_columns_align_across_rows() {
+        let width = 68;
+        let rows: Vec<String> = ["a", "qwen3-8-27b-q4_k_m-inquisitor", "mid-length-name"]
+            .iter()
+            .map(|name| row_text(&probe_session(name, true), width))
+            .collect();
+
+        for row in &rows {
+            assert_eq!(row.chars().count(), rows[0].chars().count(), "ragged row: {row:?}");
+            assert!(row.contains("port:8000") && row.contains("tg 17.58 t/s"), "{row}");
+        }
+        // Same starting column for every cell, whatever the name did. Counted
+        // in characters, not bytes: the glyph and the ellipsis are multibyte.
+        for cell in ["port:8000", "25m 49s", "tg 17.58 t/s", "pp 481 t/s"] {
+            let columns: Vec<Option<usize>> = rows
+                .iter()
+                .map(|row| row.find(cell).map(|byte| row[..byte].chars().count()))
+                .collect();
+            assert!(columns.iter().all(|at| *at == columns[0]), "{cell} drifts: {columns:?}");
+        }
+    }
+
+    /// A narrow pane sheds columns from the right rather than wrapping, and the
+    /// decode rate outlives the prefill rate because it is the one felt.
+    #[test]
+    fn narrow_panes_shed_columns_from_the_right() {
+        let session = probe_session("qwen3-8-27b-q4_k_m-inquisitor", true);
+        let kept = |width: usize| {
+            let row = row_text(&session, width);
+            assert!(row.chars().count() <= width, "{width}: overflowed with {row:?}");
+            (row.contains("tg "), row.contains("pp "), row.contains("25m 49s"))
+        };
+        assert_eq!(kept(96), (true, true, true));
+        assert_eq!(kept(56), (true, false, true), "pp goes first");
+        assert_eq!(kept(44), (false, false, true), "then tg");
+        assert_eq!(kept(30), (false, false, false), "then the uptime");
+        // Even absurdly narrow, it renders something rather than panicking.
+        assert!(!row_text(&session, 4).is_empty());
+    }
+
+    /// A session that has served nothing has no rates to show, and the columns
+    /// simply are not there.
+    #[test]
+    fn a_session_with_no_requests_shows_no_rates() {
+        let row = row_text(&probe_session("fresh", false), 96);
+        assert!(row.contains("port:8000"));
+        assert!(!row.contains("t/s"), "{row}");
     }
 }

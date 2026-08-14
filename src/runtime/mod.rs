@@ -348,6 +348,20 @@ pub fn templates_for(runtime: &str) -> &'static [Template] {
     }
 }
 
+/// How to read per-request rates out of a runtime's log, identified only by
+/// name.
+///
+/// The same exception as [`templates_for`], for the same reason: session
+/// records are read off disk at startup, long before any backend is in hand,
+/// and they carry the runtime's name rather than a handle to it. Everywhere a
+/// backend *is* available, dispatch goes through the trait.
+pub fn throughput_parser(runtime: &str) -> fn(&str) -> Vec<crate::session::throughput::Sample> {
+    match runtime {
+        flm::NAME => flm::parse_throughput,
+        _ => llama_cpp::parse_throughput,
+    }
+}
+
 /// Resolve a binary to an absolute path: honor an explicit path, else search
 /// `$PATH`.
 pub(crate) fn resolve_binary(binary: &str) -> Option<std::path::PathBuf> {

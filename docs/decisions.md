@@ -686,3 +686,63 @@ that narrow to the case of two configured source directories holding the same
 sidecar path. `flm remove` stays unused: llmctl downloads FastFlowLM models
 itself (ADR-013), so it removes them itself too, and the plan is visible in the
 same way as every other runtime's.
+
+---
+
+## ADR-016: Throughput is read from the server's log, and averaged over active seconds
+
+**Status:** Accepted — implemented (`tg`/`pp` columns in the Session Manager)
+
+**Context:** A session should show how fast it is going: token generation (`tg`,
+decode) and prompt processing (`pp`, prefill). The obvious source is llama.cpp's
+Prometheus endpoint, and the obvious measurement is tokens counted over elapsed
+time. Both are wrong here.
+
+`/metrics` is **disabled by default** — a server started without `--metrics`
+answers `501 … Start it with --metrics`. Depending on it would mean every user
+adding a flag and restarting every session before a number appeared, and llmctl
+cannot add it to sessions it merely rediscovered. `/slots` *is* enabled by
+default but carries no timings (only `id`, `n_ctx`, `speculative`,
+`is_processing`).
+
+**Decision:** Read the per-request timings both runtimes already write to the
+session log llmctl creates and owns. llama.cpp prints them on completion:
+
+```text
+slot print_timing: id 3 | task 131 | prompt eval time =  1419.87 ms / 348 tokens (…)
+slot print_timing: id 3 | task 131 |        eval time = 15444.75 ms / 258 tokens (…)
+```
+
+FastFlowLM puts a `usage` object on the closing `ChatCompletionChunk`, with the
+token counts and durations behind them. Each runtime parses its own dialect;
+`throughput_parser` resolves the parser by runtime *name*, the same exception as
+`templates_for` and for the same reason — session records are read off disk long
+before any backend is in hand.
+
+Rates are averaged over a 30-second window by summing tokens and **active
+seconds** and dividing once, not by dividing tokens by the window's span. Wall
+clock cannot tell generating from idling: a server that produced 20 tokens in
+one second and then sat quiet for twenty-nine is running at 20 t/s, not 0.7.
+Summing both sides also weights a long request above a two-token one, which
+averaging per-request rates would not. When the window empties, the last
+measurement stays on screen dimmed — on a personal server the window is empty
+most of the time, and a blank column would be the normal state.
+
+The mid-request progress lines llama.cpp also emits (`n_decoded = 1653,
+tg = 18.51 t/s, tg_3s = 19.09 t/s`) are deliberately not parsed. They carry a
+rate but no duration, so they cannot join a token-weighted average, and a
+session's speed is a property of the requests it served rather than of the
+instant it is looked at.
+
+Reading is incremental (`session::logtail`): the manager polls every tick and
+these logs reach tens of megabytes, so a `LogTail` remembers its offset and
+returns only whole lines appended since. The first poll primes from the last
+64 KB, which is what lets a session rediscovered after an llmctl restart show a
+rate immediately instead of waiting for the next request.
+
+**Consequences:** No new flags, no restart, no HTTP polling, and a runtime that
+logs its timings needs one function to join in. The figures update when a
+request *finishes*, so a long generation shows the previous request's rate until
+it completes — the price of refusing to average a duration-less number. Session
+rows became columnar to fit the two new fields, shedding `pp`, then `tg`, then
+the uptime as the pane narrows; the Detail pane always carries all of them.

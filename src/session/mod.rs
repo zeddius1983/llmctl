@@ -7,9 +7,11 @@
 
 pub mod command;
 pub mod health;
+pub mod logtail;
 pub mod proc;
 pub mod record;
 pub mod supervisor;
+pub mod throughput;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,9 +21,11 @@ use anyhow::{Result, anyhow};
 
 use command::Command;
 use health::Health;
+use logtail::LogTail;
 use proc::CpuSample;
 use record::{DownloadRecord, SessionRecord};
 use supervisor::{DetachedSupervisor, LaunchSpec, SessionSupervisor};
+use throughput::Throughput;
 
 /// Observable lifecycle state of a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +114,10 @@ pub struct Session {
     requested_stop: bool,
     /// Previous CPU sample for delta-based percentage.
     last_cpu: Option<CpuSample>,
+    /// Prompt-processing and token-generation rates, and the position in the
+    /// server's log they are read from.
+    pub throughput: Throughput,
+    log_tail: LogTail,
     /// Set while a restart is waiting out the old process; see [`PendingRestart`].
     restart_pending: Option<PendingRestart>,
 }
@@ -125,8 +133,16 @@ impl Session {
             download_percent,
             requested_stop: false,
             last_cpu: None,
+            throughput: Throughput::default(),
+            log_tail: LogTail::default(),
             restart_pending: None,
         }
+    }
+
+    /// A session with pre-seeded rates, for rendering tests.
+    #[cfg(test)]
+    pub fn probe(record: SessionRecord, status: SessionStatus, throughput: Throughput) -> Self {
+        Self { throughput, ..Self::new(record, status) }
     }
 
     /// Seconds the process has been alive (None for terminal states).
@@ -371,6 +387,11 @@ impl SessionManager {
 
             let rss = proc::rss_bytes(pid);
             let sample = proc::cpu_sample(pid);
+            // The server already timed its own requests; read what it wrote
+            // rather than timing anything here (see `session::throughput`).
+            let parse = crate::runtime::throughput_parser(&self.sessions[idx].record.runtime);
+            let log_file = self.sessions[idx].record.log_file.clone();
+            let appended = self.sessions[idx].log_tail.poll(&log_file);
             // Once a session is Running its status no longer depends on the
             // probe — the `was_running` arm below keeps it Running for as long
             // as the process lives — so re-probing every tick buys nothing. It
@@ -383,6 +404,9 @@ impl SessionManager {
             let s = &mut self.sessions[idx];
             s.rss_bytes = rss;
             s.download_percent = progress;
+            for measurement in appended.iter().flat_map(|line| parse(line)) {
+                s.throughput.record(measurement);
+            }
             if let Some(now) = sample {
                 if let Some(prev) = prev {
                     s.cpu_percent = proc::cpu_percent(prev, now);

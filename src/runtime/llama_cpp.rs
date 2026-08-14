@@ -16,6 +16,7 @@ use crate::runtime::{
 use crate::session::command::Command;
 use crate::session::record::{DownloadBlob, DownloadRecord};
 use crate::session::supervisor;
+use crate::session::throughput::{Phase, Sample};
 
 use OptionKind::{Enum, Float, Int, Str};
 
@@ -851,6 +852,48 @@ fn occupied_paths(model: &Model) -> Vec<PathBuf> {
     paths
 }
 
+/// Per-request timings from a `llama-server` log line, if it carries any.
+///
+/// llama-server prints these when a request finishes:
+///
+/// ```text
+/// slot print_timing: id 3 | task 131 | prompt eval time = 1419.87 ms /  348 tokens (...)
+/// slot print_timing: id 3 | task 131 |        eval time = 15444.75 ms / 258 tokens (...)
+/// ```
+///
+/// The `ms` figure is time spent on that phase, not elapsed wall clock, which
+/// is exactly what a rate should be divided by. The progress lines the server
+/// also emits mid-request (`n_decoded = …, tg = …`) are deliberately ignored:
+/// they carry a rate but no duration, so they cannot be averaged with these.
+pub fn parse_throughput(line: &str) -> Vec<Sample> {
+    // Order matters: "prompt eval time" ends with "eval time".
+    let (phase, rest) = if let Some((_, rest)) = line.split_once("prompt eval time =") {
+        (Phase::Prefill, rest)
+    } else if let Some((_, rest)) = line.split_once("eval time =") {
+        (Phase::Decode, rest)
+    } else {
+        // `total time = … / N tokens` covers both phases at once; counting it
+        // would double every request.
+        return Vec::new();
+    };
+
+    let Some(milliseconds) = leading_number(rest) else { return Vec::new() };
+    let Some(tokens) = rest.split_once('/').and_then(|(_, after)| leading_number(after)) else {
+        return Vec::new();
+    };
+    let sample = Sample { phase, tokens: tokens as u64, seconds: milliseconds / 1000.0 };
+    if sample.rate().is_none() { Vec::new() } else { vec![sample] }
+}
+
+/// The number at the start of `text`, ignoring the spaces llama.cpp pads its
+/// columns with.
+fn leading_number(text: &str) -> Option<f64> {
+    let text = text.trim_start();
+    let end =
+        text.find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-').unwrap_or(text.len());
+    text[..end].parse().ok()
+}
+
 /// A speculative-decoding type that needs a companion draft GGUF, and which
 /// companion that is. llama.cpp loads either through the same
 /// `--spec-draft-model` slot, so at most one can be selected at a time.
@@ -1150,6 +1193,43 @@ mod tests {
     #[test]
     fn a_model_whose_file_is_gone_has_nothing_to_delete() {
         assert!(local_deletion(&test_model(), &[test_model()]).is_none());
+    }
+
+    /// Verbatim lines from a real session log.
+    #[test]
+    fn per_request_timings_are_read_from_the_server_log() {
+        let pp = "0.37.008.491 I slot print_timing: id  3 | task 0 | prompt eval time =   \
+                  10436.32 ms /  3266 tokens (    3.20 ms per token,   312.95 tokens per second)";
+        let tg = "0.37.008.496 I slot print_timing: id  3 | task 0 |        eval time =    \
+                  9379.48 ms /   174 tokens (   53.91 ms per token,    18.55 tokens per second)";
+
+        let prefill = parse_throughput(pp);
+        assert_eq!(
+            prefill,
+            vec![Sample { phase: Phase::Prefill, tokens: 3266, seconds: 10.43632 }]
+        );
+        // Divides out to the rate the server itself printed.
+        assert!((prefill[0].rate().unwrap() - 312.95).abs() < 0.01);
+
+        let decode = parse_throughput(tg);
+        assert_eq!(decode, vec![Sample { phase: Phase::Decode, tokens: 174, seconds: 9.37948 }]);
+        assert!((decode[0].rate().unwrap() - 18.55).abs() < 0.01);
+    }
+
+    /// `total time` covers both phases at once and would double every request;
+    /// the progress lines carry a rate but no duration, so they cannot be
+    /// averaged with the rest. Neither is a measurement this can use.
+    #[test]
+    fn only_completed_request_timings_count() {
+        for line in [
+            "0.37.008.500 I slot print_timing: id  3 | task 0 |       total time =   19815.80 ms /  3440 tokens",
+            "34.13.260.056 I slot print_timing: id  2 | task 272 | n_decoded =   1653, tg =  18.51 t/s, tg_3s =  19.09 t/s",
+            "0.26.101.658 I slot print_timing: id  3 | task 0 | prompt processing, n_tokens =   2877, progress = 0.88, t =   8.91 s / 322.93 tokens per second",
+            "0.00.000.001 I main: server is listening on http://127.0.0.1:8000",
+            "",
+        ] {
+            assert!(parse_throughput(line).is_empty(), "should not measure: {line}");
+        }
     }
 
     #[test]

@@ -62,11 +62,12 @@ and watch them from a built-in session manager.
 - **Detached sessions** — `s` launches a server in its own process group
   (`setsid`), with stdout/stderr redirected to a per-session log file and
   automatic port-conflict resolution. Sessions are rediscovered across restarts.
-- **Session manager** (`t`) — live status (Downloading / Starting / Running /
-  Crashed), PID,
-  port, uptime, and `/proc`-sampled CPU & memory; a `/health` probe promotes
-  Downloading → Starting → Running. Stop (`x`), kill (`K`), restart (`R`), copy endpoint (`c`),
-  and tail logs (`L`).
+- **Session manager** (`t`) — aligned columns of live status (Downloading /
+  Starting / Running / Crashed), name, port, uptime, and throughput: `tg`
+  (token generation) and `pp` (prompt processing) in tokens per second,
+  averaged over the last 30 seconds. Plus PID and `/proc`-sampled CPU & memory;
+  a `/health` probe promotes Downloading → Starting → Running. Stop (`x`),
+  kill (`K`), restart (`R`), copy endpoint (`c`), and tail logs (`L`).
 
 ## Requirements
 
@@ -153,6 +154,25 @@ overlay.
 | **General** | |
 | `F5` | Rescan / reload |
 | `?` / `q` | Help / quit |
+
+### Session throughput
+
+Each session shows its speed, read from the timings the server already writes to
+its own log — nothing to enable, and it works for sessions llmctl rediscovered
+after a restart:
+
+```
+● qwen3-8-27b-q4_k_m-inquisitor   port:8000    25m 49s  tg 17.58 t/s    pp 481 t/s
+```
+
+`tg` is token generation (decode), `pp` is prompt processing (prefill), each
+averaged over the requests that finished in the last 30 seconds — tokens over
+*active* seconds, so an idle gap does not drag the figure down. Once the window
+empties, the last measurement stays on screen dimmed. The Detail pane adds the
+request count behind the average and the last request's tokens and duration.
+
+Columns are shed from the right on a narrow pane (`pp`, then `tg`, then the
+uptime), so the list never wraps; the Detail pane always has all of them.
 
 ### Launch options
 

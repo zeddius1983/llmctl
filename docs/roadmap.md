@@ -252,6 +252,14 @@ noted here because the failure looks like one.
 
 ## In progress
 
+### Session throughput and columns
+- [x] `tg` (decode) and `pp` (prefill) rates in the Session Manager, averaged
+      over a 30s window of active seconds and read from the session log both
+      runtimes already write — no `--metrics`, no restart (ADR-016). Idle
+      sessions keep the last figure, dimmed.
+- [x] Session rows laid out in aligned columns (status · name · port · uptime ·
+      tg · pp), shedding columns from the right on a narrow pane.
+
 ### Model storage management
 - [x] `D` in the Model pane removes the selected model from disk, behind a
       one-line confirmation quoting the model and the space freed (ADR-015).

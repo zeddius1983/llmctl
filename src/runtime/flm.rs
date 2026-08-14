@@ -28,6 +28,7 @@ use crate::runtime::{CatalogCtx, Deletion, LaunchContext, RuntimeBackend, tree_b
 use crate::session::command::Command;
 use crate::session::record::{DownloadBlob, DownloadRecord};
 use crate::session::supervisor;
+use crate::session::throughput::{Phase, Sample};
 
 pub const NAME: &str = "FastFlowLM";
 
@@ -776,6 +777,45 @@ impl Entry {
     }
 }
 
+/// Per-request timings from an `flm serve` log line, if it carries any.
+///
+/// `flm` streams `ChatCompletionChunk: {…}` lines and puts a `usage` object on
+/// the final one, with the token counts and the durations behind them:
+///
+/// ```text
+/// ChatCompletionChunk: {…,"usage":{"prompt_tokens":299,"completion_tokens":10,
+///   "prefill_duration_ttft":7.53,"decoding_duration":0.97,
+///   "prefill_speed_tps":39.69,"decoding_speed_tps":10.36}}
+/// ```
+///
+/// It reports the rates too, but the counts and durations are what get used:
+/// they divide out to the same figures and, unlike a rate, can be summed across
+/// requests to average a window.
+pub fn parse_throughput(line: &str) -> Vec<Sample> {
+    let Some((_, json)) = line.split_once("ChatCompletionChunk:") else { return Vec::new() };
+    let Ok(chunk) = serde_json::from_str::<serde_json::Value>(json.trim()) else {
+        return Vec::new();
+    };
+    // Only the closing chunk of a stream carries usage.
+    let Some(usage) = chunk.get("usage") else { return Vec::new() };
+
+    let read = |tokens: &str, duration: &str, phase: Phase| -> Option<Sample> {
+        let sample = Sample {
+            phase,
+            tokens: usage.get(tokens)?.as_u64()?,
+            seconds: usage.get(duration)?.as_f64()?,
+        };
+        sample.rate().is_some().then_some(sample)
+    };
+    [
+        read("prompt_tokens", "prefill_duration_ttft", Phase::Prefill),
+        read("completion_tokens", "decoding_duration", Phase::Decode),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 /// A tag as a single filesystem-safe path segment (`qwen3:4b` → `qwen3_4b`).
 fn sanitize(tag: &str) -> String {
     tag.chars()
@@ -1059,6 +1099,37 @@ mod tests {
         let model = entry.to_model(&local("reasoning"), Path::new("/models"), Path::new("/cfg"));
         assert_eq!(model.path, PathBuf::new(), "no directory means no local path");
         assert_eq!(model_dir(&model), None, "and nothing for a deletion to remove");
+    }
+
+    /// A verbatim closing chunk from a real `flm serve` log.
+    #[test]
+    fn per_request_timings_are_read_from_the_closing_chunk() {
+        let line = r#"ChatCompletionChunk: {"id":"chatcmpl-2c0e58d9ea2b7e21bd157485","object":"chat.completion.chunk","created":1785106964,"model":"qwen3.6-moe:35b-a3b","choices":[{"index":0,"delta":{"content":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":299,"completion_tokens":10,"total_tokens":309,"load_duration":11.668804608,"prefill_duration_ttft":7.53399552,"decoding_duration":0.965662,"prefill_speed_tps":39.68677698390774,"decoding_speed_tps":10.355590258289132}}"#;
+
+        let samples = parse_throughput(line);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].phase, Phase::Prefill);
+        assert_eq!(samples[0].tokens, 299);
+        assert_eq!(samples[1].phase, Phase::Decode);
+        assert_eq!(samples[1].tokens, 10);
+        // The counts over the durations reproduce the rates `flm` itself
+        // reports, which is why they are used instead of those rates.
+        assert!((samples[0].rate().unwrap() - 39.686_776_983_907_74).abs() < 1e-9);
+        assert!((samples[1].rate().unwrap() - 10.355_590_258_289_132).abs() < 1e-9);
+    }
+
+    /// Streaming emits a chunk per token; only the closing one carries usage.
+    #[test]
+    fn chunks_without_usage_are_not_measurements() {
+        for line in [
+            r#"ChatCompletionChunk: {"id":"x","choices":[{"delta":{"content":"hi"}}]}"#,
+            "ChatCompletionChunk: not json at all",
+            "[FLM]  Start prefill...",
+            "[FLM]  Prefill chunk 1/1 with 299 tokens",
+            "",
+        ] {
+            assert!(parse_throughput(line).is_empty(), "should not measure: {line}");
+        }
     }
 
     #[test]
