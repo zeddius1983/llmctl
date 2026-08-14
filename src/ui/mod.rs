@@ -496,10 +496,8 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
     ]);
     frame.render_widget(Paragraph::new(title), header);
 
-    // The session list carries seven columns now; the detail pane is a stack of
-    // short key/value rows and needs less.
     let [jobs, detail] =
-        Layout::horizontal([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(body);
+        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(body);
     let [sessions, downloads] =
         Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(jobs);
     render_session_list(frame, sessions, app);
