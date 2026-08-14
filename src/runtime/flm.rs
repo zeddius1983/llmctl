@@ -511,12 +511,19 @@ fn tag(model: &Model) -> String {
 /// repository alone, without its owner.
 pub fn model_dir(model: &Model) -> Option<PathBuf> {
     let flm = model.flm.as_ref()?;
-    Some(model_root().join(repo_dir_name(&flm.repo)))
+    let name = repo_dir_name(&flm.repo)?;
+    let dir = model_root().join(name);
+    // Never the root itself. `Entry::url` is `#[serde(default)]`, so a catalog
+    // row with a missing or unparseable URL yields an empty repository, and
+    // `join("")` on the root is the root — which a deletion would then remove
+    // recursively, taking every installed model with it.
+    (dir.parent() == Some(model_root().as_path())).then_some(dir)
 }
 
-/// The directory `flm` stores a repository under: its last path segment.
-fn repo_dir_name(repo: &str) -> &str {
-    repo.rsplit('/').next().unwrap_or(repo)
+/// The directory `flm` stores a repository under: its last path segment, or
+/// `None` when the repository does not name one.
+fn repo_dir_name(repo: &str) -> Option<&str> {
+    repo.rsplit('/').next().filter(|name| !name.is_empty() && *name != "." && *name != "..")
 }
 
 /// FastFlowLM's model root: `$FLM_MODEL_PATH`, else `~/.config/flm/models`.
@@ -724,7 +731,9 @@ impl Entry {
 
     fn to_model(&self, group: &[String], root: &Path, models_dir: &Path) -> Model {
         let repo = self.repo();
-        let dir = root.join(repo_dir_name(&repo));
+        // No usable directory name means no local path: a catalog row whose
+        // URL is missing must not resolve to the model root.
+        let dir = repo_dir_name(&repo).map(|name| root.join(name));
         let mut catalog_path = group.to_vec();
         catalog_path.push(self.name.clone());
         Model {
@@ -733,7 +742,7 @@ impl Entry {
             // Only an installed model has a local path; a catalog entry that
             // hasn't been pulled is still a real, launchable model (`flm serve`
             // downloads it), which is why `is_catalog_dir` also consults `flm`.
-            path: if self.installed { dir } else { PathBuf::new() },
+            path: if self.installed { dir.unwrap_or_default() } else { PathBuf::new() },
             shard_paths: Vec::new(),
             mtp_path: None,
             dflash_path: None,
@@ -1034,6 +1043,24 @@ mod tests {
 
     /// FastFlowLM is exclusive (one NPU hardware context) where llama.cpp is
     /// not — the distinction the launch guard rests on.
+    /// Regression: `Entry::url` is optional, so a catalog row without one has
+    /// an empty repository. `join("")` on the model root is the root, and the
+    /// deletion plan would have removed it recursively — every installed model.
+    #[test]
+    fn a_catalog_row_without_a_url_resolves_to_no_directory_at_all() {
+        assert_eq!(repo_dir_name("FastFlowLM/Qwen3-4B-NPU2"), Some("Qwen3-4B-NPU2"));
+        assert_eq!(repo_dir_name(""), None);
+        assert_eq!(repo_dir_name("owner/"), None);
+        assert_eq!(repo_dir_name(".."), None);
+
+        let mut entry = entries()[0].clone();
+        entry.url = String::new();
+        entry.installed = true;
+        let model = entry.to_model(&local("reasoning"), Path::new("/models"), Path::new("/cfg"));
+        assert_eq!(model.path, PathBuf::new(), "no directory means no local path");
+        assert_eq!(model_dir(&model), None, "and nothing for a deletion to remove");
+    }
+
     #[test]
     fn only_the_npu_runtime_is_single_session() {
         let flm = FlmBackend::discover(&FastFlowLmConfig::default());
@@ -1498,7 +1525,7 @@ mod tests {
         // The Hub needs the full id...
         assert_eq!(entry.repo(), "FastFlowLM/Qwen3-4B-NPU2");
         // ...while flm names the directory after the repository alone.
-        assert_eq!(repo_dir_name(&entry.repo()), "Qwen3-4B-NPU2");
+        assert_eq!(repo_dir_name(&entry.repo()), Some("Qwen3-4B-NPU2"));
         let model = entry.to_model(&local("reasoning"), Path::new("/models"), Path::new("/cfg"));
         assert_eq!(model.path, Path::new("/models/Qwen3-4B-NPU2"));
     }

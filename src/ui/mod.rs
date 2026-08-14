@@ -763,11 +763,17 @@ fn render_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm) {
     lines.push(Line::from("y / Enter delete · any other key cancel".dim().italic()));
 
     let longest = confirm.lines.iter().map(|line| line.chars().count()).max().unwrap_or(40);
-    // Never wider than the terminal: a long model name wraps instead.
-    let width = (longest as u16 + 4).clamp(44, area.width.saturating_sub(4).max(24));
+    // Never wider than the terminal: a long model name wraps instead. The
+    // preferred minimum yields to that ceiling rather than being clamped
+    // against it — `clamp` panics when its floor exceeds its ceiling, which a
+    // terminal under 48 columns would otherwise do on every `D`.
+    let ceiling = area.width.saturating_sub(4).max(1);
+    let width = (longest as u16 + 4).clamp(44.min(ceiling), ceiling);
     let inner = width.saturating_sub(4).max(1) as usize;
     let wrapped: usize =
-        confirm.lines.iter().map(|line| line.chars().count().div_ceil(inner) - 1).sum();
+        // `saturating_sub`: a blank spacer line occupies no rows beyond its
+        // own, and `0 - 1` would underflow.
+        confirm.lines.iter().map(|line| line.chars().count().div_ceil(inner).saturating_sub(1)).sum();
     let height = ((lines.len() + wrapped) as u16 + 2).min(area.height);
     let popup = center(area, Constraint::Length(width), Constraint::Length(height));
     let block = Block::default()
@@ -1030,6 +1036,27 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("Remove Muse-Glimmer-30B-UD")));
         assert!(rows.iter().any(|row| row.contains("disk?")), "the wrapped tail stays on screen");
         assert!(rows.iter().any(|row| row.contains("y / Enter delete")));
+    }
+
+    /// Regression: the preferred 44-column minimum was clamped against a
+    /// narrower ceiling, and `clamp` panics when its floor exceeds its ceiling
+    /// — so `D` in a terminal under 48 columns crashed llmctl.
+    #[test]
+    fn a_delete_confirmation_survives_a_very_narrow_terminal() {
+        let confirm = Confirm::preview(
+            "Delete model",
+            vec![
+                "Remove Muse-Glimmer-30B-UD-Q4_K_XL.gguf (15.1 GB) from disk?".into(),
+                String::new(),
+            ],
+        );
+        for width in [1_u16, 8, 20, 40, 47, 48] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 12)).unwrap();
+            terminal
+                .draw(|frame| render_confirm(frame, frame.area(), &confirm))
+                .unwrap_or_else(|err| panic!("{width} columns: {err}"));
+        }
     }
 
     #[test]

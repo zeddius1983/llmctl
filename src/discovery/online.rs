@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::discovery::hf;
 use crate::domain::{Model, RemoteBlob, RemoteModel};
-use crate::runtime::{Deletion, Husk, file_bytes, link_target};
+use crate::runtime::{Deletion, Husk, canonical, file_bytes, link_target};
 
 const API: &str = "https://huggingface.co/api/models";
 const SOURCE: [&str; 2] = ["online", "huggingface"];
@@ -926,8 +926,15 @@ fn deletion_in(hub: &Path, model: &Model, catalog: &[Model]) -> Option<Deletion>
     if !repo_dir.is_dir() {
         return None;
     }
-    let revision = remote.revision.as_deref().unwrap_or("main");
-    let snapshot = repo_dir.join("snapshots").join(revision);
+    // The revision *on disk*, not the one the last catalog refresh reported.
+    // `model.path` was resolved through `refs/main`, so after an upstream
+    // update the two diverge — and planning against the fresh metadata would
+    // either find nothing or delete a different revision's blob while leaving
+    // the file the user is looking at in place.
+    let revision = cached_revision(&repo_dir)
+        .or_else(|| remote.revision.clone())
+        .unwrap_or_else(|| "main".to_string());
+    let snapshot = repo_dir.join("snapshots").join(&revision);
 
     // Artifacts of the same repository that are themselves still cached. Their
     // files stay — including the projector and dFlash drafter this artifact
@@ -945,23 +952,37 @@ fn deletion_in(hub: &Path, model: &Model, catalog: &[Model]) -> Option<Deletion>
 
     let mut plan = Deletion::default();
     let mut prune: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
     for blob in &remote.blobs {
         if spoken_for.contains(blob.file.as_str()) {
             continue;
         }
         let link = snapshot.join(&blob.file);
-        // Both routes to the blob: the oid llmctl recorded, and whatever the
-        // link actually resolves to — a cache written by `huggingface_hub`
-        // rather than by llmctl is reached only by the latter.
+        // The link is authoritative about which blob this revision uses; the
+        // recorded oid may name a different one. A cache written by
+        // `huggingface_hub` rather than by llmctl is reachable only this way.
+        let linked = link_target(&link).map(|target| canonical(&target));
+
         let mut candidates = Vec::new();
         if let Some((incomplete, complete)) = cache_blob_paths_in(hub, &remote.repo, &blob.oid) {
-            candidates.push(complete);
+            // A `.downloadInProgress` file is scratch for this oid either way.
             candidates.push(incomplete);
+            if linked.is_none() {
+                // Nothing links the blob yet — an interrupted download leaves
+                // it addressable only by oid.
+                candidates.push(complete);
+            }
         }
-        candidates.extend(link_target(&link));
+        candidates.extend(linked);
         candidates.push(link.clone());
         for candidate in candidates {
-            if fs::symlink_metadata(&candidate).is_ok() && !plan.files.contains(&candidate) {
+            let Ok(meta) = fs::symlink_metadata(&candidate) else { continue };
+            // Deduplicate by the file itself, not by spelling: a relative
+            // `../../blobs/<oid>` link and the recorded blob path name one
+            // file, and counting it twice doubles the size the prompt quotes.
+            let identity =
+                if meta.is_symlink() { candidate.clone() } else { canonical(&candidate) };
+            if seen.insert(identity) {
                 plan.bytes += file_bytes(&candidate);
                 plan.files.push(candidate);
             }
@@ -996,6 +1017,14 @@ fn deletion_in(hub: &Path, model: &Model, catalog: &[Model]) -> Option<Deletion>
         });
     }
     Some(plan)
+}
+
+/// The revision the cache currently holds for a repository, from `refs/main` —
+/// the same pointer [`cached_file_in`] resolves a model's path through.
+fn cached_revision(repo_dir: &Path) -> Option<String> {
+    let revision = fs::read_to_string(repo_dir.join("refs/main")).ok()?;
+    let revision = revision.trim();
+    (!revision.is_empty()).then(|| revision.to_string())
 }
 
 /// The Hugging Face repository cache directory `path` lives in, if any.
@@ -1740,6 +1769,64 @@ mod tests {
         assert!(!blobs.join("aa".repeat(32)).exists());
         assert!(blobs.join("ff".repeat(32)).exists(), "the shared projector must survive");
         assert!(blobs.join("bb".repeat(32)).exists());
+        let _ = fs::remove_dir_all(hub);
+    }
+
+    /// Regression: the plan used the revision the last catalog refresh
+    /// reported, while the cached file is the one `refs/main` names. After an
+    /// upstream update those diverge, and the plan either found nothing or
+    /// deleted the new revision's blob while leaving the cached one behind.
+    #[test]
+    fn a_stale_catalog_revision_still_plans_against_what_is_cached() {
+        let hub = std::env::temp_dir().join(format!("llmctl-delete-stale-{}", now()));
+        let on_disk = ("model-Q4.gguf", &"aa".repeat(32)[..], 10);
+        fake_hub(&hub, "owner/repo", "abc", &[on_disk]);
+        // Upstream moved on: a new revision, and a new oid for the same name.
+        let repo_dir = hub.join("models--owner--repo");
+        let fresh_blob = repo_dir.join("blobs").join("cc".repeat(32));
+        fs::write(&fresh_blob, vec![0_u8; 99]).unwrap();
+
+        let mut model = artifact(&hub, "owner/repo", "model-Q4.gguf", &[on_disk]);
+        let remote = model.remote.as_mut().unwrap();
+        remote.revision = Some("def".into());
+        remote.blobs[0].oid = "cc".repeat(32);
+
+        let plan = deletion_in(&hub, &model, std::slice::from_ref(&model)).expect("a cached plan");
+        assert_eq!(plan.bytes, 10, "the cached revision's blob, not the fresh one");
+        assert!(
+            plan.files.contains(&repo_dir.join("blobs").join("aa".repeat(32))),
+            "{:?}",
+            plan.files
+        );
+        assert!(!plan.files.contains(&fresh_blob), "another revision's blob is not ours");
+        let _ = fs::remove_dir_all(hub);
+    }
+
+    /// Regression: `huggingface_hub` writes `../../blobs/<oid>` links, whose
+    /// lexical path differs from the recorded blob path even though both name
+    /// one file — so its bytes were counted twice and the prompt quoted double.
+    #[test]
+    fn a_relative_snapshot_link_and_its_blob_are_counted_once() {
+        let hub = std::env::temp_dir().join(format!("llmctl-delete-relative-{}", now()));
+        let oid = "aa".repeat(32);
+        let repo_dir = hub.join("models--owner--repo");
+        let snapshot = repo_dir.join("snapshots/abc");
+        fs::create_dir_all(repo_dir.join("blobs")).unwrap();
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(repo_dir.join("refs")).unwrap();
+        fs::write(repo_dir.join("refs/main"), "abc").unwrap();
+        fs::write(repo_dir.join("blobs").join(&oid), vec![0_u8; 1000]).unwrap();
+        std::os::unix::fs::symlink(
+            PathBuf::from("../../blobs").join(&oid),
+            snapshot.join("model-Q4.gguf"),
+        )
+        .unwrap();
+
+        let model = artifact(&hub, "owner/repo", "model-Q4.gguf", &[("model-Q4.gguf", &oid, 1000)]);
+        let plan = deletion_in(&hub, &model, std::slice::from_ref(&model)).expect("a cached plan");
+        assert_eq!(plan.bytes, 1000, "one file, counted once");
+        plan.execute().unwrap();
+        assert!(!hub.join("models--owner--repo").exists());
         let _ = fs::remove_dir_all(hub);
     }
 

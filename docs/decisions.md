@@ -640,6 +640,10 @@ Three storage shapes sit behind the one trait method:
   are found both by the oid llmctl recorded and by resolving the snapshot link,
   so a cache written by `huggingface_hub` is handled as well as llmctl's own.
 - **FastFlowLM** — the model directory `flm` gives each model, removed whole.
+  `model_dir` returns `None` unless the repository yields a real directory name
+  *under* the model root: `Entry::url` is optional, an absent one leaves the
+  repository empty, and `join("")` on the root is the root — which a recursive
+  removal would take out entirely.
 
 Two rules make the plan safe. **Shared companions survive:** a projector or
 dFlash drafter is paired with every quantization of its repository, so it is
@@ -659,7 +663,19 @@ server.
 A model reachable both by scanning and through the online catalog is one file
 under two catalog names, not two models: entries whose paths canonicalize to the
 same file are excluded from the share check, or a model would always look
-spoken-for by its own twin and nothing would ever be freed.
+spoken-for by its own twin and nothing would ever be freed. The same duplication
+is why an in-flight download is detected by the paths it is writing rather than
+by catalog id — a transfer runs under an `hf:*` id while its half-written blobs
+are also listed under a `models:*` one.
+
+Two rules keep the plan anchored to the filesystem rather than to metadata.
+The revision comes from the cache's own `refs/main`, not from the last catalog
+refresh: those diverge when a repository is updated upstream, and the fresh sha
+would name a snapshot that is not the one on disk. And a snapshot link, where
+one exists, decides which blob belongs to the artifact — the recorded oid may
+name a newer revision's. Candidates are deduplicated by canonicalized identity,
+since `../../blobs/<oid>` and the blob's own path are one file spelled two ways
+and counting both doubles the size the prompt quotes.
 
 **Consequences:** Removing a model is `D`, symmetric with `d` to download it,
 and reports what it freed. A runtime that adds local storage implements one

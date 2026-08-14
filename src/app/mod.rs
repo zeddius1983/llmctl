@@ -139,6 +139,23 @@ impl ModelDownload {
     pub fn percent(&self) -> u8 {
         transfer_percent(self.downloaded_bytes, self.total_bytes)
     }
+
+    /// The paths this transfer is writing, so a deletion can tell whether it
+    /// would remove files still being fetched — whatever the model is called
+    /// in the catalog the user is deleting from.
+    fn targets(&self) -> Vec<PathBuf> {
+        match &self.source {
+            DownloadSource::Hub(remote) => remote
+                .blobs
+                .iter()
+                .filter_map(|blob| discovery::online::cache_blob_paths(&remote.repo, &blob.oid))
+                .flat_map(|(incomplete, complete)| [incomplete, complete])
+                .collect(),
+            DownloadSource::Flm(model) => {
+                crate::runtime::flm::model_dir(model).into_iter().collect()
+            }
+        }
+    }
 }
 
 fn transfer_percent(downloaded_bytes: u64, total_bytes: u64) -> u8 {
@@ -2382,10 +2399,6 @@ impl App {
     /// exactly what gets unlinked.
     fn prompt_delete_model(&mut self) {
         let Some(model) = self.selected_model().cloned() else { return };
-        if let Some(blocker) = self.deletion_blocker(&model) {
-            self.message = Some(Message { title: "Cannot delete".into(), lines: vec![blocker] });
-            return;
-        }
         let Some(plan) = self.deletion_plan() else {
             self.message = Some(Message {
                 title: "Nothing to delete".into(),
@@ -2393,6 +2406,12 @@ impl App {
             });
             return;
         };
+        // Checked against the plan rather than the selection: the same files
+        // reach the catalog under more than one identity.
+        if let Some(blocker) = self.deletion_blocker(&model, &plan) {
+            self.message = Some(Message { title: "Cannot delete".into(), lines: vec![blocker] });
+            return;
+        }
 
         // One line: the model, and what removing it buys back. The paths are
         // llmctl's business, and the size is the only part the user weighs.
@@ -2406,19 +2425,26 @@ impl App {
 
     /// Why the selected model must not be deleted right now: something is using
     /// the very files the deletion would pull out from under it.
-    fn deletion_blocker(&self, model: &Model) -> Option<String> {
+    fn deletion_blocker(&self, model: &Model, plan: &Deletion) -> Option<String> {
         let runtime = self.runtimes.selected()?.descriptor().name.clone();
         if self.sessions.active_for_model(&runtime, &model.name).is_some() {
             return Some(format!("{} is serving a live session; stop it first.", model.name));
         }
-        if self.model_downloads.iter().any(|download| {
-            download.model_id == model.id
-                && matches!(
-                    download.status,
-                    ModelDownloadStatus::Downloading | ModelDownloadStatus::Cancelling
-                )
-        }) {
-            return Some(format!("{} is downloading; cancel it first.", model.name));
+        // Identity by id is not enough: a Hub artifact downloads under an
+        // `hf:*` id, and a rescan of the Hub cache lists the same partially
+        // materialized files again under a `models:*` one. Deleting through
+        // that twin would pull completed shards out from under the transfer,
+        // so ask what each is writing instead of what it is called.
+        let live = self.model_downloads.iter().filter(|download| {
+            matches!(
+                download.status,
+                ModelDownloadStatus::Downloading | ModelDownloadStatus::Cancelling
+            )
+        });
+        for download in live {
+            if download.model_id == model.id || plan.overlaps(&download.targets()) {
+                return Some(format!("{} is downloading; cancel it first.", download.model));
+            }
         }
         None
     }

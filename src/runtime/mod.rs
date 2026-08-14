@@ -105,6 +105,16 @@ impl Deletion {
         self.files.is_empty() && self.trees.is_empty()
     }
 
+    /// Whether executing this plan would touch any of `paths` — a file it would
+    /// unlink, or anything inside a tree it would remove. Compared by resolved
+    /// identity, so the same file under two spellings counts once.
+    pub fn overlaps(&self, paths: &[PathBuf]) -> bool {
+        paths.iter().map(|path| canonical(path)).any(|path| {
+            self.files.iter().any(|file| canonical(file) == path)
+                || self.trees.iter().any(|tree| path.starts_with(canonical(tree)))
+        })
+    }
+
     /// Unlink everything, then clear the directories that emptied out.
     ///
     /// An already-missing path is not an error: the plan is a snapshot, and
@@ -355,4 +365,42 @@ pub fn discover(config: &Config, paths: &Paths) -> Vec<Box<dyn RuntimeBackend>> 
         Box::new(LlamaCppBackend::discover(&config.runtime.llama_cpp, &paths.cache_dir)),
         Box::new(FlmBackend::discover(&config.runtime.fastflowlm)),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: an in-flight download was matched by catalog id alone, but
+    /// the same partially fetched blobs reach the catalog under a second id
+    /// once the Hub cache is scanned. Overlap is decided by what is on disk.
+    #[test]
+    fn a_plan_overlaps_a_transfer_writing_the_same_files() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("llmctl-overlaps-{nonce}"));
+        let blobs = root.join("blobs");
+        let tree = root.join("flm-model");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&tree).unwrap();
+        let blob = blobs.join("aa");
+        std::fs::write(&blob, b"x").unwrap();
+
+        let plan = Deletion {
+            files: vec![blob.clone()],
+            trees: vec![tree.clone()],
+            ..Deletion::default()
+        };
+        assert!(plan.overlaps(&[blob.clone()]));
+        // The same blob spelled with a traversal is the same file.
+        assert!(plan.overlaps(&[blobs.join("..").join("blobs").join("aa")]));
+        // Anything inside a tree the plan removes counts too.
+        assert!(plan.overlaps(&[tree.join("model.bin")]));
+        assert!(!plan.overlaps(&[blobs.join("bb")]));
+        assert!(!plan.overlaps(&[]));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
