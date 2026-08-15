@@ -659,7 +659,10 @@ below the snapshot, and every level between the two is llmctl's to clear: one
 left behind holds the snapshot open, which holds the repository open, and the
 husk never fires. Order matters for the same reason — `remove_dir` refuses a
 directory that still holds its child and nothing comes back to it — and the
-order blobs happen to be walked in is not it.
+order blobs happen to be walked in is not it. Both planners do this: the same
+cache is reached through the online catalog and through the directory scan, and
+a rule that held on only one route would depend on which name the user deleted
+the model under.
 
 Model **profiles are kept**. They are cheap YAML, and re-downloading a model the
 user had tuned should not cost them the tuning.
@@ -681,6 +684,15 @@ given, and a llama.cpp launch that fetches its own artifacts records the
 repo-relative filename it asked the Hub for. Both are non-empty and neither
 locates anything, so comparing them against an absolute plan matches nothing —
 which is a guard that waves every FastFlowLM and native-Hub session through.
+
+The name is a weak handle even where it is the only one, so a session's
+**download record** is read as identity too. A launch that fetches its own
+artifacts records where each blob is going, in absolute paths, and those are the
+files a deletion would take. The name cannot stand in for them: the online
+catalog calls a nested artifact `Q4/model.gguf` and the cache scanner that finds
+the same file afterwards calls it `model.gguf`, so a rescan hands the user a
+second name for a model already being served, and deleting through it would ask
+a question the name check was never posed.
 
 A model reachable both by scanning and through the online catalog is one file
 under two catalog names, not two models: entries naming the same file are

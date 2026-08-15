@@ -179,6 +179,23 @@ fn storage_path(record: &SessionRecord) -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
+/// The cache files a session's own transfer is writing.
+///
+/// A launch that fetches its own artifacts records where every blob is going,
+/// and those paths are absolute even where the process token is not. They are
+/// what identifies such a session's storage, because its *name* does not: the
+/// online catalog calls a nested artifact `Q4/model.gguf` and the scanner that
+/// finds the same file in the cache afterwards calls it `model.gguf`, so
+/// deleting through the second one would answer a question the first was asked.
+fn download_paths(record: &SessionRecord) -> Vec<PathBuf> {
+    record
+        .download
+        .iter()
+        .flat_map(|download| download.blobs.iter())
+        .flat_map(|blob| [blob.complete_file.clone(), blob.incomplete_file.clone()])
+        .collect()
+}
+
 fn download_percent(record: &SessionRecord) -> Option<u8> {
     download_record_percent(record.download.as_ref()?)
 }
@@ -376,7 +393,7 @@ impl SessionManager {
         })
     }
 
-    /// Model files the live sessions of `runtime` have open.
+    /// Model files the live sessions of `runtime` have open or are writing.
     ///
     /// Names are not enough to decide what is in use: one GGUF reaches the
     /// catalog under more than one entry, and a session records the name it was
@@ -385,7 +402,7 @@ impl SessionManager {
         self.sessions
             .iter()
             .filter(|s| !s.status.is_terminal() && s.record.runtime == runtime)
-            .filter_map(|s| storage_path(&s.record))
+            .flat_map(|s| storage_path(&s.record).into_iter().chain(download_paths(&s.record)))
             .collect()
     }
 
@@ -1204,6 +1221,23 @@ mod tests {
         // A stopped session holds nothing.
         mgr.sessions[1].status = SessionStatus::Stopped;
         assert!(!mgr.pathless_session_for("llama.cpp", "model.gguf"));
+
+        // What such a session is really holding is on its download record, in
+        // absolute paths — the identity its name cannot supply, since the
+        // online catalog and the cache scanner call the same artifact
+        // different things.
+        let mut fetching = record("fetching", "Q4/model.gguf");
+        fetching.download = Some(DownloadRecord {
+            blobs: vec![record::DownloadBlob {
+                incomplete_file: PathBuf::from("/hub/blobs/aa.incomplete"),
+                complete_file: PathBuf::from("/hub/blobs/aa"),
+                expected_bytes: 10,
+            }],
+        });
+        mgr.sessions.push(Session::new(fetching, SessionStatus::Downloading));
+        let paths = mgr.active_model_paths("llama.cpp");
+        assert!(paths.contains(&PathBuf::from("/hub/blobs/aa")), "{paths:?}");
+        assert!(paths.contains(&PathBuf::from("/hub/blobs/aa.incomplete")), "{paths:?}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

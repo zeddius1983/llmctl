@@ -852,11 +852,28 @@ fn local_deletion(model: &Model, catalog: &[Model]) -> Option<Deletion> {
     // A GGUF scanned out of the Hugging Face cache leaves that cache's
     // directories behind; clear the ones this model emptied.
     if let Some(repo_dir) = crate::discovery::online::hub_repo_dir(&identity) {
-        plan.prune = vec![repo_dir.join("blobs"), repo_dir.join("snapshots")];
-        plan.husk = Some(crate::runtime::Husk { empty_first: plan.prune.clone(), dir: repo_dir });
-        if let Some(snapshot) = model.path.parent() {
-            plan.prune.insert(0, snapshot.to_path_buf());
+        let snapshots = repo_dir.join("snapshots");
+        let blobs = repo_dir.join("blobs");
+        // Every directory between an unlinked snapshot file and `snapshots/`
+        // itself — a repository that files its quantizations away nests them,
+        // and one level left behind holds the snapshot open, and with it the
+        // repository. Pruning is a single pass, so the list is sorted deepest
+        // first rather than left in the order the files were planned.
+        let mut prune: Vec<PathBuf> = Vec::new();
+        for file in plan.files.iter().filter(|file| file.starts_with(&snapshots)) {
+            for ancestor in file.ancestors().skip(1).take_while(|dir| *dir != snapshots) {
+                let dir = ancestor.to_path_buf();
+                if !prune.contains(&dir) {
+                    prune.push(dir);
+                }
+            }
         }
+        prune.push(snapshots.clone());
+        prune.push(blobs.clone());
+        prune.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+        plan.prune = prune;
+        plan.husk =
+            Some(crate::runtime::Husk { empty_first: vec![blobs, snapshots], dir: repo_dir });
     }
 
     let leaf_link = model.catalog_dir.join("model.gguf");
@@ -1238,6 +1255,45 @@ mod tests {
         plan.execute().unwrap();
         assert!(!blob.exists(), "the blob must go");
         assert!(!repo.exists(), "an emptied repository cache is a husk");
+        let _ = std::fs::remove_dir_all(hub);
+    }
+
+    /// The same, for a repository that files its quantizations away in
+    /// subdirectories: a level left behind holds the snapshot open, and with it
+    /// the repository the husk check would have taken.
+    #[test]
+    fn a_nested_scanned_gguf_prunes_every_level_of_the_cache() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let hub = std::env::temp_dir().join(format!("llmctl-scanned-nested-{nonce}"));
+        let repo = hub.join("models--owner--repo");
+        let snapshot = repo.join("snapshots/abc");
+        let nested = snapshot.join("UD/Q4_K_XL");
+        std::fs::create_dir_all(repo.join("blobs")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        let blob = repo.join("blobs").join("aa".repeat(32));
+        std::fs::write(&blob, vec![0_u8; 2048]).unwrap();
+        let link = nested.join("model.gguf");
+        std::os::unix::fs::symlink(&blob, &link).unwrap();
+
+        // The scanner names it by filename alone, whatever it is nested under.
+        let scanned = Model {
+            id: "models:scanned".into(),
+            name: "model.gguf".into(),
+            path: link.clone(),
+            shard_paths: vec![link.clone()],
+            ..test_model()
+        };
+        let plan = local_deletion(&scanned, std::slice::from_ref(&scanned)).expect("a local plan");
+        assert!(plan.prune.contains(&snapshot.join("UD")), "{:?}", plan.prune);
+        assert!(plan.prune.contains(&snapshot), "{:?}", plan.prune);
+        let depths: Vec<usize> = plan.prune.iter().map(|dir| dir.components().count()).collect();
+        assert!(depths.windows(2).all(|pair| pair[0] >= pair[1]), "{:?}", plan.prune);
+
+        plan.execute().unwrap();
+        assert!(!repo.exists(), "a leftover directory kept the repository alive");
         let _ = std::fs::remove_dir_all(hub);
     }
 
