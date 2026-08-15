@@ -744,9 +744,11 @@ request *finishes*, so a long generation shows the previous request's rate until
 it completes. Session rows became columnar to carry the new fields — model,
 profile, port, size, backend, `tg`, `pp`, uptime — shedding the least useful
 first (size, backend, profile, `pp`, uptime) as the pane narrows, rather than
-right-to-left; the Detail pane always carries all of them. At the pane's 60% share the whole
-set wants a terminal around 180 columns wide; narrower than that the size goes
-first, which is the least missed.
+right-to-left; the Detail pane always carries all of them. Columns are separated
+by four spaces, enough that the eye reads the row as columns rather than one run
+of text. At the pane's 60% share that puts the whole set at a terminal around
+190 columns wide; narrower than that the size goes first, which is the least
+missed.
 
 Within a row, no column is ever omitted: a session with no measurement yet shows
 `tg --.-- t/s` and `pp --- t/s`, and a record with no size or backend shows a

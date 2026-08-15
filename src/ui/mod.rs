@@ -552,8 +552,10 @@ const RATE_FIGURE: usize = 5;
 /// Shown where a session has no value for a column — an older record with no
 /// size or backend, or a stopped session with no uptime.
 const MISSING: &str = "—";
-/// Gap between columns.
-const COL_GAP: usize = 2;
+/// Gap between columns. Wide enough that the eye reads the row as columns
+/// rather than as one run of text — the rate cells especially, which already
+/// carry a space inside them.
+const COL_GAP: usize = 4;
 /// Below this much room for the model name, a column is not worth its space.
 const MIN_NAME: usize = 12;
 
@@ -1408,10 +1410,10 @@ mod tests {
     /// The point of the columns: they line up regardless of name length.
     #[test]
     fn session_columns_align_across_rows() {
-        // A 160-column terminal, where every column fits. The last row has
-        // served nothing: a session without figures must still line up with one
-        // that has them, which is why no column is ever omitted.
-        let width = 108;
+        // A pane wide enough for every column. The last row has served
+        // nothing: a session without figures must still line up with one that
+        // has them, which is why no column is ever omitted.
+        let width = 120;
         let rows: Vec<String> = [("a", true), ("gpt-oss-20b-q8_0", true), ("fresh", false)]
             .iter()
             .map(|(name, rates)| row_text(&probe_session(name, *rates), width))
@@ -1437,7 +1439,7 @@ mod tests {
     /// The requested order, left to right.
     #[test]
     fn session_columns_are_in_the_documented_order() {
-        let row = row_text(&probe_session("gpt-oss-20b-q8_0", true), 108);
+        let row = row_text(&probe_session("gpt-oss-20b-q8_0", true), 120);
         let order = [
             "gpt-oss-20b-q8_0",
             "[inquisitor]",
@@ -1466,7 +1468,7 @@ mod tests {
             assert!(row.chars().count() <= width, "{width}: overflowed with {row:?}");
             row
         };
-        assert!(kept(108).contains("11.3 GB"), "everything fits on a wide pane");
+        assert!(kept(120).contains("11.3 GB"), "everything fits on a wide pane");
         // Narrower: the size and the backend go before the uptime does.
         let tight = kept(80);
         assert!(!tight.contains("11.3 GB") && !tight.contains("ROCm"), "{tight}");
@@ -1483,7 +1485,7 @@ mod tests {
     /// than nothing at all, so its row occupies the same columns as the others.
     #[test]
     fn a_session_with_no_requests_shows_placeholder_rates() {
-        let row = row_text(&probe_session("fresh", false), 108);
+        let row = row_text(&probe_session("fresh", false), 120);
         assert!(row.contains("tg --.-- t/s"), "{row}");
         assert!(row.contains("pp   --- t/s"), "{row}");
     }
@@ -1495,8 +1497,8 @@ mod tests {
         let mut session = probe_session("legacy", true);
         session.record.size_bytes = None;
         session.record.device = None;
-        let row = row_text(&session, 108);
-        let full = row_text(&probe_session("legacy", true), 108);
+        let row = row_text(&session, 120);
+        let full = row_text(&probe_session("legacy", true), 120);
         assert_eq!(row.chars().count(), full.chars().count(), "{row:?}");
         assert_eq!(row.matches('—').count(), 2, "one dash for each missing cell: {row}");
     }
