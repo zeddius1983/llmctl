@@ -260,6 +260,9 @@ noted here because the failure looks like one.
       · size · backend · tg · pp · uptime, shedding the least useful first on a
       narrow pane. Size and compute backend (ROCm/Vulkan/CUDA/NPU) are recorded
       at launch, since neither can be recovered from a running server.
+- [x] Sessions grouped under their runtime: the runtime's name heads its
+      sessions, indented beneath it. The manager keeps the list in that order so
+      the cursor moves down the pane the way it looks (ADR-016).
 
 ### Model storage management
 - [x] `D` in the Model pane removes the selected model from disk, behind a

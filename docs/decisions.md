@@ -774,6 +774,21 @@ of text. At the pane's 60% share that puts the whole set at a terminal around
 190 columns wide; narrower than that the size goes first, which is the least
 missed.
 
+Sessions are drawn **grouped under their runtime**: the runtime's name heads its
+sessions, which are indented under it. A flat list made every row carry a
+backend column to say what it was running under; the heading says it once for
+the group, and the shape answers "what have I got up on the NPU?" at a glance.
+
+The grouping is an ordering of the manager's list, not a rearrangement in the
+renderer. The cursor is an index into the sessions, and every action — stop,
+restart, log view — uses that index, so a displayed order that differed from the
+stored one would send the cursor jumping between groups on each keypress. The
+manager regroups on launch and on rediscovery, stably, so a group's launch order
+survives; the renderer only emits a heading wherever the runtime changes, which
+keeps it truthful about a list that arrived ungrouped instead of filing a
+session under the wrong name. Headings are rows the cursor never lands on, so
+the selected session's row is looked up rather than assumed.
+
 Within a row, no column is ever omitted: a session with no measurement yet shows
 `tg --.-- t/s` and `pp --- t/s`, and a record with no size or backend shows a
 dash. A cell that disappeared would shift every cell after it out of line with

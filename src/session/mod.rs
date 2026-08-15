@@ -260,6 +260,7 @@ impl SessionManager {
                 record.delete(&self.dir);
             }
         }
+        self.group_by_runtime();
     }
 
     /// Launch the already-built command in `req`, moving to a free port if the
@@ -301,8 +302,35 @@ impl SessionManager {
         } else {
             SessionStatus::Starting
         };
+        let launched = record.id.clone();
         self.sessions.push(Session::new(record, status));
-        Ok(self.sessions.len() - 1)
+        self.group_by_runtime();
+        Ok(self
+            .sessions
+            .iter()
+            .position(|session| session.record.id == launched)
+            .unwrap_or(self.sessions.len() - 1))
+    }
+
+    /// Order the list so each runtime's sessions sit together, the groups in the
+    /// order they first appeared and each group in launch order.
+    ///
+    /// The Session Manager heads every group with its runtime's name, and a list
+    /// whose stored order differs from its displayed one would send the cursor
+    /// jumping between groups on every keypress. Keeping the order here rather
+    /// than in the renderer means the index a row is drawn at is the index every
+    /// action uses.
+    fn group_by_runtime(&mut self) {
+        let mut order: Vec<String> = Vec::new();
+        for session in &self.sessions {
+            if !order.contains(&session.record.runtime) {
+                order.push(session.record.runtime.clone());
+            }
+        }
+        // Stable, so launch order survives inside each group.
+        self.sessions.sort_by_key(|session| {
+            order.iter().position(|runtime| *runtime == session.record.runtime).unwrap_or(0)
+        });
     }
 
     /// The first session of `runtime` that still holds its resources — anything
@@ -1066,6 +1094,44 @@ mod tests {
         assert!(errors[0].starts_with("broken:"), "{errors:?}");
         assert_eq!(mgr.sessions[0].status, SessionStatus::Crashed);
         assert!(mgr.poll_restarts().is_empty(), "a failed restart should not retry forever");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The Session Manager heads each runtime's sessions with its name, so the
+    /// list is kept grouped: each runtime's sessions contiguous, the groups in
+    /// the order they first appeared, launch order intact inside each.
+    #[test]
+    fn sessions_are_grouped_by_runtime_without_disturbing_launch_order() {
+        let base = std::env::temp_dir().join(format!("llmctl-grouping-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut mgr = SessionManager::new(base.join("sessions"), base.join("logs"));
+        let record = |id: &str, runtime: &str| SessionRecord {
+            id: id.into(),
+            name: id.into(),
+            runtime: runtime.into(),
+            model: "m".into(),
+            model_path: "m".into(),
+            profile: "Default".into(),
+            size_bytes: None,
+            device: None,
+            pid: -1,
+            host: "127.0.0.1".into(),
+            port: 18934,
+            command: Vec::new(),
+            health_path: "/health".into(),
+            log_file: base.join("s.log"),
+            download: None,
+            started_unix: 0,
+        };
+        for (id, runtime) in
+            [("a", "llama.cpp"), ("b", "FastFlowLM"), ("c", "llama.cpp"), ("d", "FastFlowLM")]
+        {
+            mgr.sessions.push(Session::new(record(id, runtime), SessionStatus::Running));
+        }
+
+        mgr.group_by_runtime();
+        let order: Vec<&str> = mgr.sessions.iter().map(|s| s.record.id.as_str()).collect();
+        assert_eq!(order, vec!["a", "c", "b", "d"]);
         let _ = std::fs::remove_dir_all(&base);
     }
 

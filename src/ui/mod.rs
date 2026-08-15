@@ -500,7 +500,14 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
         Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(body);
     let [sessions, downloads] =
         Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(jobs);
-    render_session_list(frame, sessions, app);
+    let focused = app.selected_server_session().is_some() || app.async_job_count() == 0;
+    render_session_list(
+        frame,
+        sessions,
+        &app.sessions.sessions,
+        app.session_sel.selected(),
+        focused,
+    );
     render_download_list(frame, downloads, app);
     render_session_detail(frame, detail, app);
 
@@ -703,14 +710,80 @@ fn truncate_right(text: &str, max: usize) -> String {
     text.chars().take(max - 1).collect::<String>() + "…"
 }
 
-fn render_session_list(frame: &mut Frame, area: Rect, app: &mut App) {
-    // Two columns of border, two of selection marker.
-    let width = area.width.saturating_sub(4) as usize;
-    let items: Vec<ListItem> =
-        app.sessions.sessions.iter().map(|s| ListItem::new(session_row(s, width))).collect();
-    let focused = app.selected_server_session().is_some() || app.async_job_count() == 0;
+/// How far a session sits in from the runtime heading above it.
+const SESSION_INDENT: usize = 2;
+
+/// One drawn row of the session list.
+#[derive(Debug, PartialEq)]
+enum SessionListRow<'a> {
+    /// A runtime's name, heading the sessions running under it. The cursor
+    /// never lands here: it indexes sessions, not rows.
+    Runtime(&'a str),
+    /// The session at this index in the manager's list.
+    Session(usize),
+}
+
+/// The session list as it is drawn: each runtime's name, then its sessions.
+///
+/// A heading is emitted wherever the runtime changes rather than being planned
+/// from a set of runtimes, so a list that somehow arrived ungrouped still draws
+/// truthfully — it repeats a heading instead of filing a session under the
+/// wrong runtime. [`SessionManager`](crate::session::SessionManager) keeps the
+/// list grouped so that does not arise.
+fn session_list_rows(sessions: &[Session]) -> Vec<SessionListRow<'_>> {
+    let mut rows = Vec::new();
+    let mut runtime: Option<&str> = None;
+    for (index, session) in sessions.iter().enumerate() {
+        if runtime != Some(session.record.runtime.as_str()) {
+            runtime = Some(&session.record.runtime);
+            rows.push(SessionListRow::Runtime(&session.record.runtime));
+        }
+        rows.push(SessionListRow::Session(index));
+    }
+    rows
+}
+
+/// The drawn rows, and the one the selected session landed on.
+fn session_items(
+    sessions: &[Session],
+    selected: Option<usize>,
+    width: usize,
+) -> (Vec<ListItem<'static>>, Option<usize>) {
+    let selected = selected.filter(|index| *index < sessions.len());
+    let rows = session_list_rows(sessions);
+    let selected_row = selected
+        .and_then(|index| rows.iter().position(|row| *row == SessionListRow::Session(index)));
+    let indent = " ".repeat(SESSION_INDENT);
+    let items = rows
+        .iter()
+        .map(|row| match row {
+            SessionListRow::Runtime(name) => ListItem::new(Line::from(Span::styled(
+                name.to_string(),
+                Style::default().fg(ACCENT).bold(),
+            ))),
+            SessionListRow::Session(index) => {
+                let mut spans = vec![Span::raw(indent.clone())];
+                spans.extend(session_row(&sessions[*index], width).spans);
+                ListItem::new(Line::from(spans))
+            }
+        })
+        .collect();
+    (items, selected_row)
+}
+
+fn render_session_list(
+    frame: &mut Frame,
+    area: Rect,
+    sessions: &[Session],
+    selected: Option<usize>,
+    focused: bool,
+) {
+    // Two columns of border, two of selection marker, and the indent that sets
+    // a session apart from the runtime heading it sits under.
+    let width = area.width.saturating_sub(4 + SESSION_INDENT as u16) as usize;
+    let (items, selected_row) = session_items(sessions, selected, width);
     let mut state = ListState::default();
-    state.select(app.session_sel.selected().filter(|index| *index < app.sessions.sessions.len()));
+    state.select(selected_row);
     let list = List::new(items)
         .block(pane_block("Sessions", focused))
         .highlight_style(Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD))
@@ -1403,6 +1476,76 @@ mod tests {
             crate::session::SessionStatus::Running,
             throughput,
         )
+    }
+
+    fn probe_session_of(runtime: &str, name: &str) -> crate::session::Session {
+        let mut session = probe_session(name, true);
+        session.record.runtime = runtime.into();
+        session
+    }
+
+    /// Each runtime is named once, with its sessions beneath it, and the
+    /// headings are rows the cursor's session indices have to be mapped past.
+    #[test]
+    fn sessions_are_drawn_under_their_runtime() {
+        use super::SessionListRow::{Runtime, Session};
+
+        let sessions = vec![
+            probe_session_of("llama.cpp", "muse-glimmer-30b-q8_0"),
+            probe_session_of("llama.cpp", "qwen3-8b-q4_k_m"),
+            probe_session_of("FastFlowLM", "gpt-oss-20b"),
+        ];
+        assert_eq!(
+            super::session_list_rows(&sessions),
+            vec![Runtime("llama.cpp"), Session(0), Session(1), Runtime("FastFlowLM"), Session(2),]
+        );
+
+        // An empty list heads nothing.
+        assert!(super::session_list_rows(&[]).is_empty());
+    }
+
+    /// The drawn pane: a heading at the left margin, its sessions stepped in
+    /// under it, and the cursor on the session it was pointed at rather than on
+    /// whatever row that index happens to be.
+    #[test]
+    fn the_session_pane_heads_each_group_and_indents_its_sessions() {
+        let sessions = vec![
+            probe_session_of("llama.cpp", "muse-glimmer-30b-q8_0"),
+            probe_session_of("FastFlowLM", "gpt-oss-20b"),
+        ];
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 8)).unwrap();
+        terminal
+            .draw(|frame| super::render_session_list(frame, frame.area(), &sessions, Some(1), true))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+
+        // Inside the border, the heading starts where the selection marker
+        // would; the session under it starts two further in.
+        let heading = rows.iter().position(|row| row.contains("llama.cpp")).expect("heading");
+        let session = rows.iter().position(|row| row.contains("muse-glimmer")).expect("session");
+        assert_eq!(session, heading + 1);
+        // In columns, not bytes: the border and the status glyph are multibyte.
+        let column = |row: &str, text: &str| row[..row.find(text).unwrap()].chars().count();
+        assert_eq!(
+            column(&rows[session], "muse-glimmer"),
+            column(&rows[heading], "llama.cpp") + super::SESSION_INDENT + 2, // + status glyph
+        );
+        // Both runtimes are named, each once.
+        assert_eq!(rows.iter().filter(|row| row.contains("llama.cpp")).count(), 1);
+        assert_eq!(rows.iter().filter(|row| row.contains("FastFlowLM")).count(), 1);
+        // The cursor is on the second session, three rows below the first
+        // heading — the row index the naive mapping would have got wrong.
+        assert!(rows[heading + 3].contains("▌"), "cursor row: {:?}", rows[heading + 3]);
     }
 
     fn row_text(session: &crate::session::Session, width: usize) -> String {
