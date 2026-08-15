@@ -183,6 +183,20 @@ pub(crate) fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Identity of a path *as a name*: the directory it sits in resolved, the final
+/// component left alone.
+///
+/// The difference from [`canonical`] matters in the Hugging Face cache, where
+/// two revisions' snapshot links are two names for one blob. Resolved they are
+/// the same file; as names they are not, and "is anything else still called
+/// this?" is the question that decides whether the blob may go.
+pub(crate) fn name_identity(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => canonical(parent).join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
 /// Total size of every regular file under `dir`.
 pub(crate) fn tree_bytes(dir: &Path) -> u64 {
     walkdir::WalkDir::new(dir)

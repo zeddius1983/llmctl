@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::discovery::hf;
 use crate::domain::{Model, RemoteBlob, RemoteModel};
-use crate::runtime::{Deletion, Husk, canonical, file_bytes, link_target};
+use crate::runtime::{Deletion, Husk, canonical, file_bytes, link_target, name_identity};
 
 const API: &str = "https://huggingface.co/api/models";
 const SOURCE: [&str; 2] = ["online", "huggingface"];
@@ -950,6 +950,17 @@ fn deletion_in(hub: &Path, model: &Model, catalog: &[Model]) -> Option<Deletion>
         .flat_map(|other| other.blobs.iter().map(|blob| blob.file.as_str()))
         .collect();
 
+    // The snapshot links this deletion removes. A blob is only free once
+    // nothing *outside* this set still names it — another revision cached in
+    // the same repository shares blobs with this one wherever the file did not
+    // change between them.
+    let our_links: Vec<PathBuf> = remote
+        .blobs
+        .iter()
+        .filter(|blob| !spoken_for.contains(blob.file.as_str()))
+        .map(|blob| snapshot.join(&blob.file))
+        .collect();
+
     let mut plan = Deletion::default();
     let mut prune: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -977,6 +988,11 @@ fn deletion_in(hub: &Path, model: &Model, catalog: &[Model]) -> Option<Deletion>
         candidates.push(link.clone());
         for candidate in candidates {
             let Ok(meta) = fs::symlink_metadata(&candidate) else { continue };
+            // The links go regardless; the blob behind them stays as long as
+            // another revision's snapshot still points at it.
+            if !meta.is_symlink() && blob_linked_elsewhere(&repo_dir, &candidate, &our_links) {
+                continue;
+            }
             // Deduplicate by the file itself, not by spelling: a relative
             // `../../blobs/<oid>` link and the recorded blob path name one
             // file, and counting it twice doubles the size the prompt quotes.
@@ -1043,6 +1059,25 @@ pub fn hub_repo_dir(path: &Path) -> Option<PathBuf> {
         })
         .find(|dir| dir.join("blobs").is_dir() && dir.join("snapshots").is_dir())
         .map(Path::to_path_buf)
+}
+
+/// Whether any snapshot link in `repo_dir` other than `ours` still resolves to
+/// `blob`.
+///
+/// `blobs/` is content-addressed, so one file backs every revision whose copy
+/// of it is byte-identical — a repository that bumps its README gets a second
+/// snapshot directory whose GGUF link points at the very same blob. Unlinking
+/// that blob to reclaim one artifact would leave the other snapshot dangling,
+/// so the blob only goes when nothing but this deletion's own links names it.
+pub fn blob_linked_elsewhere(repo_dir: &Path, blob: &Path, ours: &[PathBuf]) -> bool {
+    let blob = canonical(blob);
+    let ours: Vec<PathBuf> = ours.iter().map(|path| name_identity(path)).collect();
+    walkdir::WalkDir::new(repo_dir.join("snapshots"))
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path_is_symlink())
+        .filter(|entry| !ours.contains(&name_identity(entry.path())))
+        .any(|entry| link_target(entry.path()).is_some_and(|target| canonical(&target) == blob))
 }
 
 fn materialize_snapshot_file(remote: &RemoteModel, file: &str, blob: &Path) -> Result<PathBuf> {
@@ -1769,6 +1804,35 @@ mod tests {
         assert!(!blobs.join("aa".repeat(32)).exists());
         assert!(blobs.join("ff".repeat(32)).exists(), "the shared projector must survive");
         assert!(blobs.join("bb".repeat(32)).exists());
+        let _ = fs::remove_dir_all(hub);
+    }
+
+    /// Blobs are content-addressed and shared between revisions: a repository
+    /// that changed only its README leaves two snapshots pointing at one GGUF.
+    /// Deleting through the current revision may take its link, but not the
+    /// blob the older snapshot still names.
+    #[test]
+    fn a_blob_an_older_snapshot_still_links_survives() {
+        let hub = std::env::temp_dir().join(format!("llmctl-delete-revisions-{}", now()));
+        let q4 = ("model-Q4.gguf", &"aa".repeat(32)[..], 10);
+        fake_hub(&hub, "owner/repo", "abc", &[q4]);
+        // An earlier revision whose copy of the file was byte-identical, so the
+        // Hub cache gave both snapshots the same blob.
+        let repo_dir = hub.join("models--owner--repo");
+        let older = repo_dir.join("snapshots/old");
+        fs::create_dir_all(&older).unwrap();
+        let blob = repo_dir.join("blobs").join("aa".repeat(32));
+        std::os::unix::fs::symlink(&blob, older.join("model-Q4.gguf")).unwrap();
+
+        let model = artifact(&hub, "owner/repo", "model-Q4.gguf", &[q4]);
+        let plan = deletion_in(&hub, &model, std::slice::from_ref(&model)).expect("a cached plan");
+        assert!(!plan.files.contains(&blob), "the shared blob is not this plan's to remove");
+        assert_eq!(plan.bytes, 0, "unlinking a name frees nothing while the file is still named");
+
+        plan.execute().unwrap();
+        assert!(blob.exists(), "the older snapshot must not be left dangling");
+        assert!(older.join("model-Q4.gguf").exists());
+        assert!(!repo_dir.join("snapshots/abc/model-Q4.gguf").exists(), "our own link goes");
         let _ = fs::remove_dir_all(hub);
     }
 

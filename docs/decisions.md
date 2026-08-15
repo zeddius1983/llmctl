@@ -658,15 +658,25 @@ user had tuned should not cost them the tuning.
 
 A live session serving the model, or an in-flight download of it, blocks the
 deletion with a message rather than pulling files out from under a running
-server.
+server. Both are detected by the *files* involved — the session's recorded
+`model_path`, the transfer's target blobs — and not only by name or catalog id,
+because the same GGUF reaches the catalog under more than one entry and a
+name-only check is bypassed by deleting through the other one.
 
 A model reachable both by scanning and through the online catalog is one file
-under two catalog names, not two models: entries whose paths canonicalize to the
-same file are excluded from the share check, or a model would always look
-spoken-for by its own twin and nothing would ever be freed. The same duplication
-is why an in-flight download is detected by the paths it is writing rather than
-by catalog id — a transfer runs under an `hf:*` id while its half-written blobs
-are also listed under a `models:*` one.
+under two catalog names, not two models: entries naming the same file are
+excluded from the share check, or a model would always look spoken-for by its
+own twin and nothing would ever be freed. That comparison is by *name* —
+the directory resolved, the final component left alone — not by resolved
+target. Two snapshot links onto one blob resolve alike but are two artifacts,
+and treating the second as a twin would free the blob out from under it.
+
+Blobs shared **between revisions** get the same protection from the other
+direction: `blobs/` is content-addressed, so a repository that changed only its
+README leaves two snapshots pointing at one GGUF. Before a blob is scheduled for
+removal the repository's snapshot tree is checked for any link, other than the
+plan's own, that resolves to it; if one exists the plan takes its link and
+leaves the file. The freed figure then reads 0 B, which is the truth.
 
 Two rules keep the plan anchored to the filesystem rather than to metadata.
 The revision comes from the cache's own `refs/main`, not from the last catalog
@@ -676,6 +686,11 @@ one exists, decides which blob belongs to the artifact — the recorded oid may
 name a newer revision's. Candidates are deduplicated by canonicalized identity,
 since `../../blobs/<oid>` and the blob's own path are one file spelled two ways
 and counting both doubles the size the prompt quotes.
+
+A completed download job whose files the deletion removes is dropped from the
+Session Manager along with them. A finished transfer is not resumable, so
+leaving it listed would make `d` on that model jump to the stale job instead of
+downloading it again.
 
 **Consequences:** Removing a model is `D`, symmetric with `d` to download it,
 and reports what it freed. A runtime that adds local storage implements one

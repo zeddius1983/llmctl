@@ -322,6 +322,20 @@ impl SessionManager {
         })
     }
 
+    /// Model files the live sessions of `runtime` have loaded.
+    ///
+    /// Names are not enough to decide what is in use: one GGUF reaches the
+    /// catalog under more than one entry, and a session records the name it was
+    /// launched under. The file it opened is the same either way.
+    pub fn active_model_paths(&self, runtime: &str) -> Vec<PathBuf> {
+        self.sessions
+            .iter()
+            .filter(|s| !s.status.is_terminal() && s.record.runtime == runtime)
+            .filter(|s| !s.record.model_path.is_empty())
+            .map(|s| PathBuf::from(&s.record.model_path))
+            .collect()
+    }
+
     /// The live pid that actually backs a session, re-acquiring the real server
     /// if a launcher wrapper re-exec'd or daemonized it under a different pid
     /// (and possibly its own session). Persists the record when the pid changes.

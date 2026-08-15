@@ -12,6 +12,7 @@ use crate::profiles::registry::{DEFAULT, OptionKind, OptionSchema, OptionSpec};
 use crate::profiles::templates::Template;
 use crate::runtime::{
     CatalogCtx, Deletion, LaunchContext, RuntimeBackend, canonical, file_bytes, link_target,
+    name_identity,
 };
 use crate::session::command::Command;
 use crate::session::record::{DownloadBlob, DownloadRecord};
@@ -795,25 +796,42 @@ fn local_deletion(model: &Model, catalog: &[Model]) -> Option<Deletion> {
     }
     // Paths held by any *other* model. The Hugging Face cache is one of the
     // directories llmctl scans, so the same GGUF can also be in the catalog as
-    // an online artifact; that twin is the same file under another name, not
-    // another model laying claim to it.
+    // an online artifact; that twin is the same file under the same name, not
+    // another model laying claim to it. Compared as names rather than resolved:
+    // two snapshot links onto one blob resolve alike but are two artifacts, and
+    // the other one still needs its blob.
     let identity = canonical(&model.path);
+    let self_name = name_identity(&model.path);
     let claimed: Vec<PathBuf> = catalog
         .iter()
         .filter(|other| {
             !other.path.as_os_str().is_empty()
                 && other.id != model.id
-                && canonical(&other.path) != identity
+                && name_identity(&other.path) != self_name
         })
         .flat_map(occupied_paths)
         .collect();
 
+    // A GGUF scanned out of the Hub cache is a link into `blobs/`, and that
+    // blob may be named by revisions this catalog never listed.
+    let repo_dir = crate::discovery::online::hub_repo_dir(&identity);
+    let paths = occupied_paths(model);
+    let own_links: Vec<PathBuf> = paths
+        .iter()
+        .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()))
+        .cloned()
+        .collect();
+
     let mut plan = Deletion::default();
-    for path in occupied_paths(model) {
-        if std::fs::symlink_metadata(&path).is_err() || plan.files.contains(&path) {
+    for path in paths {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        if plan.files.contains(&path) || claimed.contains(&path) {
             continue;
         }
-        if claimed.contains(&path) {
+        if !meta.is_symlink()
+            && let Some(repo_dir) = &repo_dir
+            && crate::discovery::online::blob_linked_elsewhere(repo_dir, &path, &own_links)
+        {
             continue;
         }
         plan.bytes += file_bytes(&path);
@@ -1212,6 +1230,42 @@ mod tests {
         plan.execute().unwrap();
         assert!(!blob.exists(), "the blob must go");
         assert!(!repo.exists(), "an emptied repository cache is a husk");
+        let _ = std::fs::remove_dir_all(hub);
+    }
+
+    /// A second snapshot naming the same blob is another artifact, not the
+    /// twin: its link resolves alike, but the file has to stay for it.
+    #[test]
+    fn a_blob_a_second_snapshot_link_names_survives_a_scanned_deletion() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let hub = std::env::temp_dir().join(format!("llmctl-scanned-shared-{nonce}"));
+        let repo = hub.join("models--owner--repo");
+        std::fs::create_dir_all(repo.join("blobs")).unwrap();
+        std::fs::create_dir_all(repo.join("snapshots/abc")).unwrap();
+        std::fs::create_dir_all(repo.join("snapshots/old")).unwrap();
+        let blob = repo.join("blobs").join("aa".repeat(32));
+        std::fs::write(&blob, vec![0_u8; 4096]).unwrap();
+        let link = repo.join("snapshots/abc/model-Q4.gguf");
+        let older = repo.join("snapshots/old/model-Q4.gguf");
+        std::os::unix::fs::symlink(&blob, &link).unwrap();
+        std::os::unix::fs::symlink(&blob, &older).unwrap();
+
+        let scanned = Model {
+            id: "models:scanned".into(),
+            name: "model-Q4.gguf".into(),
+            path: link.clone(),
+            shard_paths: vec![link.clone()],
+            ..test_model()
+        };
+        let plan = local_deletion(&scanned, std::slice::from_ref(&scanned)).expect("a local plan");
+        assert_eq!(plan.bytes, 0, "nothing is freed while the older snapshot names the blob");
+        assert!(plan.files.contains(&link) && !plan.files.contains(&blob));
+
+        plan.execute().unwrap();
+        assert!(blob.exists() && older.exists(), "the other snapshot must not dangle");
         let _ = std::fs::remove_dir_all(hub);
     }
 

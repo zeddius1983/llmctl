@@ -830,6 +830,10 @@ fn session_detail_lines(session: &Session) -> Text<'static> {
     let uptime = session.uptime_secs().map(format_uptime).unwrap_or_else(|| "—".into());
     let mem = session.rss_bytes.map(human_size).unwrap_or_else(|| "—".into());
     let cpu = session.cpu_percent.map(|c| format!("{c:.0}%")).unwrap_or_else(|| "—".into());
+    // The row sheds these two first when the pane narrows, so Detail is where
+    // they have to remain readable.
+    let size = r.size_bytes.map(human_size).unwrap_or_else(|| "—".into());
+    let device = r.device.clone().unwrap_or_else(|| "—".into());
 
     Text::from(vec![
         Line::from(r.name.clone().bold().fg(ACCENT)),
@@ -844,6 +848,8 @@ fn session_detail_lines(session: &Session) -> Text<'static> {
         kv("Runtime", &r.runtime),
         kv("Model", &r.model),
         kv("Profile", &r.profile),
+        kv("Size", &size),
+        kv("Backend", &device),
         Line::raw(""),
         kv("PID", &r.pid.to_string()),
         kv("Port", &r.port.to_string()),

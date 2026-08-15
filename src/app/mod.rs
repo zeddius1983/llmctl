@@ -2429,7 +2429,12 @@ impl App {
     /// the very files the deletion would pull out from under it.
     fn deletion_blocker(&self, model: &Model, plan: &Deletion) -> Option<String> {
         let runtime = self.runtimes.selected()?.descriptor().name.clone();
-        if self.sessions.active_for_model(&runtime, &model.name).is_some() {
+        // By name *and* by file: a session records the catalog name it was
+        // launched under, so deleting the same GGUF through its other entry
+        // would sail past a name-only check and unlink a model being served.
+        if self.sessions.active_for_model(&runtime, &model.name).is_some()
+            || plan.overlaps(&self.sessions.active_model_paths(&runtime))
+        {
             return Some(format!("{} is serving a live session; stop it first.", model.name));
         }
         // Identity by id is not enough: a Hub artifact downloads under an
@@ -2459,7 +2464,27 @@ impl App {
 
     fn delete_model(&mut self, model: &str, plan: Deletion) {
         let freed = human_size(plan.bytes);
+        // Finished transfers this deletion invalidates, resolved *before* the
+        // files go. A completed job is not resumable, so leaving it in the list
+        // would make `d` on the model jump to it and do nothing instead of
+        // downloading it again.
+        let stale: Vec<(u64, String)> = self
+            .model_downloads
+            .iter()
+            .filter(|download| matches!(download.status, ModelDownloadStatus::Downloaded(_)))
+            .filter(|download| plan.overlaps(&download.targets()))
+            .map(|download| (download.id, download.model_id.clone()))
+            .collect();
         let result = plan.execute();
+        if result.is_ok() {
+            for (id, model_id) in &stale {
+                // Best-effort: a record left behind reappears as a resumable
+                // job, which is a nuisance rather than a hazard.
+                let _ = discovery::online::delete_download_record(&self.models_dir, model_id);
+                self.model_downloads.retain(|download| download.id != *id);
+            }
+            self.sync_session_selection();
+        }
         self.reload_catalog_in_place();
         self.message = Some(match result {
             Ok(()) => Message {
