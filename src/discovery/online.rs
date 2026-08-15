@@ -926,12 +926,22 @@ fn deletion_in(hub: &Path, model: &Model, catalog: &[Model]) -> Option<Deletion>
     if !repo_dir.is_dir() {
         return None;
     }
-    // The revision *on disk*, not the one the last catalog refresh reported.
-    // `model.path` was resolved through `refs/main`, so after an upstream
-    // update the two diverge — and planning against the fresh metadata would
-    // either find nothing or delete a different revision's blob while leaving
-    // the file the user is looking at in place.
-    let revision = cached_revision(&repo_dir)
+    // The revision holding the file the user selected, in order of how directly
+    // each source knows it.
+    //
+    // `model.path` is the strongest: it is a snapshot the artifact was actually
+    // found in, so it names the revision the browser is showing. `refs/main`
+    // comes next, because it is at least on disk — the catalog's own revision
+    // is a sha the Hub reported, and after an upstream update it names a
+    // snapshot that was never fetched.
+    //
+    // The order matters in both directions. `refs/main` moves whenever anything
+    // pulls a newer revision — `huggingface-cli`, or a `-hf` launch — and it
+    // moves without the browser noticing, so planning against it after the
+    // catalog was loaded would delete the *new* revision's files and leave the
+    // selected model where it was.
+    let revision = revision_of(&repo_dir, &model.path)
+        .or_else(|| cached_revision(&repo_dir))
         .or_else(|| remote.revision.clone())
         .unwrap_or_else(|| "main".to_string());
     let snapshot = repo_dir.join("snapshots").join(&revision);
@@ -1055,6 +1065,20 @@ fn deletion_in(hub: &Path, model: &Model, catalog: &[Model]) -> Option<Deletion>
         });
     }
     Some(plan)
+}
+
+/// The revision a cached path sits under: the directory immediately below
+/// `<repo>/snapshots/`.
+///
+/// `None` for a path outside this repository's snapshots — an empty one, from
+/// an artifact that is not cached at all, or a GGUF scanned from a plain model
+/// directory that happens to carry the same remote metadata.
+fn revision_of(repo_dir: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(repo_dir.join("snapshots")).ok()?;
+    let revision = relative.components().next()?.as_os_str().to_str()?;
+    // The revision alone is not a file: `snapshots/<rev>` with nothing under it
+    // is not a path any artifact was found at.
+    (relative != Path::new(revision)).then(|| revision.to_string())
 }
 
 /// The revision the cache currently holds for a repository, from `refs/main` —
@@ -1952,6 +1976,39 @@ mod tests {
             plan.files
         );
         assert!(!plan.files.contains(&fresh_blob), "another revision's blob is not ours");
+        let _ = fs::remove_dir_all(hub);
+    }
+
+    /// Regression: `refs/main` was the first source for the revision, and it
+    /// moves whenever anything pulls a newer one — `huggingface-cli`, or a
+    /// `-hf` launch — without the browser noticing. `D` on the artifact the
+    /// user is looking at then deleted the *new* revision's files and left the
+    /// selected one exactly where it was.
+    #[test]
+    fn deleting_takes_the_revision_the_selected_artifact_lives_in() {
+        let hub = std::env::temp_dir().join(format!("llmctl-delete-moved-ref-{}", now()));
+        let old = ("model-Q4.gguf", &"aa".repeat(32)[..], 10);
+        fake_hub(&hub, "owner/repo", "abc", &[old]);
+        // The model the catalog found, in the revision it found it in.
+        let model = artifact(&hub, "owner/repo", "model-Q4.gguf", &[old]);
+
+        // Something else then fetched a newer revision, moving `refs/main`.
+        let repo_dir = hub.join("models--owner--repo");
+        let fresh = ("model-Q4.gguf", &"cc".repeat(32)[..], 99);
+        fake_hub(&hub, "owner/repo", "def", &[fresh]);
+        assert_eq!(fs::read_to_string(repo_dir.join("refs/main")).unwrap(), "def");
+
+        let plan = deletion_in(&hub, &model, std::slice::from_ref(&model)).expect("a cached plan");
+        assert_eq!(plan.bytes, 10, "the selected revision's blob, not the newer one");
+        plan.execute().unwrap();
+
+        let blobs = repo_dir.join("blobs");
+        assert!(!blobs.join("aa".repeat(32)).exists(), "the selected artifact is what goes");
+        assert!(
+            repo_dir.join("snapshots/def/model-Q4.gguf").exists(),
+            "the revision fetched since must be untouched"
+        );
+        assert!(blobs.join("cc".repeat(32)).exists());
         let _ = fs::remove_dir_all(hub);
     }
 

@@ -619,8 +619,10 @@ the exact paths and the bytes they occupy — which the app confirms before
 anything is unlinked. `y`/Enter proceeds; every other key cancels, unlike the
 message overlay that any key dismisses. Assent is a key, not a key *code*:
 crossterm spells Ctrl+Y as `Char('y')` with a modifier flag, so a chord that
-merely contains the confirm key backs out like anything else, Shift excepted
-because that is how `Y` arrives at all. What executes is the plan the user
+merely contains the confirm key backs out like anything else. Shift is
+tolerated on the letter, because that is how `Y` arrives at all, and not on
+Enter — a terminal in enhanced-keyboard mode reports Shift+Enter distinctly,
+and that is a chord the user pressed meaning something else. What executes is the plan the user
 agreed to, not a recomputation.
 
 The prompt is one line — `Remove <model> (<size>) from disk?`. The plan's paths
@@ -740,9 +742,16 @@ rather than downloading: there is no byte left to fetch, and a transfer with no
 work in it would appear to do nothing at all.
 
 Two rules keep the plan anchored to the filesystem rather than to metadata.
-The revision comes from the cache's own `refs/main`, not from the last catalog
-refresh: those diverge when a repository is updated upstream, and the fresh sha
-would name a snapshot that is not the one on disk. And a snapshot link, where
+The revision is the one holding the file the user selected — the directory
+`model.path` sits in under `snapshots/` — falling back to the cache's own
+`refs/main` and only then to the catalog's sha. Each step down is a step
+further from the artifact on screen. The catalog's sha is what the Hub reported
+at the last refresh, and after an upstream update it names a snapshot that was
+never fetched. `refs/main` is at least on disk, but it moves whenever anything
+pulls a newer revision — `huggingface-cli`, or a `-hf` launch — and it moves
+without the browser noticing, so planning against it would delete the *new*
+revision's files and leave the selected model exactly where it was. And a
+snapshot link, where
 one exists, decides which blob belongs to the artifact — the recorded oid may
 name a newer revision's. Candidates are deduplicated by canonicalized identity,
 since `../../blobs/<oid>` and the blob's own path are one file spelled two ways
@@ -861,7 +870,17 @@ distinction only shows up on text the user supplies — a profile name is typed
 into a prompt — but a CJK or emoji glyph occupies two columns, so ten of them
 pass a ten-character limit and then draw at twice the width of the field
 reserved for them, taking every column after it out of line with the rows above
-and below.
+and below. The modal dialogs are sized the same way, since ratatui wraps in
+columns too: a question measured in `char`s gets half the rows it needs, and
+what falls off the bottom of a delete confirmation is the footer naming the two
+answers.
+
+Padding a fixed field cannot shrink what it is handed, so the *formatter* owes
+the layout its bound: `format_rate` is documented and tested never to exceed
+the five columns the rate cell reserves. Two values used to escape it — a rate
+just under a hundred, which `{:.2}` rounds up to `100.00`, and a prefill rate
+past five digits, which small models reach — and either shifted every column
+after it.
 
 The size and compute backend shown per session are recorded at launch
 (`SessionRecord::size_bytes` and `device`), because neither can be recovered

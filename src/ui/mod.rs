@@ -555,8 +555,9 @@ const COL_DEVICE: usize = 6; // "Vulkan"
 const COL_RATE: usize = 12; // "tg 67.73 t/s"
 const COL_UPTIME: usize = 8; // "2h 34m"; four-digit hours push the row, not wrap it
 /// Width of the numeric field inside a rate cell, so `67.73` and `1425` line
-/// their digits up against each other.
-const RATE_FIGURE: usize = 5;
+/// their digits up against each other. Taken from the formatter, which
+/// guarantees no figure exceeds it — padding cannot shrink an oversized one.
+const RATE_FIGURE: usize = crate::session::throughput::RATE_WIDTH;
 /// Shown where a session has no value for a column — an older record with no
 /// size or backend, or a stopped session with no uptime.
 const MISSING: &str = "—";
@@ -1026,9 +1027,8 @@ fn render_message(frame: &mut Frame, area: Rect, message: &Message) {
     lines.push(Line::raw(""));
     lines.push(Line::from("press any key to dismiss".dim().italic()));
 
-    let width = message.lines.iter().map(|l| l.chars().count()).max().unwrap_or(20).clamp(24, 88)
-        as u16
-        + 4;
+    let width =
+        message.lines.iter().map(|l| l.width()).max().unwrap_or(20).clamp(24, 88) as u16 + 4;
     let height = lines.len() as u16 + 2;
     let popup = center(area, Constraint::Length(width), Constraint::Length(height));
     let block = Block::default()
@@ -1049,7 +1049,11 @@ fn render_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm) {
     lines.push(Line::raw(""));
     lines.push(Line::from("y / Enter delete · any other key cancel".dim().italic()));
 
-    let longest = confirm.lines.iter().map(|line| line.chars().count()).max().unwrap_or(40);
+    // Terminal columns throughout, as ratatui's own wrapping measures them: a
+    // model name in CJK is twice as wide as it is long, and counting `char`s
+    // would size the popup to half the rows the question actually takes —
+    // cutting off its tail, or the footer naming the two answers.
+    let longest = confirm.lines.iter().map(|line| line.width()).max().unwrap_or(40);
     // Never wider than the terminal: a long model name wraps instead. The
     // preferred minimum yields to that ceiling rather than being clamped
     // against it — `clamp` panics when its floor exceeds its ceiling, which a
@@ -1060,7 +1064,7 @@ fn render_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm) {
     let wrapped: usize =
         // `saturating_sub`: a blank spacer line occupies no rows beyond its
         // own, and `0 - 1` would underflow.
-        confirm.lines.iter().map(|line| line.chars().count().div_ceil(inner).saturating_sub(1)).sum();
+        confirm.lines.iter().map(|line| line.width().div_ceil(inner).saturating_sub(1)).sum();
     let height = ((lines.len() + wrapped) as u16 + 2).min(area.height);
     let popup = center(area, Constraint::Length(width), Constraint::Length(height));
     let block = Block::default()
@@ -1344,6 +1348,35 @@ mod tests {
                 .draw(|frame| render_confirm(frame, frame.area(), &confirm))
                 .unwrap_or_else(|err| panic!("{width} columns: {err}"));
         }
+    }
+
+    /// Regression: the popup was sized in `char`s while ratatui wraps in
+    /// terminal columns, so a model name in CJK took twice the rows the height
+    /// allowed for — and the footer naming the two answers fell off the bottom
+    /// of the one dialog where knowing the answers matters.
+    #[test]
+    fn a_confirmation_leaves_room_for_a_question_in_wide_characters() {
+        let confirm = Confirm::preview(
+            "Delete model",
+            vec!["移除 通義千問-32B-指令-深度思考-Q4_K_XL.gguf (15.1 GB) 從磁碟?".into()],
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|frame| render_confirm(frame, frame.area(), &confirm)).unwrap();
+
+        let rows: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(60)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let screen = rows.join("\n");
+        // A wide glyph occupies two cells, the second of which holds nothing —
+        // so the tail of the question is looked for with the gaps taken out.
+        let dense: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(screen.contains("y / Enter delete"), "the footer was cut off:\n{screen}");
+        assert!(dense.contains("從磁碟?"), "the question was cut off:\n{screen}");
     }
 
     #[test]

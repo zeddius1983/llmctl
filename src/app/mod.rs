@@ -163,11 +163,20 @@ impl ModelDownload {
 /// The dialog promises that `y` or Enter deletes and every other key backs out,
 /// so the key code alone will not do: crossterm spells Ctrl+Y as `Char('y')`
 /// with a modifier flag set, and a chord that merely contains the confirm key
-/// is not the key. Shift is the one modifier allowed through, because that is
-/// how `Y` arrives at all.
+/// is not the key.
+///
+/// Shift is tolerated on the letter alone, because that is how `Y` arrives at
+/// all. It is not tolerated on Enter: a terminal in enhanced-keyboard mode
+/// reports Shift+Enter distinctly, and that is a chord the user meant as
+/// something else.
 fn is_assent(key: KeyEvent) -> bool {
-    key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
-        && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter)
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+        }
+        KeyCode::Enter => key.modifiers.is_empty(),
+        _ => false,
+    }
 }
 
 fn transfer_percent(downloaded_bytes: u64, total_bytes: u64) -> u8 {
@@ -3377,6 +3386,9 @@ mod tests {
         assert!(!is_assent(key(KeyCode::Char('Y'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)));
         assert!(!is_assent(key(KeyCode::Char('y'), KeyModifiers::ALT)));
         assert!(!is_assent(key(KeyCode::Enter, KeyModifiers::CONTROL)));
+        // A terminal in enhanced-keyboard mode reports Shift+Enter distinctly,
+        // and it is a chord the user pressed meaning something else.
+        assert!(!is_assent(key(KeyCode::Enter, KeyModifiers::SHIFT)));
         assert!(!is_assent(key(KeyCode::Char('n'), KeyModifiers::NONE)));
         assert!(!is_assent(key(KeyCode::Esc, KeyModifiers::NONE)));
     }

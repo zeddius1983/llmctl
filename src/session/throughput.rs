@@ -69,13 +69,37 @@ impl Throughput {
     }
 }
 
+/// Columns a formatted rate is guaranteed to occupy at most.
+///
+/// The session pane right-aligns the figure in a field this wide and pads it to
+/// fit; padding cannot shrink what it is handed, so anything wider would shift
+/// every column after it and, at the pane's edge, wrap the row. Formatting owes
+/// the layout this bound, which is why the constant lives with the formatter.
+pub const RATE_WIDTH: usize = 5;
+
 /// Format a rate the way the runtimes do: two decimals while they carry
-/// information, whole tokens once they do not.
+/// information, whole tokens once they do not — and never wider than
+/// [`RATE_WIDTH`].
+///
+/// The thresholds are the *rounded* values, not the raw ones: `{:.2}` turns
+/// 99.999 into `100.00`, which is six columns from a figure that tested as
+/// under a hundred. Prefill on a small model runs to five digits and beyond, so
+/// past that the figure goes to thousands rather than out of its field.
 pub fn format_rate(tokens_per_second: f64) -> String {
-    if tokens_per_second < 100.0 {
-        format!("{tokens_per_second:.2}")
+    let rate = tokens_per_second.max(0.0);
+    if rate < 99.995 {
+        format!("{rate:.2}")
+    } else if rate < 99_999.5 {
+        format!("{rate:.0}")
+    } else if rate < 999_500.0 {
+        format!("{:.0}k", rate / 1_000.0)
+    } else if rate < 999_500_000.0 {
+        format!("{:.0}M", rate / 1_000_000.0)
     } else {
-        format!("{tokens_per_second:.0}")
+        // Nothing a runtime can report from a real request. The field's
+        // guarantee is a guarantee regardless, so the top end saturates rather
+        // than growing another tier for every order of magnitude.
+        ">1G".into()
     }
 }
 
@@ -122,5 +146,46 @@ mod tests {
         assert_eq!(format_rate(17.573), "17.57");
         assert_eq!(format_rate(99.994), "99.99");
         assert_eq!(format_rate(1425.4), "1425");
+    }
+
+    /// Regression: the session pane pads the figure into a five-column field
+    /// and padding cannot shrink what it is handed. Two rates escaped it — one
+    /// just under a hundred, which `{:.2}` rounds up to `100.00`, and a prefill
+    /// rate past five digits. Either shifted every column after it.
+    #[test]
+    fn no_rate_outgrows_the_field_reserved_for_it() {
+        // The rounding boundary: under a hundred by the test, over it once
+        // formatted.
+        assert_eq!(format_rate(99.999), "100");
+        assert_eq!(format_rate(99.995), "100");
+        assert_eq!(format_rate(99.9949), "99.99");
+        // Prefill on a small model reaches five digits and beyond.
+        assert_eq!(format_rate(99_999.0), "99999");
+        assert_eq!(format_rate(123_456.0), "123k");
+        assert_eq!(format_rate(9_900_000.0), "10M");
+
+        for rate in [
+            0.0,
+            0.004,
+            1.0,
+            17.573,
+            99.994,
+            99.995,
+            99.999,
+            100.0,
+            999.5,
+            1425.4,
+            99_999.4,
+            99_999.5,
+            123_456.0,
+            999_499.0,
+            999_500.0,
+            12_345_678.0,
+            f64::MAX,
+            -1.0,
+        ] {
+            let figure = format_rate(rate);
+            assert!(figure.len() <= RATE_WIDTH, "{rate} formatted as {figure:?}");
+        }
     }
 }
