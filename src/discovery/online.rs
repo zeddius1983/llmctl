@@ -1003,11 +1003,15 @@ fn deletion_in(hub: &Path, model: &Model, catalog: &[Model]) -> Option<Deletion>
                 plan.files.push(candidate);
             }
         }
-        // A split artifact may sit in a subdirectory of the snapshot.
-        if let Some(parent) = link.parent().filter(|parent| *parent != snapshot) {
-            let parent = parent.to_path_buf();
-            if !prune.contains(&parent) {
-                prune.push(parent);
+        // A split artifact may sit in a subdirectory of the snapshot — and a
+        // repository that files its quantizations away can nest them several
+        // deep. Every level between the file and the snapshot is offered, or
+        // the one left behind holds the snapshot directory open and, with it,
+        // the whole repository.
+        for ancestor in link.ancestors().skip(1).take_while(|dir| *dir != snapshot) {
+            let dir = ancestor.to_path_buf();
+            if !prune.contains(&dir) {
+                prune.push(dir);
             }
         }
     }
@@ -1025,6 +1029,13 @@ fn deletion_in(hub: &Path, model: &Model, catalog: &[Model]) -> Option<Deletion>
     prune.push(snapshot);
     prune.push(repo_dir.join("snapshots"));
     prune.push(repo_dir.join("blobs"));
+    // Deepest first, as `Deletion::prune` requires: pruning is one pass of
+    // `remove_dir`, which refuses a directory that still holds its child, and
+    // nothing comes back to it. Two artifacts at different depths interleave
+    // their ancestors in the order the blobs were walked, so sort rather than
+    // trust that order. Stable, so `snapshots` still precedes its sibling
+    // `blobs` and the husk sees both gone.
+    prune.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
     plan.prune = prune;
     if siblings.is_empty() {
         plan.husk = Some(Husk {
@@ -1710,7 +1721,10 @@ mod tests {
         for (name, oid, size) in files {
             let blob = repo_dir.join("blobs").join(oid);
             fs::write(&blob, vec![0_u8; *size]).unwrap();
-            std::os::unix::fs::symlink(&blob, snapshot.join(name)).unwrap();
+            let link = snapshot.join(name);
+            // A repo-relative name may nest (`Q4_K_M/model-00001-of-2.gguf`).
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&blob, link).unwrap();
         }
     }
 
@@ -1777,6 +1791,37 @@ mod tests {
 
         plan.execute().unwrap();
         assert!(!hub.join("models--owner--repo").exists(), "the repository cache should be gone");
+        let _ = fs::remove_dir_all(hub);
+    }
+
+    /// A repository that files its quantizations away in nested directories.
+    /// Pruning is one pass, so a directory left behind at any level keeps the
+    /// snapshot — and with it the repository and its stale `refs/main` — alive.
+    #[test]
+    fn a_nested_artifact_prunes_every_level_down_to_the_repository() {
+        let hub = std::env::temp_dir().join(format!("llmctl-delete-nested-{}", now()));
+        // The GGUF is two directories down and the companion sits at the top,
+        // so `UD` is reached only as an ancestor of the file — nothing else
+        // names it.
+        let deep = ("UD/Q4_K_XL/model.gguf", &"aa".repeat(32)[..], 10);
+        let root = ("mmproj.gguf", &"ff".repeat(32)[..], 5);
+        fake_hub(&hub, "owner/repo", "abc", &[deep, root]);
+        let model = artifact(&hub, "owner/repo", "UD/Q4_K_XL/model.gguf", &[deep, root]);
+
+        let plan = deletion_in(&hub, &model, std::slice::from_ref(&model)).expect("a cached plan");
+        let snapshot = hub.join("models--owner--repo/snapshots/abc");
+        assert!(plan.prune.contains(&snapshot.join("UD")), "{:?}", plan.prune);
+        assert!(plan.prune.contains(&snapshot.join("UD/Q4_K_XL")), "{:?}", plan.prune);
+        // Deepest first, whatever order the blobs were walked in: pruning is
+        // one pass and never comes back to a directory it could not take.
+        let depths: Vec<usize> = plan.prune.iter().map(|dir| dir.components().count()).collect();
+        assert!(depths.windows(2).all(|pair| pair[0] >= pair[1]), "{:?}", plan.prune);
+
+        plan.execute().unwrap();
+        assert!(
+            !hub.join("models--owner--repo").exists(),
+            "an intermediate directory kept the repository alive"
+        );
         let _ = fs::remove_dir_all(hub);
     }
 

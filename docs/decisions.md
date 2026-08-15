@@ -653,6 +653,14 @@ anything llmctl did not put there. The one exception is the `Husk` — a Hub
 repository directory whose `blobs/` and `snapshots/` are empty, where the
 surviving `refs/main` names a revision that no longer exists.
 
+Pruning is a single pass, so the list has to be complete and deepest-first. A
+repository that files its quantizations away puts the GGUF several directories
+below the snapshot, and every level between the two is llmctl's to clear: one
+left behind holds the snapshot open, which holds the repository open, and the
+husk never fires. Order matters for the same reason — `remove_dir` refuses a
+directory that still holds its child and nothing comes back to it — and the
+order blobs happen to be walked in is not it.
+
 Model **profiles are kept**. They are cheap YAML, and re-downloading a model the
 user had tuned should not cost them the tuning.
 
@@ -662,10 +670,17 @@ server. Both are detected by the *files* involved — the session's recorded
 `model_path`, the transfer's target blobs — and not only by name or catalog id,
 because the same GGUF reaches the catalog under more than one entry and a
 name-only check is bypassed by deleting through the other one. The name answers
-only where there is no file to ask about: a launch that streams straight from
-the Hub records no local path. Letting it answer anywhere else would block in
-the opposite direction, refusing to delete a model whose filename merely matches
-one being served from another source directory or repository.
+only where there is no file to ask about. Letting it answer anywhere else would
+block in the opposite direction, refusing to delete a model whose filename
+merely matches one being served from another source directory or repository.
+
+Which sessions those are is decided by whether the recorded path is **absolute**,
+not by whether it is present. `model_path` holds the process token, and that is
+only sometimes a path: a FastFlowLM session records the tag `flm serve` was
+given, and a llama.cpp launch that fetches its own artifacts records the
+repo-relative filename it asked the Hub for. Both are non-empty and neither
+locates anything, so comparing them against an absolute plan matches nothing —
+which is a guard that waves every FastFlowLM and native-Hub session through.
 
 A model reachable both by scanning and through the online catalog is one file
 under two catalog names, not two models: entries naming the same file are

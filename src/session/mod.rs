@@ -167,6 +167,18 @@ fn session_status_label(status: SessionStatus, download_percent: Option<u8>) -> 
     }
 }
 
+/// The model file a session has open, where its process token names one.
+///
+/// Only an absolute path locates storage. A tag (`qwen3:4b`) and a repo-relative
+/// filename (`Q4_K_M/model.gguf`) are both non-empty and both resolve against
+/// whatever the process's working directory happened to be, so treating either
+/// as a path would compare it against an absolute deletion plan, match nothing,
+/// and wave the deletion through.
+fn storage_path(record: &SessionRecord) -> Option<PathBuf> {
+    let path = PathBuf::from(&record.model_path);
+    path.is_absolute().then_some(path)
+}
+
 fn download_percent(record: &SessionRecord) -> Option<u8> {
     download_record_percent(record.download.as_ref()?)
 }
@@ -342,26 +354,29 @@ impl SessionManager {
         self.sessions.iter().find(|s| !s.status.is_terminal() && s.record.runtime == runtime)
     }
 
-    /// A live session of `runtime` currently serving `model`, if any. Used to
-    /// refuse deleting the files a running server has open.
-    /// Whether a live session of `runtime` is serving `model` and recorded no
-    /// file for it.
+    /// Whether a live session of `runtime` is serving `model` and named no file
+    /// on disk when it was launched.
     ///
-    /// A launch that streams straight from the Hub loads no local path, so the
-    /// name it was started under is the only handle on what it is using. Where
-    /// a path *was* recorded the files answer the question better — see
-    /// [`SessionManager::active_model_paths`] — and two unrelated models that
+    /// `model_path` holds the process token
+    /// ([`RuntimeBackend::process_token`](crate::runtime::RuntimeBackend::process_token)),
+    /// which only sometimes *is* a path: a FastFlowLM session records the tag
+    /// `flm serve` was given, and a llama.cpp launch that fetches its own
+    /// artifacts records the repo-relative filename it asked the Hub for.
+    /// Neither locates storage, so those sessions are recognized by the name
+    /// they were launched under — the only handle there is. Where a real path
+    /// was recorded the files answer better (see
+    /// [`SessionManager::active_model_paths`]), and two unrelated models that
     /// happen to share a filename stay independent.
     pub fn pathless_session_for(&self, runtime: &str, model: &str) -> bool {
         self.sessions.iter().any(|s| {
             !s.status.is_terminal()
                 && s.record.runtime == runtime
                 && s.record.model == model
-                && s.record.model_path.is_empty()
+                && storage_path(&s.record).is_none()
         })
     }
 
-    /// Model files the live sessions of `runtime` have loaded.
+    /// Model files the live sessions of `runtime` have open.
     ///
     /// Names are not enough to decide what is in use: one GGUF reaches the
     /// catalog under more than one entry, and a session records the name it was
@@ -370,8 +385,7 @@ impl SessionManager {
         self.sessions
             .iter()
             .filter(|s| !s.status.is_terminal() && s.record.runtime == runtime)
-            .filter(|s| !s.record.model_path.is_empty())
-            .map(|s| PathBuf::from(&s.record.model_path))
+            .filter_map(|s| storage_path(&s.record))
             .collect()
     }
 
@@ -1168,12 +1182,24 @@ mod tests {
         assert!(!mgr.pathless_session_for("llama.cpp", "model.gguf"));
         assert_eq!(mgr.active_model_paths("llama.cpp"), vec![PathBuf::from("/a/model.gguf")]);
 
-        // A launch straight from the Hub loads no local path; the name is all
+        // A launch that fetches from the Hub itself records the repo-relative
+        // filename it asked for, which locates nothing on disk; the name is all
         // there is to go on.
-        mgr.sessions.push(Session::new(record("remote", ""), SessionStatus::Running));
+        mgr.sessions
+            .push(Session::new(record("remote", "Q4_K_M/model.gguf"), SessionStatus::Running));
         assert!(mgr.pathless_session_for("llama.cpp", "model.gguf"));
         assert!(!mgr.pathless_session_for("llama.cpp", "other.gguf"));
         assert!(!mgr.pathless_session_for("FastFlowLM", "model.gguf"));
+        // And it adds nothing to the paths, or a relative path would be
+        // compared against an absolute plan and match nothing.
+        assert_eq!(mgr.active_model_paths("llama.cpp"), vec![PathBuf::from("/a/model.gguf")]);
+
+        // A FastFlowLM tag is a name too, not a path.
+        let mut tagged = record("tagged", "qwen3:4b");
+        tagged.runtime = "FastFlowLM".into();
+        mgr.sessions.push(Session::new(tagged, SessionStatus::Running));
+        assert!(mgr.pathless_session_for("FastFlowLM", "model.gguf"));
+        assert!(mgr.active_model_paths("FastFlowLM").is_empty());
 
         // A stopped session holds nothing.
         mgr.sessions[1].status = SessionStatus::Stopped;

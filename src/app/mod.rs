@@ -2451,7 +2451,8 @@ impl App {
         // other entry would sail past a name-only check and unlink a model
         // being served — while two unrelated models sharing a filename would
         // block each other under one. The name is left to answer only for the
-        // launches that record no path at all.
+        // launches whose process token is not a path at all: a FastFlowLM tag,
+        // or the repo-relative filename of a native Hub launch.
         if self.sessions.pathless_session_for(&runtime, &model.name)
             || plan.overlaps(&self.sessions.active_model_paths(&runtime))
         {
