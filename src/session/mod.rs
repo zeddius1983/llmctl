@@ -196,6 +196,24 @@ fn download_paths(record: &SessionRecord) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Every absolute path in a session's own command line.
+///
+/// The model is not the only file a server holds open: a projector, an MTP
+/// sidecar or a dFlash drafter is passed as its own flag, and a companion
+/// already in the cache is named there and nowhere else — not in the process
+/// token, and not in the download record, which lists only what this launch is
+/// fetching. Deleting another quantization of the same repository would then
+/// take a companion out from under a running server, because a companion is
+/// spared only for the *cached* siblings the catalog lists and the running one
+/// may not be among them.
+///
+/// Reading the argv over-blocks slightly: a log path or a binary is a path too.
+/// Neither ever appears in a deletion plan, and erring towards refusing a
+/// deletion is the right direction for a guard.
+fn command_paths(record: &SessionRecord) -> impl Iterator<Item = PathBuf> + '_ {
+    record.command.iter().map(PathBuf::from).filter(|path| path.is_absolute())
+}
+
 fn download_percent(record: &SessionRecord) -> Option<u8> {
     download_record_percent(record.download.as_ref()?)
 }
@@ -267,6 +285,34 @@ impl SessionManager {
             supervisor: Box::new(DetachedSupervisor::new()),
             sessions: Vec::new(),
         };
+        mgr.rediscover();
+        mgr
+    }
+
+    /// A manager whose supervisor never spawns, for tests about bookkeeping.
+    ///
+    /// Constructing a [`DetachedSupervisor`] sets `SIGCHLD` to `SIG_IGN` for the
+    /// whole process, so any test that merely wants a `SessionManager` struct
+    /// breaks child reaping for whatever else `cargo test` is running in
+    /// parallel at that moment — `Command::output` fails, `Command::spawn`
+    /// panics. Tests that do need real processes are `#[ignore]`d and run
+    /// single-threaded; these take a supervisor that touches no signals.
+    #[cfg(test)]
+    fn without_supervisor(dir: PathBuf, log_dir: PathBuf) -> Self {
+        struct NeverSpawns;
+        impl SessionSupervisor for NeverSpawns {
+            fn spawn(&self, _spec: &LaunchSpec) -> Result<supervisor::Spawned> {
+                Err(anyhow!("this test's supervisor does not spawn"))
+            }
+            fn stop(&self, _pid: i32) -> Result<()> {
+                Ok(())
+            }
+            fn kill(&self, _pid: i32) -> Result<()> {
+                Ok(())
+            }
+        }
+        let mut mgr =
+            Self { dir, log_dir, supervisor: Box::new(NeverSpawns), sessions: Vec::new() };
         mgr.rediscover();
         mgr
     }
@@ -393,16 +439,22 @@ impl SessionManager {
         })
     }
 
-    /// Model files the live sessions of `runtime` have open or are writing.
+    /// Every file the live sessions of `runtime` have open or are writing —
+    /// models, their companions, and the blobs a launch is still fetching.
     ///
     /// Names are not enough to decide what is in use: one GGUF reaches the
     /// catalog under more than one entry, and a session records the name it was
-    /// launched under. The file it opened is the same either way.
+    /// launched under. The files it opened are the same either way.
     pub fn active_model_paths(&self, runtime: &str) -> Vec<PathBuf> {
         self.sessions
             .iter()
             .filter(|s| !s.status.is_terminal() && s.record.runtime == runtime)
-            .flat_map(|s| storage_path(&s.record).into_iter().chain(download_paths(&s.record)))
+            .flat_map(|s| {
+                storage_path(&s.record)
+                    .into_iter()
+                    .chain(download_paths(&s.record))
+                    .chain(command_paths(&s.record))
+            })
             .collect()
     }
 
@@ -1091,12 +1143,15 @@ mod tests {
     }
 
     /// A replacement that cannot be spawned at all reports the failure instead
-    /// of leaving the session stuck in `Restarting`.
+    /// of leaving the session stuck in `Restarting`. The refusal comes from the
+    /// supervisor here rather than from a real failed exec — that path is
+    /// covered by the `#[ignore]`d restart tests, which get a process to
+    /// themselves.
     #[test]
     fn a_replacement_that_cannot_spawn_is_reported() {
         let base = std::env::temp_dir().join(format!("llmctl-restart-bad-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
-        let mut mgr = SessionManager::new(base.join("sessions"), base.join("logs"));
+        let mut mgr = SessionManager::without_supervisor(base.join("sessions"), base.join("logs"));
         mgr.sessions.push(Session::new(
             SessionRecord {
                 id: "0-0".into(),
@@ -1135,7 +1190,7 @@ mod tests {
     fn sessions_are_grouped_by_runtime_without_disturbing_launch_order() {
         let base = std::env::temp_dir().join(format!("llmctl-grouping-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
-        let mut mgr = SessionManager::new(base.join("sessions"), base.join("logs"));
+        let mut mgr = SessionManager::without_supervisor(base.join("sessions"), base.join("logs"));
         let record = |id: &str, runtime: &str| SessionRecord {
             id: id.into(),
             name: id.into(),
@@ -1173,7 +1228,7 @@ mod tests {
     fn only_a_pathless_session_is_matched_by_name() {
         let base = std::env::temp_dir().join(format!("llmctl-pathless-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
-        let mut mgr = SessionManager::new(base.join("sessions"), base.join("logs"));
+        let mut mgr = SessionManager::without_supervisor(base.join("sessions"), base.join("logs"));
         let record = |id: &str, model_path: &str| SessionRecord {
             id: id.into(),
             name: id.into(),
@@ -1238,6 +1293,22 @@ mod tests {
         let paths = mgr.active_model_paths("llama.cpp");
         assert!(paths.contains(&PathBuf::from("/hub/blobs/aa")), "{paths:?}");
         assert!(paths.contains(&PathBuf::from("/hub/blobs/aa.incomplete")), "{paths:?}");
+
+        // And a companion already cached is named only in the argv: the
+        // transfer is not fetching it, and the process token is the base
+        // artifact. Relative arguments are not paths and stay out.
+        let mut companion = record("companion", "Q4/model.gguf");
+        companion.command = vec![
+            "llama-server".into(),
+            "--mmproj".into(),
+            "/hub/blobs/mmproj".into(),
+            "--port".into(),
+            "8080".into(),
+        ];
+        mgr.sessions.push(Session::new(companion, SessionStatus::Running));
+        let paths = mgr.active_model_paths("llama.cpp");
+        assert!(paths.contains(&PathBuf::from("/hub/blobs/mmproj")), "{paths:?}");
+        assert!(!paths.contains(&PathBuf::from("8080")), "{paths:?}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1245,7 +1316,7 @@ mod tests {
     fn resolve_port_skips_a_bound_port() {
         let dir = std::env::temp_dir().join(format!("llmctl-mgr-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mgr = SessionManager::new(dir.clone(), dir);
+        let mgr = SessionManager::without_supervisor(dir.clone(), dir);
         // Bind an ephemeral port so it is guaranteed in use, then confirm the
         // resolver moves past it to a free, higher port.
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();

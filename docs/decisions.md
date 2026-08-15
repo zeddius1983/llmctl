@@ -694,6 +694,17 @@ the same file afterwards calls it `model.gguf`, so a rescan hands the user a
 second name for a model already being served, and deleting through it would ask
 a question the name check was never posed.
 
+So is the session's **command line**, for the same reason one step further out.
+A server holds more than its model open: a projector, an MTP sidecar or a dFlash
+drafter arrives on its own flag, and a companion that was already cached appears
+in neither the process token nor the download record — the transfer is not
+fetching it. The share rule spares a companion for the *cached* siblings the
+catalog lists, and a quantization being streamed from the Hub is not one of
+them, so deleting a cached sibling could unlink a projector a live server is
+loading. Every absolute path in the recorded argv therefore counts as in use.
+It over-blocks a little — a binary and a log path are paths too — but neither
+ever appears in a deletion plan, and a guard should err towards refusing.
+
 A model reachable both by scanning and through the online catalog is one file
 under two catalog names, not two models: entries naming the same file are
 excluded from the share check, or a model would always look spoken-for by its

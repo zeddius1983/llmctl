@@ -109,7 +109,10 @@ legacy profile migration), `~/.cache/llmctl/` (models.json, llama-server.help.tx
   **Single-threaded is required:** building a `SessionManager` sets `SIGCHLD` to
   `SIG_IGN` process-wide, which makes any concurrent `Command::output()` fail to
   reap its child. The same ordering constraint is why `App::new` discovers
-  runtimes before constructing the manager.
+  runtimes before constructing the manager — and why a test that only needs the
+  struct takes `SessionManager::without_supervisor`, which touches no signals.
+  Never construct the real supervisor from a test that runs in the default
+  (parallel) suite.
 - Reading a subprocess's output at runtime must go through
   `session::supervisor::output`. The supervisor sets `SIGCHLD` to `SIG_IGN` so
   detached servers self-reap, which makes a plain `Command::output()` fail to
