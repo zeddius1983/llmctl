@@ -5,7 +5,7 @@
 //! `IMPLEMENTATION_PLAN.md` → Navigation model).
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 use ratatui::widgets::ListState;
 
@@ -156,6 +156,18 @@ impl ModelDownload {
             }
         }
     }
+}
+
+/// Whether a keystroke agrees to a pending destructive action.
+///
+/// The dialog promises that `y` or Enter deletes and every other key backs out,
+/// so the key code alone will not do: crossterm spells Ctrl+Y as `Char('y')`
+/// with a modifier flag set, and a chord that merely contains the confirm key
+/// is not the key. Shift is the one modifier allowed through, because that is
+/// how `Y` arrives at all.
+fn is_assent(key: KeyEvent) -> bool {
+    key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+        && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter)
 }
 
 fn transfer_percent(downloaded_bytes: u64, total_bytes: u64) -> u8 {
@@ -915,7 +927,7 @@ impl App {
         // dismisses" like a message — that would make a stray keystroke an
         // answer.
         if self.confirm.is_some() {
-            if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter)
+            if is_assent(key)
                 && let Some(confirm) = self.confirm.take()
             {
                 self.run_confirmed(confirm.action);
@@ -3349,6 +3361,24 @@ mod tests {
             filter: String::new(),
             cursor: 0,
         }
+    }
+
+    /// Regression: the confirm dialog matched on the key code alone, so
+    /// Ctrl+Y — which crossterm reports as `Char('y')` plus a modifier — ran
+    /// the deletion the dialog was asking about.
+    #[test]
+    fn only_an_unmodified_key_confirms_a_deletion() {
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        assert!(is_assent(key(KeyCode::Char('y'), KeyModifiers::NONE)));
+        assert!(is_assent(key(KeyCode::Char('Y'), KeyModifiers::SHIFT)));
+        assert!(is_assent(key(KeyCode::Enter, KeyModifiers::NONE)));
+
+        assert!(!is_assent(key(KeyCode::Char('y'), KeyModifiers::CONTROL)));
+        assert!(!is_assent(key(KeyCode::Char('Y'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)));
+        assert!(!is_assent(key(KeyCode::Char('y'), KeyModifiers::ALT)));
+        assert!(!is_assent(key(KeyCode::Enter, KeyModifiers::CONTROL)));
+        assert!(!is_assent(key(KeyCode::Char('n'), KeyModifiers::NONE)));
+        assert!(!is_assent(key(KeyCode::Esc, KeyModifiers::NONE)));
     }
 
     /// Regression: `flm` writes progress to its log the way it would to a

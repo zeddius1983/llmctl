@@ -617,7 +617,10 @@ knows nothing about llmctl's own scanned model directories or `flm`'s.
 **Decision:** `RuntimeBackend::deletion` returns a `Deletion` — a plan holding
 the exact paths and the bytes they occupy — which the app confirms before
 anything is unlinked. `y`/Enter proceeds; every other key cancels, unlike the
-message overlay that any key dismisses. What executes is the plan the user
+message overlay that any key dismisses. Assent is a key, not a key *code*:
+crossterm spells Ctrl+Y as `Char('y')` with a modifier flag, so a chord that
+merely contains the confirm key backs out like anything else, Shift excepted
+because that is how `Y` arrives at all. What executes is the plan the user
 agreed to, not a recomputation.
 
 The prompt is one line — `Remove <model> (<size>) from disk?`. The plan's paths
@@ -641,9 +644,14 @@ Three storage shapes sit behind the one trait method:
   so a cache written by `huggingface_hub` is handled as well as llmctl's own.
 - **FastFlowLM** — the model directory `flm` gives each model, removed whole.
   `model_dir` returns `None` unless the repository yields a real directory name
-  *under* the model root: `Entry::url` is optional, an absent one leaves the
-  repository empty, and `join("")` on the root is the root — which a recursive
-  removal would take out entirely.
+  *under* an absolute model root. Two ways it does not: `Entry::url` is
+  optional, an absent one leaves the repository empty, and `join("")` on the
+  root is the root — which a recursive removal would take out entirely. And a
+  root that is not absolute — `FLM_MODEL_PATH` set to nothing, no home
+  directory to resolve, or a relative `FLM_MODEL_PATH` — makes the join a bare
+  name that passes the "not the root itself" check and then resolves against
+  llmctl's own working directory, so the plan would raze a same-named directory
+  sitting beside it. Only an absolute root locates storage.
 
 Two rules make the plan safe. **Shared companions survive:** a projector or
 dFlash drafter is paired with every quantization of its repository, so it is
@@ -733,6 +741,14 @@ one exists, decides which blob belongs to the artifact — the recorded oid may
 name a newer revision's. Candidates are deduplicated by canonicalized identity,
 since `../../blobs/<oid>` and the blob's own path are one file spelled two ways
 and counting both doubles the size the prompt quotes.
+
+The size is measured once the file list is settled rather than file by file,
+because what a file frees is a property of the whole plan. A symlink frees
+nothing; the blob behind it counts, and only if the plan names it too. Neither
+does a file with several **hard links**, unless the plan holds every one of its
+names — the contents survive as long as any name does, and the same GGUF hard
+linked into a second model directory would otherwise be quoted as gigabytes
+reclaimed by an unlink that frees nothing at all.
 
 A completed download job whose files the deletion removes is dropped from the
 Session Manager along with them. A finished transfer is not resumable, so

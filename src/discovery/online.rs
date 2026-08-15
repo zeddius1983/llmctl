@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::discovery::hf;
 use crate::domain::{Model, RemoteBlob, RemoteModel};
-use crate::runtime::{Deletion, Husk, canonical, file_bytes, link_target, name_identity};
+use crate::runtime::{Deletion, Husk, canonical, freed_bytes, link_target, name_identity};
 
 const API: &str = "https://huggingface.co/api/models";
 const SOURCE: [&str; 2] = ["online", "huggingface"];
@@ -999,7 +999,6 @@ fn deletion_in(hub: &Path, model: &Model, catalog: &[Model]) -> Option<Deletion>
             let identity =
                 if meta.is_symlink() { candidate.clone() } else { canonical(&candidate) };
             if seen.insert(identity) {
-                plan.bytes += file_bytes(&candidate);
                 plan.files.push(candidate);
             }
         }
@@ -1037,6 +1036,9 @@ fn deletion_in(hub: &Path, model: &Model, catalog: &[Model]) -> Option<Deletion>
     // `blobs` and the husk sees both gone.
     prune.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
     plan.prune = prune;
+    // Sized once the list is settled, not blob by blob: what a hard-linked blob
+    // frees depends on whether the plan holds its other names too.
+    plan.bytes = freed_bytes(&plan.files);
     if siblings.is_empty() {
         plan.husk = Some(Husk {
             empty_first: vec![repo_dir.join("blobs"), repo_dir.join("snapshots")],

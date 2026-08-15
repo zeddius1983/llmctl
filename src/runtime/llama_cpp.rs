@@ -11,7 +11,7 @@ use crate::domain::{Model, OptionItem, RemoteModel, Runtime};
 use crate::profiles::registry::{DEFAULT, OptionKind, OptionSchema, OptionSpec};
 use crate::profiles::templates::Template;
 use crate::runtime::{
-    CatalogCtx, Deletion, LaunchContext, RuntimeBackend, canonical, file_bytes, link_target,
+    CatalogCtx, Deletion, LaunchContext, RuntimeBackend, canonical, freed_bytes, link_target,
     name_identity,
 };
 use crate::session::command::Command;
@@ -842,7 +842,6 @@ fn local_deletion(model: &Model, catalog: &[Model]) -> Option<Deletion> {
         {
             continue;
         }
-        plan.bytes += file_bytes(&path);
         plan.files.push(path);
     }
     if plan.is_empty() {
@@ -880,6 +879,9 @@ fn local_deletion(model: &Model, catalog: &[Model]) -> Option<Deletion> {
     if std::fs::symlink_metadata(&leaf_link).is_ok_and(|meta| meta.is_symlink()) {
         plan.files.push(leaf_link);
     }
+    // Sized once the list is settled, not file by file: what a hard-linked GGUF
+    // frees depends on whether the plan holds its other names too.
+    plan.bytes = freed_bytes(&plan.files);
     Some(plan)
 }
 

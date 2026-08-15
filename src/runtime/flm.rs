@@ -517,14 +517,29 @@ fn tag(model: &Model) -> String {
 /// Where `flm` keeps a model's files. `flm` names the directory after the
 /// repository alone, without its owner.
 pub fn model_dir(model: &Model) -> Option<PathBuf> {
+    model_dir_in(&model_root(), model)
+}
+
+/// [`model_dir`] against a given root, so the guards below can be tested
+/// without an environment variable the rest of the suite also reads.
+fn model_dir_in(root: &Path, model: &Model) -> Option<PathBuf> {
     let flm = model.flm.as_ref()?;
     let name = repo_dir_name(&flm.repo)?;
-    let dir = model_root().join(name);
+    // Only an absolute root locates storage. An empty one — `FLM_MODEL_PATH`
+    // set to nothing, or no home directory to resolve — makes the join below a
+    // bare relative name, and so does a relative `FLM_MODEL_PATH`: either
+    // resolves against whatever working directory llmctl happens to have, so a
+    // deletion would recursively remove a same-named directory sitting beside
+    // it rather than the model.
+    if !root.is_absolute() {
+        return None;
+    }
+    let dir = root.join(name);
     // Never the root itself. `Entry::url` is `#[serde(default)]`, so a catalog
     // row with a missing or unparseable URL yields an empty repository, and
     // `join("")` on the root is the root — which a deletion would then remove
     // recursively, taking every installed model with it.
-    (dir.parent() == Some(model_root().as_path())).then_some(dir)
+    (dir.parent() == Some(root)).then_some(dir)
 }
 
 /// The directory `flm` stores a repository under: its last path segment, or
@@ -1105,6 +1120,27 @@ mod tests {
         let model = entry.to_model(&local("reasoning"), Path::new("/models"), Path::new("/cfg"));
         assert_eq!(model.path, PathBuf::new(), "no directory means no local path");
         assert_eq!(model_dir(&model), None, "and nothing for a deletion to remove");
+    }
+
+    /// Regression: an unusable model root used to pass the "never the root
+    /// itself" check, because the parent of a bare `Qwen3-4B-NPU2` is the empty
+    /// path and so is the root. The deletion plan then held a *relative*
+    /// directory, which `remove_dir_all` resolves against llmctl's own working
+    /// directory — someone else's tree entirely.
+    #[test]
+    fn a_model_root_that_is_not_absolute_resolves_to_no_directory_at_all() {
+        let mut entry = entries()[0].clone();
+        entry.installed = true;
+        let model = entry.to_model(&local("reasoning"), Path::new("/models"), Path::new("/cfg"));
+
+        // `FLM_MODEL_PATH=` set to nothing, or no home directory to resolve.
+        assert_eq!(model_dir_in(Path::new(""), &model), None, "an empty root names nothing");
+        // A relative `FLM_MODEL_PATH`, which `flm` resolves against its own
+        // working directory rather than llmctl's.
+        assert_eq!(model_dir_in(Path::new("models"), &model), None, "nor does a relative one");
+
+        let dir = model_dir_in(Path::new("/srv/flm"), &model).expect("an absolute root resolves");
+        assert_eq!(dir.parent(), Some(Path::new("/srv/flm")));
     }
 
     /// A verbatim closing chunk from a real `flm serve` log.

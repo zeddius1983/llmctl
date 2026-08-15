@@ -12,6 +12,7 @@
 pub mod flm;
 pub mod llama_cpp;
 
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -160,13 +161,36 @@ fn is_empty_dir(dir: &Path) -> bool {
     }
 }
 
-/// Size on disk of one path, without following symlinks: a Hugging Face
-/// snapshot link costs nothing, and the blob it points at is counted once in
-/// its own right.
-pub(crate) fn file_bytes(path: &Path) -> u64 {
-    std::fs::symlink_metadata(path)
-        .map(|meta| if meta.is_symlink() { 0 } else { meta.len() })
-        .unwrap_or(0)
+/// Space unlinking every path in `files` actually gives back.
+///
+/// Three things stop a file's own length from being the answer, and all three
+/// are ordinary in a Hugging Face cache:
+///
+/// - A symlink costs nothing; the blob it points at is counted in its own
+///   right, and only if the plan names it too.
+/// - Two spellings can name one file — a relative `../../blobs/<oid>` link
+///   resolved and the recorded blob path — and counting it twice doubles the
+///   figure the prompt quotes.
+/// - A file with several hard links keeps its contents until the last name for
+///   it goes. Unlinking one of them frees nothing unless this plan unlinks the
+///   rest as well, so a multiply linked file counts only when the plan holds as
+///   many of its names as the file has.
+pub(crate) fn freed_bytes(files: &[PathBuf]) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+
+    // Keyed by the file itself, so hard links stay apart (they are distinct
+    // paths to one inode) while two spellings of one path collapse.
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut linked: HashMap<(u64, u64), (u64, u64, u64)> = HashMap::new();
+    for path in files {
+        let Ok(meta) = std::fs::symlink_metadata(path) else { continue };
+        if meta.is_symlink() || !seen.insert(canonical(path)) {
+            continue;
+        }
+        let entry = linked.entry((meta.dev(), meta.ino())).or_insert((meta.len(), meta.nlink(), 0));
+        entry.2 += 1;
+    }
+    linked.values().filter(|(_, links, planned)| planned >= links).map(|(len, ..)| len).sum()
 }
 
 /// What a symlink points at, resolved against the link's own directory:
@@ -436,6 +460,48 @@ mod tests {
         assert!(plan.overlaps(&[tree.join("model.bin")]));
         assert!(!plan.overlaps(&[blobs.join("bb")]));
         assert!(!plan.overlaps(&[]));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Regression: the prompt quoted every file's own length, so a GGUF hard
+    /// linked into a second directory was reported as gigabytes reclaimed while
+    /// unlinking one of its two names freed nothing at all.
+    #[test]
+    fn a_file_counts_only_once_its_last_name_goes() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("llmctl-freed-{nonce}"));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let plain = root.join("plain.gguf");
+        std::fs::write(&plain, vec![0u8; 100]).unwrap();
+        assert_eq!(freed_bytes(&[plain.clone()]), 100, "a file with one name frees its length");
+        // Spelling it twice does not free it twice.
+        assert_eq!(freed_bytes(&[plain.clone(), root.join(".").join("plain.gguf")]), 100);
+
+        let shared = root.join("shared.gguf");
+        let other_name = root.join("also-shared.gguf");
+        std::fs::write(&shared, vec![0u8; 400]).unwrap();
+        std::fs::hard_link(&shared, &other_name).unwrap();
+        assert_eq!(freed_bytes(&[shared.clone()]), 0, "the contents survive under the other name");
+        assert_eq!(
+            freed_bytes(&[shared.clone(), other_name.clone()]),
+            400,
+            "unlinking every name does free them"
+        );
+        assert_eq!(
+            freed_bytes(&[plain.clone(), shared.clone()]),
+            100,
+            "and a mixed plan counts only what it fully releases"
+        );
+
+        // A symlink is a name for the blob, not a second copy of it.
+        let link = root.join("link.gguf");
+        std::os::unix::fs::symlink(&plain, &link).unwrap();
+        assert_eq!(freed_bytes(&[link, plain]), 100);
 
         let _ = std::fs::remove_dir_all(root);
     }
