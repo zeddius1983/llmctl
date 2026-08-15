@@ -23,6 +23,8 @@ work and plug in behind the `RuntimeBackend` trait. Full spec:
 - **directories** — XDG base directories.
 - **walkdir** + **regex** — model discovery and download progress sizing.
 - **ureq** — blocking HTTPS used from background workers for Hugging Face browsing.
+- **unicode-width** — fixed-width TUI cells are measured and padded in terminal
+  columns, never in `char`s.
 - **anyhow** / **thiserror** — errors. **tracing** — file-based logging.
 - **libc** — `setsid`/signals for detached sessions, `/proc` sampling, `sysconf`.
   No async runtime: a poll-based tick (`crossterm::event::poll`) drives live

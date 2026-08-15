@@ -18,6 +18,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
     App, Confirm, Message, ModelDownload, ModelDownloadStatus, ModelSearch, Pane, Prompt, Screen,
@@ -629,9 +630,9 @@ impl Column {
     fn pad(self, text: &str) -> String {
         let width = self.width();
         match self {
-            Column::Size | Column::Uptime => format!("{text:>width$}"),
-            Column::Decode | Column::Prefill => format!("{text:<width$}"),
-            _ => format!("{text:<width$}"),
+            Column::Size | Column::Uptime => pad_left(text, width),
+            Column::Decode | Column::Prefill => pad_right(text, width),
+            _ => pad_right(text, width),
         }
     }
 }
@@ -688,7 +689,7 @@ fn session_row(session: &Session, width: usize) -> Line<'static> {
             format!("{} ", session.status.glyph()),
             Style::default().fg(status_color(session.status)),
         ),
-        Span::raw(format!("{:<name_width$}", truncate_right(&session.record.name, name_width))),
+        Span::raw(pad_right(&truncate_right(&session.record.name, name_width), name_width)),
     ];
     for (column, text) in cells {
         spans.push(Span::styled(
@@ -699,15 +700,44 @@ fn session_row(session: &Session, width: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Truncate to `max` columns, keeping the head and marking the cut.
+/// Truncate to `max` terminal columns, keeping the head and marking the cut.
+///
+/// Columns, not `char`s: a CJK glyph or an emoji occupies two of them, so ten
+/// of either would draw twice as wide as the field reserved for them and shove
+/// every column after it out of line with the rows above and below.
 fn truncate_right(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
+    if text.width() <= max {
         return text.to_string();
     }
     if max <= 1 {
         return "…".repeat(max);
     }
-    text.chars().take(max - 1).collect::<String>() + "…"
+    // The ellipsis costs one column, and a wide glyph may not fit the last one
+    // left — hence the running total rather than a `take`.
+    let mut kept = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let width = c.width().unwrap_or(0);
+        if used + width > max - 1 {
+            break;
+        }
+        kept.push(c);
+        used += width;
+    }
+    kept.push('…');
+    kept
+}
+
+/// Pad `text` out to `width` terminal columns. `{:<width$}` counts `char`s,
+/// which is the same mistake [`truncate_right`] used to make.
+fn pad_right(text: &str, width: usize) -> String {
+    format!("{text}{}", " ".repeat(width.saturating_sub(text.width())))
+}
+
+/// [`pad_right`] the other way round, for the columns that read better with
+/// their digits against the column that follows them.
+fn pad_left(text: &str, width: usize) -> String {
+    format!("{}{text}", " ".repeat(width.saturating_sub(text.width())))
 }
 
 /// How far a session sits in from the runtime heading above it.
@@ -1582,6 +1612,31 @@ mod tests {
                 .collect();
             assert!(columns.iter().all(|at| at.is_some()), "{cell} missing: {rows:#?}");
             assert!(columns.iter().all(|at| *at == columns[0]), "{cell} drifts: {columns:?}");
+        }
+    }
+
+    /// Regression: cells were measured and padded in `char`s. A CJK profile
+    /// name of ten characters occupies twenty terminal columns, so it drew at
+    /// twice the width of the field reserved for it and shoved every column
+    /// after it out of line with the rows above and below.
+    #[test]
+    fn wide_characters_are_measured_in_terminal_columns() {
+        use unicode_width::UnicodeWidthStr;
+
+        let width = 120;
+        let plain = row_text(&probe_session("gpt-oss-20b-q8_0", true), width);
+        let mut session = probe_session("通義千問-32B-指令", true);
+        // Ten characters, and twice that many columns.
+        session.record.profile = "深度思考模式一二三四".into();
+        let wide = row_text(&session, width);
+
+        assert_eq!(wide.width(), plain.width(), "the wide row draws a different width");
+        // The profile was cut down to its field rather than allowed to overrun.
+        assert!(wide.contains('…'), "{wide:?}");
+        // And every column after it starts where it does on an ASCII row.
+        for cell in [":8001", "11.3 GB", "ROCm", "tg ", "pp ", "2h 34m"] {
+            let at = |row: &str| row.find(cell).map(|byte| row[..byte].width());
+            assert_eq!(at(&wide), at(&plain), "{cell} drifts: {wide:?}");
         }
     }
 

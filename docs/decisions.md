@@ -655,7 +655,13 @@ Three storage shapes sit behind the one trait method:
 
 Two rules make the plan safe. **Shared companions survive:** a projector or
 dFlash drafter is paired with every quantization of its repository, so it is
-deleted only with the last one that uses it.
+deleted only with the last one that uses it. Which siblings are still cached is
+read off the snapshot directory rather than off `Model::path`. That field holds
+what the last catalog refresh saw, and the cache moves underneath it: a `-hf`
+launch fetches its own artifacts, and `huggingface-cli` fills the same
+directories from outside llmctl entirely. A sibling that arrived since the
+refresh still has an empty path, and reading that as "not cached" would carry
+off the companion it now needs.
 **Directories are pruned, not razed:** `remove_dir` on an empty directory leaves
 anything llmctl did not put there. The one exception is the `Husk` — a Hub
 repository directory whose `blobs/` and `snapshots/` are empty, where the
@@ -849,6 +855,13 @@ dash. A cell that disappeared would shift every cell after it out of line with
 the rows above and below, which defeats having columns at all. The figures
 themselves are right-aligned in a fixed field so their digits stack. The model
 name no longer folds in the profile, which is now a column of its own.
+
+Cells are truncated and padded in **terminal columns**, not in `char`s. The
+distinction only shows up on text the user supplies — a profile name is typed
+into a prompt — but a CJK or emoji glyph occupies two columns, so ten of them
+pass a ten-character limit and then draw at twice the width of the field
+reserved for them, taking every column after it out of line with the rows above
+and below.
 
 The size and compute backend shown per session are recorded at launch
 (`SessionRecord::size_bytes` and `device`), because neither can be recovered

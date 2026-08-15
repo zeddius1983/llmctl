@@ -939,11 +939,20 @@ fn deletion_in(hub: &Path, model: &Model, catalog: &[Model]) -> Option<Deletion>
     // Artifacts of the same repository that are themselves still cached. Their
     // files stay — including the projector and dFlash drafter this artifact
     // lists but does not own.
+    //
+    // Cached is read off the snapshot being planned against, not off
+    // `Model::path`. That field is what the last catalog refresh saw, and the
+    // cache moves underneath it: a `-hf` launch fetches its artifacts itself,
+    // and `huggingface-cli` fills the same directories from outside llmctl
+    // entirely. A sibling that arrived since the refresh still has an empty
+    // path, and taking that for "not cached" would let this deletion carry off
+    // a projector or drafter the new arrival shares and now needs.
     let siblings: Vec<&RemoteModel> = catalog
         .iter()
-        .filter(|other| other.id != model.id && !other.path.as_os_str().is_empty())
+        .filter(|other| other.id != model.id)
         .filter_map(|other| other.remote.as_ref())
         .filter(|other| other.repo == remote.repo)
+        .filter(|other| other.file.as_ref().is_some_and(|file| snapshot.join(file).exists()))
         .collect();
     let spoken_for: HashSet<&str> = siblings
         .iter()
@@ -1850,6 +1859,39 @@ mod tests {
         let blobs = hub.join("models--owner--repo/blobs");
         assert!(!blobs.join("aa".repeat(32)).exists());
         assert!(blobs.join("ff".repeat(32)).exists(), "the shared projector must survive");
+        assert!(blobs.join("bb".repeat(32)).exists());
+        let _ = fs::remove_dir_all(hub);
+    }
+
+    /// Regression: "still cached" was read off `Model::path`, which is what the
+    /// last catalog refresh saw. A sibling fetched since — by a `-hf` launch or
+    /// by `huggingface-cli` — is on disk with an empty path, and taking that
+    /// for "not cached" freed the projector it now needs.
+    #[test]
+    fn a_sibling_cached_since_the_last_refresh_still_holds_its_projector() {
+        // `now()` is whole seconds, so the prefix has to be the unique part.
+        let hub = std::env::temp_dir().join(format!("llmctl-delete-fresh-sibling-{}", now()));
+        let projector = ("mmproj.gguf", &"ff".repeat(32)[..], 5);
+        let q4 = ("model-Q4.gguf", &"aa".repeat(32)[..], 10);
+        let q8 = ("model-Q8.gguf", &"bb".repeat(32)[..], 20);
+        // Everything is in the cache, including the Q8.
+        fake_hub(&hub, "owner/repo", "abc", &[q4, q8, projector]);
+        let target = artifact(&hub, "owner/repo", "model-Q4.gguf", &[q4, projector]);
+        let mut sibling = artifact(&hub, "owner/repo", "model-Q8.gguf", &[q8, projector]);
+        // The catalog, however, still lists the Q8 as not downloaded.
+        sibling.path = PathBuf::new();
+        sibling.shard_paths.clear();
+
+        let plan = deletion_in(&hub, &target, &[target.clone(), sibling]).expect("a cached plan");
+        assert_eq!(plan.bytes, 10, "only the Q4 blob is this artifact's to free");
+
+        plan.execute().unwrap();
+        let blobs = hub.join("models--owner--repo/blobs");
+        assert!(!blobs.join("aa".repeat(32)).exists(), "the Q4 is what was deleted");
+        assert!(
+            blobs.join("ff".repeat(32)).exists(),
+            "the projector the cached Q8 needs must survive"
+        );
         assert!(blobs.join("bb".repeat(32)).exists());
         let _ = fs::remove_dir_all(hub);
     }
