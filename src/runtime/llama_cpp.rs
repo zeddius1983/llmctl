@@ -498,13 +498,21 @@ impl RuntimeBackend for LlamaCppBackend {
     /// The `device` option names it outright (`ROCm0` → `ROCm`). Left at
     /// `default`, llama.cpp picks the first device it discovered, so that is
     /// what gets reported — and `CPU` when it found none.
+    ///
+    /// `gpu-layers` overrules all of that: offloading nothing runs the model on
+    /// the CPU whichever accelerator `--device` happens to name.
     fn device_label(&self, options: &[OptionItem]) -> Option<String> {
-        let selected = options
-            .iter()
-            .find(|option| option.key == "device")
-            .map(|option| option.value.as_str())
-            .filter(|value| *value != DEFAULT && !value.is_empty());
-        let device = match selected {
+        let value = |key: &str| {
+            options
+                .iter()
+                .find(|option| option.key == key)
+                .map(|option| option.value.as_str())
+                .filter(|value| *value != DEFAULT && !value.is_empty())
+        };
+        if value("gpu-layers").and_then(|layers| layers.parse::<i64>().ok()) == Some(0) {
+            return Some("CPU".into());
+        }
+        let device = match value("device") {
             Some(device) => device,
             None => self.runtime.devices.first().map(String::as_str).unwrap_or("CPU"),
         };
@@ -1580,6 +1588,33 @@ mod tests {
         let on = std::collections::BTreeMap::from([("mmap".to_string(), "on".to_string())]);
         assert_eq!(backend.legacy_value("load-mode", &on), None);
         assert_eq!(backend.legacy_value("ctx-size", &stored), None);
+    }
+
+    /// `-ngl 0` keeps every layer on the CPU, so the accelerator `--device`
+    /// names is not the one doing the work.
+    #[test]
+    fn offloading_nothing_is_reported_as_cpu() {
+        let mut backend = test_backend();
+        backend.runtime.devices = vec!["ROCm0".into()];
+        let option = |key: &str, value: &str| OptionItem {
+            key: key.into(),
+            value: value.into(),
+            default: DEFAULT.into(),
+            range: None,
+            cli: String::new(),
+            description: String::new(),
+        };
+
+        let cpu = vec![option("device", "ROCm0"), option("gpu-layers", "0")];
+        assert_eq!(backend.device_label(&cpu).as_deref(), Some("CPU"));
+
+        // Any offload at all, and the named device is the one to report.
+        let gpu = vec![option("device", "ROCm0"), option("gpu-layers", "999")];
+        assert_eq!(backend.device_label(&gpu).as_deref(), Some("ROCm"));
+
+        // 'default' hands the decision to llama.cpp, which offloads.
+        let decided = vec![option("device", DEFAULT), option("gpu-layers", DEFAULT)];
+        assert_eq!(backend.device_label(&decided).as_deref(), Some("ROCm"));
     }
 
     #[test]

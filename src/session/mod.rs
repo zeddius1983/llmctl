@@ -316,9 +316,20 @@ impl SessionManager {
 
     /// A live session of `runtime` currently serving `model`, if any. Used to
     /// refuse deleting the files a running server has open.
-    pub fn active_for_model(&self, runtime: &str, model: &str) -> Option<&Session> {
-        self.sessions.iter().find(|s| {
-            !s.status.is_terminal() && s.record.runtime == runtime && s.record.model == model
+    /// Whether a live session of `runtime` is serving `model` and recorded no
+    /// file for it.
+    ///
+    /// A launch that streams straight from the Hub loads no local path, so the
+    /// name it was started under is the only handle on what it is using. Where
+    /// a path *was* recorded the files answer the question better — see
+    /// [`SessionManager::active_model_paths`] — and two unrelated models that
+    /// happen to share a filename stay independent.
+    pub fn pathless_session_for(&self, runtime: &str, model: &str) -> bool {
+        self.sessions.iter().any(|s| {
+            !s.status.is_terminal()
+                && s.record.runtime == runtime
+                && s.record.model == model
+                && s.record.model_path.is_empty()
         })
     }
 
@@ -582,6 +593,12 @@ impl SessionManager {
         session.last_cpu = None;
         session.cpu_percent = None;
         session.rss_bytes = None;
+        // The rates and the read position belong to the process that just went
+        // away. The replacement writes its own log from byte zero and has said
+        // nothing yet about how fast it runs; carrying either across would show
+        // the old process's figures as if they were the new one's.
+        session.throughput = Throughput::default();
+        session.log_tail = LogTail::default();
         Ok(())
     }
 
@@ -993,10 +1010,21 @@ mod tests {
             SessionStatus::Crashed,
         ));
 
+        // Rates the old process reported, which the replacement has not earned.
+        mgr.sessions[0].throughput.record(throughput::Sample {
+            phase: throughput::Phase::Decode,
+            tokens: 100,
+            seconds: 2.0,
+        });
+
         mgr.restart(0).expect("restart");
         assert!(mgr.poll_restarts().is_empty(), "no spawn errors expected");
         assert_eq!(mgr.sessions[0].status, SessionStatus::Starting);
         assert!(mgr.sessions[0].record.pid > 0);
+        assert!(
+            mgr.sessions[0].throughput.rate(throughput::Phase::Decode).is_none(),
+            "the replacement kept the old process's rates"
+        );
 
         sleep(Duration::from_millis(100));
         let _ = mgr.kill(0);
@@ -1038,6 +1066,52 @@ mod tests {
         assert!(errors[0].starts_with("broken:"), "{errors:?}");
         assert_eq!(mgr.sessions[0].status, SessionStatus::Crashed);
         assert!(mgr.poll_restarts().is_empty(), "a failed restart should not retry forever");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Deleting a model asks two questions of the live sessions: which files
+    /// are open, and — only for launches that opened none — which name is in
+    /// use. Sharing a filename with a served model must not be enough.
+    #[test]
+    fn only_a_pathless_session_is_matched_by_name() {
+        let base = std::env::temp_dir().join(format!("llmctl-pathless-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut mgr = SessionManager::new(base.join("sessions"), base.join("logs"));
+        let record = |id: &str, model_path: &str| SessionRecord {
+            id: id.into(),
+            name: id.into(),
+            runtime: "llama.cpp".into(),
+            model: "model.gguf".into(),
+            model_path: model_path.into(),
+            profile: "Default".into(),
+            size_bytes: None,
+            device: None,
+            pid: -1,
+            host: "127.0.0.1".into(),
+            port: 18933,
+            command: Vec::new(),
+            health_path: "/health".into(),
+            log_file: base.join("s.log"),
+            download: None,
+            started_unix: 0,
+        };
+
+        // A local launch: the file it loaded is on the record, so the name says
+        // nothing that the path does not say better.
+        mgr.sessions.push(Session::new(record("local", "/a/model.gguf"), SessionStatus::Running));
+        assert!(!mgr.pathless_session_for("llama.cpp", "model.gguf"));
+        assert_eq!(mgr.active_model_paths("llama.cpp"), vec![PathBuf::from("/a/model.gguf")]);
+
+        // A launch straight from the Hub loads no local path; the name is all
+        // there is to go on.
+        mgr.sessions.push(Session::new(record("remote", ""), SessionStatus::Running));
+        assert!(mgr.pathless_session_for("llama.cpp", "model.gguf"));
+        assert!(!mgr.pathless_session_for("llama.cpp", "other.gguf"));
+        assert!(!mgr.pathless_session_for("FastFlowLM", "model.gguf"));
+
+        // A stopped session holds nothing.
+        mgr.sessions[1].status = SessionStatus::Stopped;
+        assert!(!mgr.pathless_session_for("llama.cpp", "model.gguf"));
         let _ = std::fs::remove_dir_all(&base);
     }
 

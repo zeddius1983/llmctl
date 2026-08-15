@@ -661,7 +661,11 @@ deletion with a message rather than pulling files out from under a running
 server. Both are detected by the *files* involved — the session's recorded
 `model_path`, the transfer's target blobs — and not only by name or catalog id,
 because the same GGUF reaches the catalog under more than one entry and a
-name-only check is bypassed by deleting through the other one.
+name-only check is bypassed by deleting through the other one. The name answers
+only where there is no file to ask about: a launch that streams straight from
+the Hub records no local path. Letting it answer anywhere else would block in
+the opposite direction, refusing to delete a model whose filename merely matches
+one being served from another source directory or repository.
 
 A model reachable both by scanning and through the online catalog is one file
 under two catalog names, not two models: entries naming the same file are
@@ -677,6 +681,11 @@ README leaves two snapshots pointing at one GGUF. Before a blob is scheduled for
 removal the repository's snapshot tree is checked for any link, other than the
 plan's own, that resolves to it; if one exists the plan takes its link and
 leaves the file. The freed figure then reads 0 B, which is the truth.
+
+That leaves an artifact whose blobs are all still cached but which nothing links
+any more — absent to the browser, complete to the cache. `d` on it relinks
+rather than downloading: there is no byte left to fetch, and a transfer with no
+work in it would appear to do nothing at all.
 
 Two rules keep the plan anchored to the filesystem rather than to metadata.
 The revision comes from the cache's own `refs/main`, not from the last catalog
@@ -778,5 +787,13 @@ afterwards: the backend appears in no endpoint and, when `device` is left at
 `default`, in no argv either. `RuntimeBackend::device_label` resolves it — the
 selected device with its ordinal stripped (`ROCm0` → `ROCm`), else the first
 device the runtime discovered, which is the one llama.cpp itself would pick.
+`gpu-layers` overrules both: offloading zero layers runs the model on the CPU
+whatever `--device` names, and a CPU-only profile that reported `ROCm` would be
+reporting the accelerator it deliberately declined to use.
+
+A restart keeps the session's slot but not its figures. The replacement is a new
+process writing a new log from byte zero, so the rates and the `LogTail` offset
+are reset with the pid — carrying either across would show the old process's
+throughput as the new one's until the first request completed.
 Records written by an older llmctl carry neither and show nothing rather than a
 guess.

@@ -1451,7 +1451,24 @@ impl App {
         let Some(remote) = model.remote.clone() else { return };
         let total_bytes = remote.blobs.iter().map(|blob| blob.size_bytes).sum();
         let downloaded_bytes = discovery::online::cached_downloaded_bytes(&remote);
-        if remote.file.is_none() || (total_bytes > 0 && downloaded_bytes >= total_bytes) {
+        if remote.file.is_none() {
+            return;
+        }
+        // Every blob already in the cache, yet the model reads as absent: a
+        // deletion that spared a blob another revision shares took the snapshot
+        // link with it, and the link is what the browser sees. There is nothing
+        // to transfer, so relink instead of opening a download with no work in
+        // it. On an artifact that is merely already downloaded this is a no-op.
+        if total_bytes > 0 && downloaded_bytes >= total_bytes {
+            match discovery::online::finalize_cached_download(&remote) {
+                Ok(_) => self.reload_catalog_in_place(),
+                Err(error) => {
+                    self.message = Some(Message {
+                        title: "Cannot download".into(),
+                        lines: vec![format!("{error:#}")],
+                    })
+                }
+            }
             return;
         }
         if remote.gated && std::env::var_os("HF_TOKEN").is_none() {
@@ -2429,10 +2446,13 @@ impl App {
     /// the very files the deletion would pull out from under it.
     fn deletion_blocker(&self, model: &Model, plan: &Deletion) -> Option<String> {
         let runtime = self.runtimes.selected()?.descriptor().name.clone();
-        // By name *and* by file: a session records the catalog name it was
-        // launched under, so deleting the same GGUF through its other entry
-        // would sail past a name-only check and unlink a model being served.
-        if self.sessions.active_for_model(&runtime, &model.name).is_some()
+        // By file wherever a file was recorded: a session stores the catalog
+        // name it was launched under, so deleting the same GGUF through its
+        // other entry would sail past a name-only check and unlink a model
+        // being served — while two unrelated models sharing a filename would
+        // block each other under one. The name is left to answer only for the
+        // launches that record no path at all.
+        if self.sessions.pathless_session_for(&runtime, &model.name)
             || plan.overlaps(&self.sessions.active_model_paths(&runtime))
         {
             return Some(format!("{} is serving a live session; stop it first.", model.name));
