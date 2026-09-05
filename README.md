@@ -62,7 +62,8 @@ and watch them from a built-in session manager.
 - **Detached sessions** — `s` launches a server in its own process group
   (`setsid`), with stdout/stderr redirected to a per-session log file and
   automatic port-conflict resolution. Sessions are rediscovered across restarts.
-- **Session manager** (`t`) — aligned columns of live status (Downloading /
+- **Session manager** (`t`) — sessions grouped under the runtime serving them,
+  in aligned columns of live status (Downloading /
   Starting / Running / Crashed), model, profile, port, size, compute backend
   (ROCm / Vulkan / CUDA / NPU), throughput (`tg` and `pp` in tokens per second,
   as the server last reported them), and uptime. Plus PID and `/proc`-sampled
@@ -163,8 +164,14 @@ its own log — nothing to enable, and it works for sessions llmctl rediscovered
 after a restart:
 
 ```
-● gpt-oss-20b-q8_0      [inquisitor]  :8001    11.3 GB  ROCm    tg 67.73 t/s   pp 1425 t/s    2h 34m
+llama.cpp
+  ● muse-glimmer-30b-q8_0     [inquisitor]    :8001      11.3 GB    ROCm      tg 67.73 t/s    pp  1425 t/s      2h 34m
+FastFlowLM
+  ● gpt-oss-20b               [balanced]      :8002       4.2 GB    NPU       tg 24.10 t/s    pp   312 t/s        12m
 ```
+
+Sessions are grouped under the runtime serving them, so "what have I got up on
+the NPU?" is one glance rather than a scan down a backend column.
 
 `tg` is token generation (decode) and `pp` is prompt processing (prefill), each
 the runtime's own figure for its most recent request rather than an average

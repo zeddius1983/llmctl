@@ -250,30 +250,32 @@ the Vulkan backend** — `pre-allocated tensor (output.weight) in a buffer
 both backends, so the 2.5x is dFlash, not the backend. Not an llmctl bug;
 noted here because the failure looks like one.
 
-## In progress
+### Unreleased — model deletion and session throughput
+Both features live on `feature/ui-enhancements` (PR #25), unmerged and without a
+version assigned; the release umbrella that takes them will decide the number
+and write the notes.
 
-### Session throughput and columns
-- [x] `tg` (decode) and `pp` (prefill) rates in the Session Manager, read from
-      the per-request timings both runtimes already write to the session log —
-      no `--metrics`, no restart (ADR-016). The latest measurement, unaveraged.
-- [x] Session rows laid out in aligned columns: status · model · profile · port
-      · size · backend · tg · pp · uptime, shedding the least useful first on a
-      narrow pane. Size and compute backend (ROCm/Vulkan/CUDA/NPU) are recorded
-      at launch, since neither can be recovered from a running server.
-- [x] Sessions grouped under their runtime: the runtime's name heads its
-      sessions, indented beneath it. The manager keeps the list in that order so
-      the cursor moves down the pane the way it looks (ADR-016).
+`D` in the Model pane removes the selected model from disk, behind a one-line
+confirmation quoting the model and the space freed (ADR-015). It covers scanned
+GGUFs, the Hugging Face blob cache — where the hash-named files are otherwise
+unreadable, and a scanned GGUF is a symlink whose bytes live in the blob behind
+it — and FastFlowLM model directories. Companions shared with another stored
+quantization survive, and profiles are kept. The plan is anchored to files
+rather than to names throughout: to the snapshot the selected artifact was found
+in, to what is cached on disk rather than what the last refresh saw, and — for
+the live-session guard — to a session's absolute paths, download record, and
+argv. `presence-penalty` was added to the llama.cpp option table alongside it.
 
-### Model storage management
-- [x] `D` in the Model pane removes the selected model from disk, behind a
-      one-line confirmation quoting the model and the space freed (ADR-015).
-      Covers scanned GGUFs, the Hugging Face blob cache (where the hash-named
-      files are otherwise unreadable, and a scanned GGUF is a symlink whose
-      bytes live in the blob behind it), and FastFlowLM model directories.
-      Companions shared with another stored quantization survive; profiles are
-      kept.
-- [x] `presence-penalty` (`--presence-penalty`) added to the llama.cpp option
-      table, omitted at the `default` sentinel like the other sampling params.
+The Session Manager reports `tg` (decode) and `pp` (prefill) rates read from the
+per-request timings both runtimes already write to the session log — no
+`--metrics`, no restart, latest measurement unaveraged (ADR-016). Rows became
+aligned columns — status · model · profile · port · size · backend · tg · pp ·
+uptime — shedding the least useful first on a narrow pane; size and compute
+backend are recorded at launch, since neither can be recovered from a running
+server. Sessions are grouped under their runtime, with the manager holding the
+list in that order so the cursor moves down the pane the way it looks. Cells are
+measured and padded in terminal columns, and `format_rate` is bounded by the
+field the rate cell reserves.
 
 ## Next (post-v0.3.1)
 
