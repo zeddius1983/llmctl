@@ -882,6 +882,18 @@ just under a hundred, which `{:.2}` rounds up to `100.00`, and a prefill rate
 past five digits, which small models reach — and either shifted every column
 after it.
 
+The name column takes what the names in the pane need — the widest of them,
+between `MIN_NAME` and `MAX_NAME` — and columns are dropped until it fits, so a
+name is cut only when it is longer than the cap or the pane is genuinely tiny.
+It used to ask for `MIN_NAME` and then absorb everything left over, which failed
+at both ends: a 106-column pane cut a twenty-one character name while keeping a
+backend that never changes, and a 200-column pane put sixty blanks between the
+name and the profile, leaving the row reading as two unrelated halves. One plan
+is computed for the whole list rather than per row, because rows that sized
+their own name columns would stop lining up. What the drop leaves over is
+bounded by the column it dropped: if the slack were enough to keep that column,
+it would not have been dropped.
+
 The size and compute backend shown per session are recorded at launch
 (`SessionRecord::size_bytes` and `device`), because neither can be recovered
 afterwards: the backend appears in no endpoint and, when `device` is left at

@@ -638,6 +638,12 @@ const MISSING: &str = "—";
 const COL_GAP: usize = 4;
 /// Below this much room for the model name, a column is not worth its space.
 const MIN_NAME: usize = 12;
+/// The widest the name column grows to.
+///
+/// Names are what the rows are about, so they get columns dropped for them —
+/// but only up to here. Past it the surplus stops seating a name and starts
+/// opening a gulf between the name and everything that describes it.
+const MAX_NAME: usize = 32;
 
 /// Which column to give up first when the pane cannot hold them all.
 ///
@@ -726,11 +732,13 @@ fn rate_cell(label: &str, session: &Session, phase: Phase) -> String {
     format!("{label} {value:>RATE_FIGURE$} t/s")
 }
 
-/// One session row: status, model, then the columns that fit.
+/// How wide the name column is, and which columns follow it, in a pane of
+/// `width` holding names up to `longest` terminal columns wide.
 ///
-/// `width` is the room inside the pane's border and selection marker.
-fn session_row(session: &Session, width: usize) -> Line<'static> {
-    let order = [
+/// One answer for the whole list rather than one per row: rows that sized their
+/// own names would stop lining up, and the alignment is the point.
+fn row_plan(width: usize, longest: usize) -> (usize, Vec<Column>) {
+    const ORDER: [Column; 7] = [
         Column::Profile,
         Column::Port,
         Column::Size,
@@ -739,23 +747,32 @@ fn session_row(session: &Session, width: usize) -> Line<'static> {
         Column::Prefill,
         Column::Uptime,
     ];
-
-    // Every column, then drop by priority until the model name has room to be
-    // readable.
-    let mut cells: Vec<(Column, String)> =
-        order.iter().map(|column| (*column, column.cell(session))).collect();
-    let cost = |cells: &[(Column, String)]| -> usize {
-        cells.iter().map(|(column, _)| column.width() + COL_GAP).sum()
+    let cost = |columns: &[Column]| -> usize {
+        columns.iter().map(|column| column.width() + COL_GAP).sum()
     };
+
     let room = width.saturating_sub(2); // status glyph and its space
+    // What the names in this pane actually need, within reason: giving up a
+    // column to seat a name whole is worth it, and `MAX_NAME` is where it stops
+    // being worth it.
+    let wanted = longest.clamp(MIN_NAME, MAX_NAME);
+    let mut columns = ORDER.to_vec();
     for dropped in DROP_ORDER {
-        if room >= cost(&cells) + MIN_NAME + COL_GAP {
+        if room >= cost(&columns) + wanted + COL_GAP {
             break;
         }
-        cells.retain(|(column, _)| *column != dropped);
+        columns.retain(|column| *column != dropped);
     }
 
-    let name_width = room.saturating_sub(cost(&cells) + COL_GAP).max(1);
+    // Capped at what the names need. The leftover used to go here, which on a
+    // wide pane put sixty blank columns between the name and the profile and
+    // left the row reading as two unrelated halves.
+    let name = room.saturating_sub(cost(&columns) + COL_GAP).clamp(1, wanted.max(1));
+    (name, columns)
+}
+
+/// One session row: status, model, then the columns the pane agreed on.
+fn session_row(session: &Session, name_width: usize, columns: &[Column]) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
             format!("{} ", session.status.glyph()),
@@ -763,9 +780,9 @@ fn session_row(session: &Session, width: usize) -> Line<'static> {
         ),
         Span::raw(pad_right(&truncate_right(&session.record.name, name_width), name_width)),
     ];
-    for (column, text) in cells {
+    for column in columns {
         spans.push(Span::styled(
-            format!("{}{}", " ".repeat(COL_GAP), column.pad(&text)),
+            format!("{}{}", " ".repeat(COL_GAP), column.pad(&column.cell(session))),
             Style::default().fg(Color::DarkGray),
         ));
     }
@@ -855,6 +872,8 @@ fn session_items(
     let rows = session_list_rows(sessions);
     let selected_row = selected
         .and_then(|index| rows.iter().position(|row| *row == SessionListRow::Session(index)));
+    let longest = sessions.iter().map(|session| session.record.name.width()).max().unwrap_or(0);
+    let (name_width, columns) = row_plan(width, longest);
     let indent = " ".repeat(SESSION_INDENT);
     let items = rows
         .iter()
@@ -865,7 +884,7 @@ fn session_items(
             ))),
             SessionListRow::Session(index) => {
                 let mut spans = vec![Span::raw(indent.clone())];
-                spans.extend(session_row(&sessions[*index], width).spans);
+                spans.extend(session_row(&sessions[*index], name_width, &columns).spans);
                 ListItem::new(Line::from(spans))
             }
         })
@@ -1448,9 +1467,9 @@ fn center(area: Rect, horizontal: Constraint, vertical: Constraint) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::{
-        ICON_CLOUD, ICON_DIRECTORY, MIN_COLS, MIN_ROWS, compact_count, download_progress,
-        model_artifact_columns, model_icon, render_confirm, render_help, render_session_log,
-        render_too_small, session_panes, truncate_download_name, wrap_hard,
+        COL_GAP, ICON_CLOUD, ICON_DIRECTORY, MAX_NAME, MIN_COLS, MIN_ROWS, compact_count,
+        download_progress, model_artifact_columns, model_icon, render_confirm, render_help,
+        render_session_log, render_too_small, session_panes, truncate_download_name, wrap_hard,
     };
     use crate::app::Confirm;
 
@@ -1928,12 +1947,66 @@ mod tests {
         assert!(screen.contains("sort online models / switch catalog grouping"), "{screen}");
     }
 
-    fn row_text(session: &crate::session::Session, width: usize) -> String {
-        super::session_row(session, width)
-            .spans
+    /// Regression: the name column took every column the row had left over, so
+    /// a wide pane put sixty blanks between the name and the profile — and a
+    /// middling one truncated a name it had columns to spare for, because the
+    /// drop rule only ever asked for `MIN_NAME`.
+    #[test]
+    fn the_name_column_takes_what_the_names_need_and_no_more() {
+        use unicode_width::UnicodeWidthStr;
+
+        let sessions = [probe_session("muse-glimmer-30b-q8_0", true)];
+        let name = "muse-glimmer-30b-q8_0";
+
+        // Wide pane: the name is whole and the columns follow it directly,
+        // rather than after a run of padding.
+        let row = &rows_text(&sessions, 200)[0];
+        let gap = row.find("[inquisitor]").expect("the profile column") - row.find(name).unwrap();
+        assert_eq!(gap, name.width() + COL_GAP, "a gulf opened up: {row:?}");
+
+        // Middling pane: a column is given up to seat the name whole. It used
+        // to keep every column and cut the name to twenty.
+        let row = &rows_text(&sessions, 106)[0];
+        assert!(row.contains(name), "the name was cut with columns to spare: {row:?}");
+
+        // The cap holds: a name past `MAX_NAME` is truncated rather than
+        // pushing every column off the row.
+        let long = "a-very-long-model-name-that-keeps-going-and-going";
+        let row = &rows_text(&[probe_session(long, true)], 200)[0];
+        assert!(row.contains('…'), "{row:?}");
+        // In columns, not bytes: the status glyph and the ellipsis are both
+        // multibyte and neither is more than one column wide.
+        let at = row[..row.find("[inquisitor]").expect("the profile column")].width();
+        assert_eq!(at, 2 + MAX_NAME + COL_GAP, "the name column outgrew its cap: {row:?}");
+
+        // Narrow panes still shed columns, and the name still gets `MIN_NAME`.
+        let row = &rows_text(&sessions, 60)[0];
+        assert!(!row.contains("[inquisitor]"), "a narrow pane kept every column: {row:?}");
+        assert!(row.width() <= 60, "{row:?}");
+    }
+
+    /// The rows a pane of `width` draws for these sessions.
+    ///
+    /// One plan for the set, the way the list does it: rows that sized their
+    /// own name columns would not line up, which several tests here are about.
+    fn rows_text(sessions: &[crate::session::Session], width: usize) -> Vec<String> {
+        use unicode_width::UnicodeWidthStr;
+        let longest = sessions.iter().map(|session| session.record.name.width()).max().unwrap_or(0);
+        let (name_width, columns) = super::row_plan(width, longest);
+        sessions
             .iter()
-            .map(|span| span.content.to_string())
+            .map(|session| {
+                super::session_row(session, name_width, &columns)
+                    .spans
+                    .iter()
+                    .map(|span| span.content.to_string())
+                    .collect()
+            })
             .collect()
+    }
+
+    fn row_text(session: &crate::session::Session, width: usize) -> String {
+        rows_text(std::slice::from_ref(session), width).remove(0)
     }
 
     /// The point of the columns: they line up regardless of name length.
@@ -1943,10 +2016,11 @@ mod tests {
         // nothing: a session without figures must still line up with one that
         // has them, which is why no column is ever omitted.
         let width = 120;
-        let rows: Vec<String> = [("a", true), ("gpt-oss-20b-q8_0", true), ("fresh", false)]
+        let sessions: Vec<_> = [("a", true), ("gpt-oss-20b-q8_0", true), ("fresh", false)]
             .iter()
-            .map(|(name, rates)| row_text(&probe_session(name, *rates), width))
+            .map(|(name, rates)| probe_session(name, *rates))
             .collect();
+        let rows = rows_text(&sessions, width);
 
         for row in &rows {
             assert_eq!(row.chars().count(), rows[0].chars().count(), "ragged row: {row:?}");
@@ -1974,11 +2048,11 @@ mod tests {
         use unicode_width::UnicodeWidthStr;
 
         let width = 120;
-        let plain = row_text(&probe_session("gpt-oss-20b-q8_0", true), width);
         let mut session = probe_session("通義千問-32B-指令", true);
         // Ten characters, and twice that many columns.
         session.record.profile = "深度思考模式一二三四".into();
-        let wide = row_text(&session, width);
+        let rows = rows_text(&[probe_session("gpt-oss-20b-q8_0", true), session], width);
+        let (plain, wide) = (rows[0].clone(), rows[1].clone());
 
         assert_eq!(wide.width(), plain.width(), "the wide row draws a different width");
         // The profile was cut down to its field rather than allowed to overrun.
