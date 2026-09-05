@@ -1051,13 +1051,34 @@ fn cli_binary(server: &str) -> Option<String> {
     Some(path.with_file_name(file.replace("llama-server", "llama-cli")).display().to_string())
 }
 
-/// Run `--version` and return a short version string. llama.cpp prints version
-/// info to stderr, so both streams are considered.
+/// Run `--version` and return a short version string.
+///
+/// Both streams are read and then searched, rather than the first non-empty
+/// line of whichever one spoke. llama.cpp prints its version to stderr — but so
+/// does anything wrapping it, and the wrapper speaks first: a `distrobox`
+/// exported binary announces `Starting container...  [ OK ]` there whenever the
+/// container was cold, which the footer then reported as the runtime's version
+/// for the rest of the session.
 fn query_version(path: &Path) -> Option<String> {
     let output = supervisor::output(ProcCommand::new(path).arg("--version")).ok()?;
-    let text = if output.stderr.is_empty() { &output.stdout } else { &output.stderr };
-    let text = String::from_utf8_lossy(text);
-    text.lines().map(str::trim).find(|l| !l.is_empty()).map(|l| l.to_string())
+    let mut text = String::from_utf8_lossy(&output.stderr).into_owned();
+    text.push('\n');
+    text.push_str(&String::from_utf8_lossy(&output.stdout));
+    parse_version(&text)
+}
+
+/// llama.cpp's own version line — `version: 10353 (f8def7f)` — out of output
+/// that may carry a wrapper's chatter around it.
+///
+/// The first non-empty line is the fallback rather than the rule: a build that
+/// words its version differently should still show something, and all llmctl
+/// does with the string is display it.
+fn parse_version(text: &str) -> Option<String> {
+    let lines = || text.lines().map(str::trim).filter(|line| !line.is_empty());
+    lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("version:"))
+        .or_else(|| lines().next())
+        .map(str::to_string)
 }
 
 /// Run `--list-devices` and extract device identifiers from lines such as
@@ -1124,6 +1145,34 @@ fn draft_hf_repository(repo: &str, file: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the version was the first non-empty line of stderr, and
+    /// llama.cpp is not always what speaks there first. A `distrobox` exported
+    /// binary is a shell wrapper around `distrobox-enter`, which announces
+    /// itself on stderr when the container is cold — so the runtime footer read
+    /// `Starting container...  [ OK ]` where the version belonged, and kept
+    /// reading it until llmctl was restarted with the container already warm.
+    #[test]
+    fn a_wrappers_banner_is_not_mistaken_for_the_version() {
+        let version = "version: 10353 (f8def7f)";
+        let built = "built with GNU 13.3.0 for Linux x86_64";
+        assert_eq!(parse_version(&format!("{version}\n{built}\n")).as_deref(), Some(version));
+
+        // `distrobox-enter` pads the banner to 40 columns and follows it with a
+        // tab and its result, all before the wrapped command says anything.
+        let banner = "Starting container...                   \t[ OK ]";
+        assert_eq!(
+            parse_version(&format!("{banner}\n{version}\n{built}\n")).as_deref(),
+            Some(version)
+        );
+
+        // Nothing recognizable still shows something: the string is only ever
+        // displayed, and a build that words its version differently should not
+        // read as a runtime with no version at all.
+        assert_eq!(parse_version(&format!("\n  {banner}\n")).as_deref(), Some(banner.trim()));
+        assert_eq!(parse_version(""), None);
+        assert_eq!(parse_version("  \n\n"), None);
+    }
 
     /// A backend with nothing discovered but every capability advertised — the
     /// dialect logic never touches the binary.
