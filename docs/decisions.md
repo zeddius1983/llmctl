@@ -898,3 +898,91 @@ are reset with the pid — carrying either across would show the old process's
 throughput as the new one's until the first request completed.
 Records written by an older llmctl carry neither and show nothing rather than a
 guess.
+
+## ADR-017: The session log tails beside the list, from lines already read
+
+**Status:** Accepted — implemented (`l`/`→` in the Session Manager)
+
+**Context:** `L` opened the log full screen, which hides the session list
+entirely. That is the right shape for reading back through a startup failure and
+the wrong one for the question actually asked while a server runs — what is this
+thing doing right now? — because answering it meant leaving the view that shows
+every other session, then coming back.
+
+**Decision:** `l` / `→` swaps the Session Manager's right-hand column between
+the Detail pane and a live tail of the selected session's log; the same key
+swaps back, and `L` still gives the log the whole screen.
+
+The pane reads no files. `SessionManager::refresh` already polls every session's
+log each tick through a `LogTail` — that is where the `tg`/`pp` rates come from
+(ADR-016) — and until now it parsed those lines and dropped them. It now also
+keeps the last `RECENT_LINES` of them per session, so the pane costs one
+`VecDeque` push per new line and nothing at all per frame. Re-reading the file
+instead, the way the full-screen view does, would mean `read_log_tail` over tens
+of megabytes on every tick the pane is open; the full-screen view can afford it
+because nothing else is on screen and it is open briefly.
+
+Lines are cleaned on the way into the buffer rather than on the way out. A
+progress bar redrawn a thousand times is one line holding a thousand states
+(`logtail::visible_line`), and reducing it on every frame would be work repeated
+for an answer that never changes. Those helpers moved from `app` to
+`session::logtail` for this: both readers now share one definition of what a
+terminal would have shown.
+
+The pane always shows the end of the log and cannot be scrolled, because `j`/`k`
+still move between sessions — there is no second cursor, and inventing one would
+make the arrow keys mean different things depending on an invisible focus. `L`
+opens the view that does scroll. The rows are wrapped by `wrap_hard` rather than
+ratatui's `Wrap`, because bottom-anchoring needs an exact row count and word
+wrapping yields one only after the fact; a log line is mostly paths and figures
+anyway, which break at spaces badly.
+
+A download has no log, so its Detail pane holds the column whatever the toggle
+says, and toggling on a selected download does nothing rather than blanking the
+pane.
+
+The column takes 43% of the body, and disappears below the 44 columns it needs
+to say anything — around a 102-column terminal. Narrower than that, every Detail
+line wraps into fragments and a log tail shows a few characters per row, so the
+pane stops answering questions while still taking width from the list, which is
+the one thing on the screen that has to stay legible. The jobs list then spans
+the whole body, and `l` opens the log full screen rather than doing nothing,
+since that is the only place a log can go on a terminal that size.
+
+**Consequences:** The Detail pane now has a peer, which sharpens how much of it
+is duplication: nine of its fifteen facts are already in the row beside it. What
+it keeps that nothing else shows — PID, CPU, memory, endpoint, the tokens and
+seconds behind each rate, the command line — is the shape a trimmed pane would
+have. That rework stays on the roadmap; this change does not depend on it.
+
+## ADR-018: Below 80x24, llmctl says what it needs instead of drawing
+
+**Status:** Accepted — implemented (`render_too_small`)
+
+**Context:** The interface degrades as the terminal narrows: session rows shed
+their least useful cells, and under about 102 columns the pane beside the list
+goes entirely (ADR-017). Degradation has a bottom, though. At 40x12 the browser
+is three panes about ten characters wide; at 24x8 it shows `hug` and `lms` and
+nothing else. Popups fare worse — the delete confirmation once panicked on a
+`clamp` below 48 columns — because they size themselves to their content and
+have nowhere to open.
+
+**Decision:** Below 80 columns or 24 rows, llmctl draws one centred message
+naming what it needs and what it has (`80x24 needed - 62x18 now`) and nothing
+else. 80x24 is the classic terminal size and the point where the three-column
+browser still reads as three columns; the app is expected to work at it, not
+merely start.
+
+The message is plain centred lines with no border, because it has to survive
+sizes where a bordered popup would have nothing left inside it — it is drawn and
+tested down to a 1x1 terminal. It is checked per frame, so a resize in either
+direction is picked up on the next tick with no state to reset.
+
+A floor is a worse answer than degradation everywhere above it, which is why it
+sits this low. A gate at, say, 120x30 would refuse terminals llmctl is entirely
+usable in — the session manager reads well at 60x18 — and llmctl is exactly the
+app people keep in a narrow split beside a server log.
+
+**Consequences:** The help overlay is ~44 rows of content and is clipped at
+24 rows, which is now a supported size: the sections past Options do not fit.
+Either it scrolls or it lays out in two columns when the terminal is short.

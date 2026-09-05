@@ -22,7 +22,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
     App, Confirm, Message, ModelDownload, ModelDownloadStatus, ModelSearch, Pane, Prompt, Screen,
-    Selector,
+    Selector, SessionPane,
 };
 use crate::domain::human_size;
 use crate::session::throughput::{Phase, format_rate};
@@ -59,7 +59,22 @@ enum Role {
     Preview,
 }
 
+/// The smallest terminal llmctl draws its interface in.
+///
+/// The classic terminal size, and about where the three-column browser stops
+/// being three columns of anything: narrower or shorter than this, panes are a
+/// few characters wide and the popups have nowhere to open. The app degrades
+/// down to here — shedding session columns, then the pane beside the list — and
+/// says what it needs below it rather than drawing a frame nobody can read.
+const MIN_COLS: u16 = 80;
+const MIN_ROWS: u16 = 24;
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+    if area.width < MIN_COLS || area.height < MIN_ROWS {
+        render_too_small(frame, area);
+        return;
+    }
     match app.screen {
         Screen::Browser => draw_browser(frame, app),
         Screen::Sessions => draw_sessions(frame, app),
@@ -83,6 +98,32 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Some(message) = &app.message {
         render_message(frame, frame.area(), message);
+    }
+}
+
+/// What llmctl shows instead of an interface it has no room for.
+///
+/// Plain centred lines, no border: the message has to survive sizes where a
+/// bordered popup would have nothing left inside it, and it names both what is
+/// needed and what there is, so the fix is a drag of the window edge.
+fn render_too_small(frame: &mut Frame, area: Rect) {
+    let lines = [
+        "terminal too small".to_string(),
+        format!("{MIN_COLS}\u{d7}{MIN_ROWS} needed \u{b7} {}\u{d7}{} now", area.width, area.height),
+        "q quit".to_string(),
+    ];
+    let rows = (lines.len() as u16).min(area.height);
+    let top = area.y + (area.height - rows) / 2;
+    for (i, line) in lines.iter().take(rows as usize).enumerate() {
+        let text = truncate_right(line, area.width as usize);
+        let left = area.x + (area.width.saturating_sub(text.width() as u16)) / 2;
+        let row = Rect::new(left, top + i as u16, area.width - (left - area.x), 1);
+        let style = if i == 0 {
+            Style::default().fg(ACCENT).bold()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        frame.render_widget(Paragraph::new(Line::styled(text, style)), row);
     }
 }
 
@@ -483,6 +524,21 @@ fn status_color(status: SessionStatus) -> Color {
 }
 
 /// The Session Manager: list of servers on the left, detail on the right.
+/// The narrowest a right-hand column is worth drawing.
+///
+/// Under this every Detail line wraps into fragments and a log tail shows a few
+/// characters per row — the pane stops answering anything and only takes width
+/// from the list, which is the one thing on this screen that must stay legible.
+const MIN_DETAIL_WIDTH: u16 = 44;
+
+/// Split the Session Manager's body into the jobs column and the pane beside
+/// it, which a narrow terminal does without entirely.
+fn session_panes(body: Rect) -> (Rect, Option<Rect>) {
+    let [jobs, detail] =
+        Layout::horizontal([Constraint::Percentage(57), Constraint::Percentage(43)]).areas(body);
+    if detail.width < MIN_DETAIL_WIDTH { (body, None) } else { (jobs, Some(detail)) }
+}
+
 fn draw_sessions(frame: &mut Frame, app: &mut App) {
     let [header, body, footer] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
@@ -497,8 +553,10 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
     ]);
     frame.render_widget(Paragraph::new(title), header);
 
-    let [jobs, detail] =
-        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(body);
+    let (jobs, detail) = session_panes(body);
+    // The key handler reads this: with no pane to swap, `l` opens the log full
+    // screen rather than doing nothing.
+    app.detail_pane_visible = detail.is_some();
     let [sessions, downloads] =
         Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(jobs);
     let focused = app.selected_server_session().is_some() || app.async_job_count() == 0;
@@ -510,7 +568,15 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
         focused,
     );
     render_download_list(frame, downloads, app);
-    render_session_detail(frame, detail, app);
+    if let Some(detail) = detail {
+        match app.session_pane {
+            // A download has no log, so its facts hold the column either way.
+            SessionPane::Log if app.selected_server_session().is_some() => {
+                render_session_log(frame, detail, app.selected_server_session())
+            }
+            _ => render_session_detail(frame, detail, app),
+        }
+    }
 
     let keys = if let Some(download) = app.selected_model_download() {
         match &download.status {
@@ -528,11 +594,16 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
             }
         }
     } else {
+        let pane = match app.session_pane {
+            SessionPane::Detail => ("l", "log"),
+            SessionPane::Log => ("l", "detail"),
+        };
         vec![
             ("x", "stop"),
             ("K", "kill"),
             ("R", "restart"),
-            ("L", "logs"),
+            pane,
+            ("L", "full log"),
             ("c", "copy url"),
             ("y", "yank cmd"),
             ("d", "remove"),
@@ -860,6 +931,73 @@ fn render_download_list(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+/// A live tail of the selected session's log, in the column the Detail pane
+/// otherwise holds.
+///
+/// The lines come from the ring buffer [`crate::session::SessionManager::refresh`]
+/// already fills every tick, so the pane costs no reading of its own — the log
+/// files reach tens of megabytes, and re-reading one each frame is what the
+/// full-screen view does and can afford to, because nothing else is on screen.
+///
+/// It always shows the end of the log. `j`/`k` still move between sessions, so
+/// there is no cursor to scroll it with; `L` opens the log where there is.
+fn render_session_log(frame: &mut Frame, area: Rect, session: Option<&Session>) {
+    let block = pane_block("Log", false);
+    let Some(session) = session else {
+        frame.render_widget(block, area);
+        return;
+    };
+    let width = area.width.saturating_sub(2) as usize;
+    let height = area.height.saturating_sub(2) as usize;
+
+    // Wrapped here rather than by `Wrap`, because the pane shows the *last*
+    // rows and only a row count we did ourselves says which those are.
+    let mut rows: Vec<String> = Vec::new();
+    for line in session.recent_log(height) {
+        rows.extend(wrap_hard(line, width));
+    }
+    if rows.len() > height {
+        rows = rows.split_off(rows.len() - height);
+    }
+
+    let text = if rows.is_empty() {
+        Text::from(Line::from("(nothing logged yet)".dim()))
+    } else {
+        Text::from(rows.into_iter().map(Line::raw).collect::<Vec<_>>())
+    };
+    frame.render_widget(Paragraph::new(text).block(block), area);
+}
+
+/// Break `text` into rows of at most `width` terminal columns.
+///
+/// Hard-wrapped mid-word on purpose: a log line is mostly paths, flags, and
+/// figures, and breaking those at spaces leaves a ragged column with no more
+/// text on it.
+fn wrap_hard(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    if text.width() <= width {
+        return vec![text.to_string()];
+    }
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let cell = c.width().unwrap_or(0);
+        if used + cell > width {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+        }
+        row.push(c);
+        used += cell;
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
 fn render_session_detail(frame: &mut Frame, area: Rect, app: &App) {
     let block = pane_block("Detail", false);
     let text = if let Some(session) = app.selected_server_session() {
@@ -1113,7 +1251,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
         help_row("t", "session manager"),
         help_row("x / K", "stop / kill / cancel"),
         help_row("R", "restart / resume"),
-        help_row("L", "view logs"),
+        help_row("l / →", "session log beside the list"),
+        help_row("L", "log full screen"),
         help_row("c", "copy endpoint"),
         Line::raw(""),
         Line::from("General".bold()),
@@ -1124,7 +1263,12 @@ fn render_help(frame: &mut Frame, area: Rect) {
     ];
 
     let height = lines.len() as u16 + 2;
-    let popup = center(area, Constraint::Length(44), Constraint::Length(height));
+    // Sized to the widest row it actually has, rather than to a number that was
+    // right when the rows were shorter: the longest description used to be cut
+    // mid-word. Never wider than the terminal, which may be narrower still.
+    let width = lines.iter().map(|line| line.width() as u16).max().unwrap_or(0);
+    let popup =
+        center(area, Constraint::Length((width + 4).min(area.width)), Constraint::Length(height));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1280,9 +1424,16 @@ fn kv<'a>(key: &str, value: &str) -> Line<'a> {
     ])
 }
 
+/// Columns the help overlay's key column reserves.
+///
+/// The longest chord plus a gap. `{keys:<8}` left none at all for `e / Enter`
+/// and `Home/End`, which ran straight into their own descriptions — and padded
+/// in `char`s, which is not what `l / \u{2192}` occupies.
+const HELP_KEY_WIDTH: usize = 11;
+
 fn help_row<'a>(keys: &str, desc: &str) -> Line<'a> {
     Line::from(vec![
-        Span::styled(format!("  {keys:<8}"), Style::default().fg(ACCENT)),
+        Span::styled(format!("  {}", pad_right(keys, HELP_KEY_WIDTH)), Style::default().fg(ACCENT)),
         Span::raw(desc.to_string()),
     ])
 }
@@ -1297,8 +1448,9 @@ fn center(area: Rect, horizontal: Constraint, vertical: Constraint) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::{
-        ICON_CLOUD, ICON_DIRECTORY, compact_count, download_progress, model_artifact_columns,
-        model_icon, render_confirm, truncate_download_name,
+        ICON_CLOUD, ICON_DIRECTORY, MIN_COLS, MIN_ROWS, compact_count, download_progress,
+        model_artifact_columns, model_icon, render_confirm, render_help, render_session_log,
+        render_too_small, session_panes, truncate_download_name, wrap_hard,
     };
     use crate::app::Confirm;
 
@@ -1609,6 +1761,171 @@ mod tests {
         // The cursor is on the second session, three rows below the first
         // heading — the row index the naive mapping would have got wrong.
         assert!(rows[heading + 3].contains("▌"), "cursor row: {:?}", rows[heading + 3]);
+    }
+
+    /// The pane is a tail: it shows the end of the log, and a line too long for
+    /// the column wraps inside it rather than over the border beside it.
+    #[test]
+    fn the_log_pane_shows_the_end_of_the_log_wrapped_to_its_column() {
+        let session = probe_session("muse", true).with_log(&[
+            "oldest line, long gone",
+            "slot launch_slot_: id  3 | task 0 | processing task",
+            "slot print_timing: id  3 | task 0 | prompt eval time = 712.25 ms / 67 tokens",
+            "slot      release: id  3 | task 0 | stop processing",
+        ]);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+        terminal.draw(|frame| render_session_log(frame, frame.area(), Some(&session))).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+
+        assert!(rows[0].contains("Log"), "the pane is titled");
+        // Wrapping breaks lines mid-word, so read the pane as the text it
+        // flows rather than row by row.
+        let flowed: String =
+            rows[1..rows.len() - 1].iter().map(|row| row.trim_matches('\u{2502}')).collect();
+        // The newest line is on screen and the oldest has scrolled off.
+        assert!(flowed.contains("stop processing"), "{rows:#?}");
+        assert!(!flowed.contains("oldest line"), "{rows:#?}");
+        // Every row still ends in the border it started with.
+        for row in &rows[1..rows.len() - 1] {
+            assert!(row.starts_with('\u{2502}') && row.ends_with('\u{2502}'), "{row:?}");
+        }
+    }
+
+    #[test]
+    fn an_unlogged_selection_leaves_an_empty_pane() {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 5)).unwrap();
+        terminal.draw(|frame| render_session_log(frame, frame.area(), None)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let screen: String = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .map(|cell| buffer[cell].symbol().to_string())
+            .collect();
+        assert!(screen.contains("Log"), "the pane keeps its frame");
+    }
+
+    /// Wrapping is measured in terminal columns, so a row of wide characters
+    /// stops at the column the pane ends at rather than one past it.
+    #[test]
+    fn wrapping_counts_columns_and_never_overruns_the_width() {
+        use unicode_width::UnicodeWidthStr;
+
+        assert_eq!(wrap_hard("short", 10), vec!["short"]);
+        assert_eq!(wrap_hard("exactly-10", 10), vec!["exactly-10"]);
+        assert_eq!(wrap_hard("abcdefghijk", 10), vec!["abcdefghij", "k"]);
+        assert!(wrap_hard("anything", 0).is_empty(), "a pane with no room shows nothing");
+
+        // Two columns per glyph: five fit in ten, and the odd width leaves one
+        // column unused rather than splitting a character across rows.
+        for width in [4, 5, 10, 11] {
+            for row in wrap_hard("從磁碟移除模型檔案嗎", width) {
+                assert!(row.width() <= width, "{row:?} overran {width}");
+            }
+        }
+    }
+
+    /// A pane too narrow to read is worse than no pane: it takes width from the
+    /// list, which is the one thing on this screen that has to stay legible.
+    #[test]
+    fn a_narrow_terminal_gives_the_whole_width_to_the_jobs_list() {
+        use ratatui::layout::Rect;
+        let body = |width| Rect::new(0, 1, width, 20);
+
+        for width in [40_u16, 60, 80, 100] {
+            let (jobs, detail) = session_panes(body(width));
+            assert!(detail.is_none(), "{width} columns left room for a pane");
+            assert_eq!(jobs.width, width, "the list takes what the pane gave up");
+        }
+
+        for width in [120_u16, 150, 200] {
+            let (jobs, detail) = session_panes(body(width));
+            let detail = detail.expect("a pane at {width} columns");
+            assert!(detail.width >= super::MIN_DETAIL_WIDTH, "{width}: {detail:?}");
+            assert_eq!(jobs.width + detail.width, width, "the split spends every column");
+        }
+
+        // Whatever width the pane first pays for itself at, it appears once
+        // and stays: no width below it has a pane, none above it lacks one.
+        let first =
+            (1_u16..240).find(|w| session_panes(body(*w)).1.is_some()).expect("a wide enough body");
+        assert!((1..first).all(|w| session_panes(body(w)).1.is_none()), "a pane below {first}");
+        assert!(
+            (first..240).all(|w| session_panes(body(w)).1.is_some()),
+            "the pane came and went above {first}"
+        );
+    }
+
+    /// Below the floor the interface is replaced by what it needs, and the
+    /// replacement has to survive sizes where even a bordered popup would not.
+    #[test]
+    fn a_terminal_under_the_floor_is_told_what_it_needs() {
+        use ratatui::layout::Rect;
+
+        let screen = |width: u16, height: u16| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render_too_small(frame, Rect::new(0, 0, width, height))).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // Just under the floor, both figures are on screen: what is needed and
+        // what there is, so the fix is a drag of the window edge.
+        let just_under = screen(MIN_COLS - 1, MIN_ROWS);
+        assert!(just_under.contains("terminal too small"), "{just_under}");
+        assert!(just_under.contains(&format!("{MIN_COLS}\u{d7}{MIN_ROWS} needed")), "{just_under}");
+        assert!(just_under.contains(&format!("{}\u{d7}{MIN_ROWS} now", MIN_COLS - 1)));
+        assert!(just_under.contains("q quit"), "the way out is on screen");
+
+        // Down to a terminal with room for nothing, drawing it is still safe
+        // and what fits is still the message.
+        for (width, height) in [(40, 10), (20, 3), (12, 2), (4, 1), (1, 1)] {
+            let tiny = screen(width, height);
+            assert!(
+                tiny.lines().all(|row| row.chars().count() == width as usize),
+                "{width}x{height} drew outside itself: {tiny:?}"
+            );
+        }
+        assert!(screen(20, 3).contains("terminal too"), "the first line survives a squeeze");
+    }
+
+    /// Regression: the key column was padded to eight `char`s, so the two
+    /// chords that reach it — `e / Enter` and `Home/End` — were printed with no
+    /// gap at all and ran into their own descriptions.
+    #[test]
+    fn every_help_key_is_separated_from_what_it_does() {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 46)).unwrap();
+        terminal.draw(|frame| render_help(frame, frame.area())).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let screen = rows.join("\n");
+
+        assert!(screen.contains("e / Enter  edit / cycle / pick value"), "{screen}");
+        assert!(screen.contains("Home/End   min / max"), "{screen}");
+        // The longest description used to be cut mid-word by a fixed width.
+        assert!(screen.contains("sort online models / switch catalog grouping"), "{screen}");
     }
 
     fn row_text(session: &crate::session::Session, width: usize) -> String {

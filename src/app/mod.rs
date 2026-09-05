@@ -252,6 +252,15 @@ impl Selector {
     }
 }
 
+/// What the right-hand column of the Session Manager shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPane {
+    /// The selected job's facts.
+    Detail,
+    /// A live tail of the selected session's log.
+    Log,
+}
+
 /// The top-level screen the UI is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -381,6 +390,11 @@ pub struct App {
     pub confirm: Option<Confirm>,
     /// Which top-level screen is active.
     pub screen: Screen,
+    /// Which pane the Session Manager's right-hand column holds.
+    pub session_pane: SessionPane,
+    /// Whether the last frame had room for that column at all. Written by the
+    /// renderer, which is the only place the terminal's width is known.
+    pub detail_pane_visible: bool,
     /// Running/known inference sessions.
     pub sessions: SessionManager,
     /// Selection cursor in the Session Manager list.
@@ -481,6 +495,8 @@ impl App {
             message: None,
             confirm: None,
             screen: Screen::Browser,
+            session_pane: SessionPane::Detail,
+            detail_pane_visible: true,
             sessions,
             session_sel: ListState::default(),
             log_lines: Vec::new(),
@@ -1267,9 +1283,9 @@ impl App {
             KeyCode::Char('d') => self.remove_async_job(),
             KeyCode::Char('c') => self.copy_endpoint(),
             KeyCode::Char('y') => self.yank_session_command(),
-            KeyCode::Char('L') | KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
-                self.open_logs()
-            }
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => self.toggle_session_pane(),
+            KeyCode::Char('h') | KeyCode::Left => self.session_pane = SessionPane::Detail,
+            KeyCode::Char('L') => self.open_logs(),
             KeyCode::F(5) => {
                 self.sessions.rediscover();
                 self.sync_session_selection();
@@ -1947,6 +1963,31 @@ impl App {
         copy_to_clipboard(&cmd.display());
         self.message =
             Some(Message { title: "Session command".into(), lines: command_message_lines(&cmd) });
+    }
+
+    /// Swap the Session Manager's right-hand column between the selected job's
+    /// facts and a live tail of its log (`l` / `→`, and back).
+    ///
+    /// The tail sits beside the list rather than over it, because the question
+    /// it answers — what is this server doing right now? — is usually asked
+    /// while watching the other sessions too. `L` still gives the log the whole
+    /// screen, which is what reading back through one wants.
+    fn toggle_session_pane(&mut self) {
+        // A download writes no log, so there is nothing to swap to.
+        if self.selected_server_index().is_none() {
+            return;
+        }
+        // On a terminal too narrow for the column, the log has nowhere to go
+        // but over the whole screen — which is better than the key doing
+        // nothing at all.
+        if !self.detail_pane_visible {
+            self.open_logs();
+            return;
+        }
+        self.session_pane = match self.session_pane {
+            SessionPane::Detail => SessionPane::Log,
+            SessionPane::Log => SessionPane::Detail,
+        };
     }
 
     /// Open the log-tail screen for the selected session (`L`).
@@ -3261,87 +3302,11 @@ fn copy_to_clipboard(text: &str) {
 fn read_log_tail(path: &std::path::Path, max_lines: usize) -> Vec<String> {
     let bytes = std::fs::read(path).unwrap_or_default();
     let content = String::from_utf8_lossy(&bytes);
-    let mut lines: Vec<String> = content.lines().map(visible_line).collect();
+    let mut lines: Vec<String> = content.lines().map(session::logtail::visible_line).collect();
     if lines.len() > max_lines {
         lines = lines.split_off(lines.len() - max_lines);
     }
     lines
-}
-
-/// Variation selectors (VS1–VS16 and the supplementary block) change how the
-/// preceding character is drawn without being drawn themselves — which is
-/// exactly what makes their width unmeasurable.
-fn is_variation_selector(c: char) -> bool {
-    matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}')
-}
-
-/// What a terminal would show for one log line.
-///
-/// A carriage return rewrites the row from column 0, so a progress bar that
-/// ticked a hundred times arrives as one line holding a hundred states. Only the
-/// last one was ever visible, and it is the only one worth showing in a log
-/// tail — the rest would be a wall of `Downloading: 0.3% … 0.5% …`.
-fn visible_line(raw: &str) -> String {
-    raw.split('\r')
-        .map(strip_control)
-        .filter(|segment| !segment.trim().is_empty())
-        .last()
-        .unwrap_or_default()
-}
-
-/// Drop ANSI escape sequences, stray control bytes, and variation selectors,
-/// keeping printable text.
-///
-/// Left in place, `ESC[K` (erase to end of line) would wipe the rest of the row
-/// including the log pane's border, and `ESC[?25l` would hide the cursor for the
-/// rest of the session.
-///
-/// Variation selectors go for a subtler reason. `⬇️` is `U+2B07 U+FE0F`, and the
-/// selector asks for emoji presentation, which a terminal draws two columns
-/// wide — but `unicode-width` still measures the pair as one. The renderer then
-/// lays the row out one cell narrower than it actually paints, and everything to
-/// its right, border included, is overwritten. Dropping the selector leaves a
-/// bare `U+2B07`, which measures and draws as one column. Characters that are
-/// emoji by default (`🔗`, `🔒`) carry no selector and already measure correctly.
-fn strip_control(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\x1b' {
-            if is_variation_selector(c) {
-                continue;
-            }
-            if c == '\t' || !c.is_control() {
-                out.push(c);
-            }
-            continue;
-        }
-        match chars.next() {
-            // CSI: parameter bytes, then a final byte in @..~ .
-            Some('[') => {
-                for c in chars.by_ref() {
-                    if ('\x40'..='\x7e').contains(&c) {
-                        break;
-                    }
-                }
-            }
-            // OSC: runs until BEL or a String Terminator.
-            Some(']') => {
-                while let Some(c) = chars.next() {
-                    if c == '\x07' {
-                        break;
-                    }
-                    if c == '\x1b' && chars.peek() == Some(&'\\') {
-                        chars.next();
-                        break;
-                    }
-                }
-            }
-            // Any other escape is two characters; both are already consumed.
-            _ => {}
-        }
-    }
-    out
 }
 
 /// Cycle through automatic device selection and the devices discovered from
@@ -3391,70 +3356,6 @@ mod tests {
         assert!(!is_assent(key(KeyCode::Enter, KeyModifiers::SHIFT)));
         assert!(!is_assent(key(KeyCode::Char('n'), KeyModifiers::NONE)));
         assert!(!is_assent(key(KeyCode::Esc, KeyModifiers::NONE)));
-    }
-
-    /// Regression: `flm` writes progress to its log the way it would to a
-    /// terminal. A bare carriage return sent the cursor back to column 0 and
-    /// `ESC[K` erased to end of line, so those rows overwrote the log pane's
-    /// borders and the text beside them.
-    #[test]
-    fn log_lines_are_reduced_to_what_a_terminal_would_show() {
-        // Verbatim bytes from a real FastFlowLM session log.
-        let overall = "\r[FLM]  Overall progress:  1/6 files";
-        assert_eq!(visible_line(overall), "[FLM]  Overall progress:  1/6 files");
-
-        // A progress bar redrawn in place: only the final state was ever visible.
-        let progress = "\u{1b}[?25l\r\u{1b}[K[FLM]  Downloading: 0.0% (0.0MB / 2340.0MB)\
-                        \r\u{1b}[K[FLM]  Downloading: 0.3% (6.0MB / 2340.0MB)\
-                        \r\u{1b}[K[FLM]  Downloading: 100.0% (2340.0MB / 2340.0MB)\u{1b}[?25h";
-        assert_eq!(visible_line(progress), "[FLM]  Downloading: 100.0% (2340.0MB / 2340.0MB)");
-
-        // Cursor show/hide around plain text leaves just the text.
-        assert_eq!(
-            visible_line("\u{1b}[?25l\u{1b}[?25h[FLM]  Checking Hash..."),
-            "[FLM]  Checking Hash..."
-        );
-
-        // Nothing survives a line that was only control bytes.
-        assert_eq!(visible_line("\u{1b}[?25l\u{1b}[?25h"), "");
-
-        // Ordinary lines pass through untouched, including colour codes.
-        assert_eq!(visible_line("plain server line"), "plain server line");
-        assert_eq!(visible_line("\u{1b}[31mred\u{1b}[0m text"), "red text");
-    }
-
-    /// Regression: a variation selector makes a character draw two columns wide
-    /// while `unicode-width` still measures one, so the log pane laid out rows
-    /// narrower than it painted them and clobbered its own border.
-    #[test]
-    fn rendered_log_width_matches_what_the_terminal_draws() {
-        use unicode_width::UnicodeWidthStr;
-
-        // Verbatim from a FastFlowLM session log: U+2B07 followed by U+FE0F.
-        let arrow = visible_line("[\u{2B07}\u{FE0F} ]  Incoming Request: GET");
-        assert_eq!(arrow, "[\u{2B07} ]  Incoming Request: GET");
-        // The selector is gone, so the measured width is now the drawn width.
-        assert!(!arrow.chars().any(is_variation_selector));
-        assert_eq!(arrow.width(), arrow.chars().count());
-
-        // Characters that are emoji by default carry no selector and already
-        // measure correctly at two columns; they must survive untouched.
-        let link = visible_line("[\u{1F517} ]  TCP connection established");
-        assert!(link.starts_with("[\u{1F517}"));
-        assert_eq!(link.width(), link.chars().count() + 1);
-    }
-
-    #[test]
-    fn no_rendered_log_line_can_carry_control_bytes() {
-        // Whatever a server writes, nothing that could move the cursor or erase
-        // the frame may reach the terminal.
-        let nasty = "\u{1b}[2J\u{1b}]0;title\u{7}\rone\u{1b}[Ktwo\u{0}\u{8}";
-        let rendered = visible_line(nasty);
-        assert!(
-            !rendered.chars().any(|c| c.is_control() && c != '\t'),
-            "control byte survived: {rendered:?}"
-        );
-        assert_eq!(rendered, "onetwo");
     }
 
     #[test]

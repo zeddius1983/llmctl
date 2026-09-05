@@ -13,6 +13,7 @@ pub mod record;
 pub mod supervisor;
 pub mod throughput;
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -118,6 +119,9 @@ pub struct Session {
     /// server's log they are read from.
     pub throughput: Throughput,
     log_tail: LogTail,
+    /// The tail of what the server has written, kept so the Session Manager can
+    /// show it without re-reading the file. See [`remember`].
+    recent: VecDeque<String>,
     /// Set while a restart is waiting out the old process; see [`PendingRestart`].
     restart_pending: Option<PendingRestart>,
 }
@@ -135,6 +139,7 @@ impl Session {
             last_cpu: None,
             throughput: Throughput::default(),
             log_tail: LogTail::default(),
+            recent: VecDeque::new(),
             restart_pending: None,
         }
     }
@@ -155,6 +160,45 @@ impl Session {
 
     pub fn status_label(&self) -> String {
         session_status_label(self.status, self.download_percent)
+    }
+
+    /// The last `count` lines the server wrote, oldest first.
+    pub fn recent_log(&self, count: usize) -> Vec<&str> {
+        let skip = self.recent.len().saturating_sub(count);
+        self.recent.iter().skip(skip).map(String::as_str).collect()
+    }
+
+    /// Seed the log tail directly, for rendering tests.
+    #[cfg(test)]
+    pub fn with_log(mut self, lines: &[&str]) -> Self {
+        remember(&mut self.recent, &lines.iter().map(|l| l.to_string()).collect::<Vec<_>>());
+        self
+    }
+}
+
+/// How much of a session's log the Session Manager keeps in memory.
+///
+/// Deep enough to fill the pane on the tallest terminal anyone drives this with,
+/// shallow enough that a dozen sessions cost a few hundred kilobytes between
+/// them. The file keeps the rest; `L` opens it.
+const RECENT_LINES: usize = 200;
+
+/// Append what a server just wrote to the tail kept for it, dropping the oldest
+/// lines past [`RECENT_LINES`].
+///
+/// Lines are cleaned on the way in, not on the way out: a progress bar redrawn
+/// a thousand times arrives as one line holding a thousand states, and the pane
+/// would otherwise reduce it again on every frame.
+fn remember(recent: &mut VecDeque<String>, appended: &[String]) {
+    for line in appended {
+        let line = logtail::visible_line(line);
+        if line.trim().is_empty() {
+            continue;
+        }
+        if recent.len() == RECENT_LINES {
+            recent.pop_front();
+        }
+        recent.push_back(line);
     }
 }
 
@@ -549,6 +593,7 @@ impl SessionManager {
             for measurement in appended.iter().flat_map(|line| parse(line)) {
                 s.throughput.record(measurement);
             }
+            remember(&mut s.recent, &appended);
             if let Some(now) = sample {
                 if let Some(prev) = prev {
                     s.cpu_percent = proc::cpu_percent(prev, now);
@@ -710,6 +755,7 @@ impl SessionManager {
         // the old process's figures as if they were the new one's.
         session.throughput = Throughput::default();
         session.log_tail = LogTail::default();
+        session.recent.clear();
         Ok(())
     }
 
@@ -806,6 +852,64 @@ pub fn format_uptime(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pane beside the session list reads this buffer, so what goes in is
+    /// what a terminal would have shown — and only the tail of it.
+    #[test]
+    fn the_log_tail_keeps_the_last_lines_as_a_terminal_would_show_them() {
+        let mut recent = VecDeque::new();
+
+        // A progress bar redrawn in place is one line, in its final state.
+        remember(
+            &mut recent,
+            &[
+                "starting".into(),
+                "\u{1b}[?25l\r\u{1b}[K[FLM]  Downloading: 0.3% (6.0MB / 2340.0MB)\r\u{1b}[K[FLM]  Downloading: 100.0% (2340.0MB / 2340.0MB)".into(),
+                // Nothing but control bytes was never on screen at all.
+                "\u{1b}[?25l\u{1b}[?25h".into(),
+                "   ".into(),
+            ],
+        );
+        assert_eq!(
+            recent.iter().collect::<Vec<_>>(),
+            ["starting", "[FLM]  Downloading: 100.0% (2340.0MB / 2340.0MB)"]
+        );
+
+        // Past the cap the oldest lines go, and the newest are the ones kept.
+        let flood: Vec<String> = (0..RECENT_LINES * 2).map(|i| format!("line {i}")).collect();
+        remember(&mut recent, &flood);
+        assert_eq!(recent.len(), RECENT_LINES);
+        assert_eq!(recent.front().map(String::as_str), Some("line 200"));
+        assert_eq!(recent.back().map(String::as_str), Some("line 399"));
+    }
+
+    #[test]
+    fn the_log_tail_hands_out_its_newest_lines() {
+        let session = Session::new(
+            record::SessionRecord {
+                id: "1".into(),
+                name: "n".into(),
+                runtime: "llama.cpp".into(),
+                model: "m".into(),
+                model_path: "m".into(),
+                profile: "p".into(),
+                size_bytes: None,
+                device: None,
+                pid: 1,
+                host: "127.0.0.1".into(),
+                port: 8000,
+                command: vec![],
+                health_path: "/health".into(),
+                log_file: Default::default(),
+                download: None,
+                started_unix: 0,
+            },
+            SessionStatus::Running,
+        )
+        .with_log(&["a", "b", "c"]);
+        assert_eq!(session.recent_log(2), ["b", "c"], "the tail, not the head");
+        assert_eq!(session.recent_log(9), ["a", "b", "c"], "asking for more is not an error");
+    }
 
     #[test]
     fn slug_and_session_name() {

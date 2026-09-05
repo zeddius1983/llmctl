@@ -277,6 +277,16 @@ list in that order so the cursor moves down the pane the way it looks. Cells are
 measured and padded in terminal columns, and `format_rate` is bounded by the
 field the rate cell reserves.
 
+`l`/`→` in the Session Manager swaps the Detail pane for a live tail of the
+selected session's log, and back; `L` still opens it full screen (ADR-017). The
+tail costs no reading of its own — the lines are the ones the manager already
+polls each tick for the rates, kept in a small per-session ring buffer instead
+of dropped, and cleaned once on the way in rather than on every frame. On a
+terminal too narrow for a readable pane (under about 102 columns) the jobs list
+takes the whole width and `l` opens the log full screen instead. Below
+80x24 the interface is replaced by the size it needs (ADR-018), which is where
+degrading stops being worth it.
+
 ## Next (post-v0.3.1)
 
 ### Online Hugging Face follow-ups
@@ -284,23 +294,26 @@ field the rate cell reserves.
 - [ ] Optional per-model MTP/projector precision selector; discovery currently
       follows the publisher's root default and deterministic precision fallback
 
+### Help overlay on a short terminal
+- [ ] The help popup is ~44 rows of content and 24 rows is now a supported
+      terminal (ADR-018), so everything past Options is clipped — including the
+      log-pane keys. Either scroll it (`j`/`k`, which the overlay has no state
+      for today) or lay it out in two columns when the terminal is short: at 80
+      columns two columns of ~22 rows fit a 24-row terminal exactly. Its width
+      now follows its longest row, so a two-column layout has that much less to
+      find.
+
 ### Session Manager Detail pane
-- [ ] Rework the Detail pane, which now restates the row it sits beside. Of the
+- [ ] Trim the Detail pane, which still restates the row it sits beside. Of the
       fifteen facts it shows, the columns and the runtime heading already carry
       nine — status, runtime, model, profile, port, size, backend, uptime, and
       both rates. Only PID, CPU, memory, endpoint, the per-request tokens and
       seconds behind each rate, and the command line are its own.
-      The idea on the table is to trim it to those and give the freed height to
-      a live tail of the selected session's log, so the pane answers "what is it
-      doing right now?" without pressing `L`. Two open questions: whether the
-      log belongs in the right column (wraps at ~76 columns) or as a full-width
-      strip along the bottom (costs the list height), and what the pane shows
-      for a download, which has no log.
-      Cheap to feed: `SessionManager::refresh` already polls every session's log
-      each tick for throughput (`session/mod.rs`) and drops the lines after
-      parsing them, so a small per-session ring buffer would populate the
-      preview for free. Reusing `App::read_log_tail` would not — it reads the
-      whole file, and these logs reach tens of megabytes.
+      The live log tail this entry also proposed is done (ADR-017): `l`/`→`
+      swaps the pane for a tail fed by the lines `SessionManager::refresh`
+      already reads each tick. What is left is deciding what the Detail pane
+      keeps once the log is a keystroke away, and whether a download — which has
+      no log — should show anything else in that column.
 
 ### Diffusion model support
 - [ ] Discover `llama-diffusion-cli` beside `llama-server` and on `$PATH`,

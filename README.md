@@ -71,11 +71,15 @@ and watch them from a built-in session manager.
   as the server last reported them), and uptime. Plus PID and `/proc`-sampled
   CPU & memory;
   a `/health` probe promotes Downloading → Starting → Running. Stop (`x`),
-  kill (`K`), restart (`R`), copy endpoint (`c`), and tail logs (`L`).
+  kill (`K`), restart (`R`), copy endpoint (`c`), and tail the log — `l` beside
+  the list, `L` full screen.
 
 ## Requirements
 
 - **Linux** (`setsid`, `/proc` sampling, and POSIX signals).
+- **A terminal of at least 80×24.** Below that llmctl says so rather than
+  drawing a frame nothing fits in; above it panes and columns are shed as room
+  runs out.
 - **At least one runtime.** Each is optional and discovered independently; a
   runtime that is missing or unusable is still listed, with the reason shown in
   the status line instead of failing at launch.
@@ -155,7 +159,8 @@ overlay.
 | `t` | Session manager |
 | `x` / `K` | Stop / kill a server; cancel a download |
 | `R` | Restart a server or resume a download |
-| `L` | View logs |
+| `l` / `→` | Tail the session's log beside the list (again for Detail) |
+| `L` | View the log full screen |
 | `c` | Copy endpoint |
 | **General** | |
 | `F5` | Rescan / reload |
