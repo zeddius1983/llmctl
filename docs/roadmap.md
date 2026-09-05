@@ -284,6 +284,24 @@ field the rate cell reserves.
 - [ ] Optional per-model MTP/projector precision selector; discovery currently
       follows the publisher's root default and deterministic precision fallback
 
+### Session Manager Detail pane
+- [ ] Rework the Detail pane, which now restates the row it sits beside. Of the
+      fifteen facts it shows, the columns and the runtime heading already carry
+      nine — status, runtime, model, profile, port, size, backend, uptime, and
+      both rates. Only PID, CPU, memory, endpoint, the per-request tokens and
+      seconds behind each rate, and the command line are its own.
+      The idea on the table is to trim it to those and give the freed height to
+      a live tail of the selected session's log, so the pane answers "what is it
+      doing right now?" without pressing `L`. Two open questions: whether the
+      log belongs in the right column (wraps at ~76 columns) or as a full-width
+      strip along the bottom (costs the list height), and what the pane shows
+      for a download, which has no log.
+      Cheap to feed: `SessionManager::refresh` already polls every session's log
+      each tick for throughput (`session/mod.rs`) and drops the lines after
+      parsing them, so a small per-session ring buffer would populate the
+      preview for free. Reusing `App::read_log_tail` would not — it reads the
+      whole file, and these logs reach tens of megabytes.
+
 ### Diffusion model support
 - [ ] Discover `llama-diffusion-cli` beside `llama-server` and on `$PATH`,
       including its version/help and supported launch flags.
