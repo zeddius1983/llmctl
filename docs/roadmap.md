@@ -67,6 +67,16 @@ the model they draft for (ADR-014). Defaults `spec-draft-n-max` to the drafter's
 `parallel`, and `sleep-idle-seconds`, and replaces the deprecated `--no-mmap`
 with `load-mode`. See [release notes](release-notes-v0.4.1.md).
 
+**v0.5.0 — model storage, live throughput, and the session log** — `D` removes a
+model's files from disk behind a one-line confirmation, planned against files
+rather than names so a Hugging Face blob, a shared companion, and a live session
+are each handled for the right reason (ADR-015). The Session Manager reports
+`tg`/`pp` rates read from the timings the runtimes already log (ADR-016), in
+aligned columns grouped under each runtime, and `l`/`→` swaps the Detail pane for
+a live tail of the selected session's log, fed by the lines that refresh already
+reads (ADR-017). Below 80x24 llmctl draws the size it needs instead of an
+interface (ADR-018). See [release notes](release-notes-v0.5.0.md).
+
 Branching: each remaining phase is built on its own `feature/<task>` branch.
 When a batch is ready to ship, the feature branches merge into a release umbrella
 (e.g. **`feature/v0.1.0`**), which then merges to `main` and is tagged. (Early
@@ -250,10 +260,10 @@ the Vulkan backend** — `pre-allocated tensor (output.weight) in a buffer
 both backends, so the 2.5x is dFlash, not the backend. Not an llmctl bug;
 noted here because the failure looks like one.
 
-### Unreleased — model deletion and session throughput
-Both features live on `feature/ui-enhancements` (PR #25), unmerged and without a
-version assigned; the release umbrella that takes them will decide the number
-and write the notes.
+### v0.5.0 — model deletion, session throughput, and the session log
+Merged from `feature/ui-enhancements` (PR #25) and released as v0.5.0: two new
+capability areas rather than an extension of an existing one, which is what the
+minor bump is for.
 
 `D` in the Model pane removes the selected model from disk, behind a one-line
 confirmation quoting the model and the space freed (ADR-015). It covers scanned

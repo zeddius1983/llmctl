@@ -8,7 +8,7 @@ The goal: **never hand-type a complex inference-server command again.** Browse
 your models, tune launch options with live validation, start detached servers,
 and watch them from a built-in session manager.
 
-> **Status:** v0.4.0. Two runtimes ship on **Linux**: **llama.cpp + GGUF**
+> **Status:** v0.5.0. Two runtimes ship on **Linux**: **llama.cpp + GGUF**
 > (CPU/GPU) and **FastFlowLM** (`flm`, AMD XDNA2 NPU). Others (vLLM, Ollama, …)
 > are future work behind the `RuntimeBackend` trait.
 

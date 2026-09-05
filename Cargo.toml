@@ -1,6 +1,6 @@
 [package]
 name = "llmctl"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 description = "Keyboard-driven TUI for managing local LLM inference servers"
 license = "MIT"
