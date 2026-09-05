@@ -12,7 +12,11 @@
 pub mod flm;
 pub mod llama_cpp;
 
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
 
 use crate::config::{Config, Paths};
 use crate::discovery::ModelSource;
@@ -58,6 +62,176 @@ pub struct LaunchContext<'a> {
     pub options: &'a [OptionItem],
 }
 
+/// A directory that is worth nothing once the directories it depends on are
+/// empty, and can then be removed whole.
+///
+/// This exists for the Hugging Face cache: removing the last artifact of a
+/// repository empties `blobs/` and `snapshots/` but leaves a `refs/main`
+/// pointer naming a revision whose files are gone. Pruning empty directories
+/// alone would never clear it, and only the runtime knows the combination is a
+/// husk rather than someone else's data.
+pub struct Husk {
+    /// The directory to remove recursively.
+    pub dir: PathBuf,
+    /// Removal happens only if each of these is absent or empty.
+    pub empty_first: Vec<PathBuf>,
+}
+
+/// What removing a model from local storage would delete, computed before
+/// anything is unlinked.
+///
+/// Nothing is unlinked until the user agrees to the plan, and then it is this
+/// plan that runs rather than a fresh one — so what happens is what was
+/// confirmed. `bytes` is the net figure the prompt quotes: files held back for
+/// another model are excluded, because they are not what the user gets back.
+#[derive(Default)]
+pub struct Deletion {
+    /// Files and symlinks to unlink.
+    pub files: Vec<PathBuf>,
+    /// Directory trees to remove wholesale (a FastFlowLM model directory).
+    pub trees: Vec<PathBuf>,
+    /// Directories to remove afterwards, deepest first, and only if unlinking
+    /// left them empty. Never recursive: anything still in them is not ours.
+    pub prune: Vec<PathBuf>,
+    /// A directory that becomes meaningless once the deletion lands.
+    pub husk: Option<Husk>,
+    /// Bytes the deletion frees. Excludes anything left behind for another
+    /// model, so it is what the user actually gets back.
+    pub bytes: u64,
+}
+
+impl Deletion {
+    /// Whether this plan would remove nothing, i.e. the model is not stored.
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.trees.is_empty()
+    }
+
+    /// Whether executing this plan would touch any of `paths` — a file it would
+    /// unlink, or anything inside a tree it would remove. Compared by resolved
+    /// identity, so the same file under two spellings counts once.
+    pub fn overlaps(&self, paths: &[PathBuf]) -> bool {
+        paths.iter().map(|path| canonical(path)).any(|path| {
+            self.files.iter().any(|file| canonical(file) == path)
+                || self.trees.iter().any(|tree| path.starts_with(canonical(tree)))
+        })
+    }
+
+    /// Unlink everything, then clear the directories that emptied out.
+    ///
+    /// An already-missing path is not an error: the plan is a snapshot, and
+    /// something else having removed a file first is the outcome asked for.
+    pub fn execute(&self) -> Result<()> {
+        for path in &self.files {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err).with_context(|| format!("removing {}", path.display()));
+                }
+            }
+        }
+        for tree in &self.trees {
+            match std::fs::remove_dir_all(tree) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err).with_context(|| format!("removing {}", tree.display()));
+                }
+            }
+        }
+        // Best-effort tidying: `remove_dir` fails on a non-empty directory,
+        // which is exactly the "leave what is not ours" rule.
+        for dir in &self.prune {
+            let _ = std::fs::remove_dir(dir);
+        }
+        if let Some(husk) = &self.husk
+            && husk.empty_first.iter().all(|dir| is_empty_dir(dir))
+        {
+            let _ = std::fs::remove_dir_all(&husk.dir);
+        }
+        Ok(())
+    }
+}
+
+/// Whether `dir` is absent or holds no entries.
+fn is_empty_dir(dir: &Path) -> bool {
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(err) => err.kind() == ErrorKind::NotFound,
+    }
+}
+
+/// Space unlinking every path in `files` actually gives back.
+///
+/// Three things stop a file's own length from being the answer, and all three
+/// are ordinary in a Hugging Face cache:
+///
+/// - A symlink costs nothing; the blob it points at is counted in its own
+///   right, and only if the plan names it too.
+/// - Two spellings can name one file — a relative `../../blobs/<oid>` link
+///   resolved and the recorded blob path — and counting it twice doubles the
+///   figure the prompt quotes.
+/// - A file with several hard links keeps its contents until the last name for
+///   it goes. Unlinking one of them frees nothing unless this plan unlinks the
+///   rest as well, so a multiply linked file counts only when the plan holds as
+///   many of its names as the file has.
+pub(crate) fn freed_bytes(files: &[PathBuf]) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+
+    // Keyed by the file itself, so hard links stay apart (they are distinct
+    // paths to one inode) while two spellings of one path collapse.
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut linked: HashMap<(u64, u64), (u64, u64, u64)> = HashMap::new();
+    for path in files {
+        let Ok(meta) = std::fs::symlink_metadata(path) else { continue };
+        if meta.is_symlink() || !seen.insert(canonical(path)) {
+            continue;
+        }
+        let entry = linked.entry((meta.dev(), meta.ino())).or_insert((meta.len(), meta.nlink(), 0));
+        entry.2 += 1;
+    }
+    linked.values().filter(|(_, links, planned)| planned >= links).map(|(len, ..)| len).sum()
+}
+
+/// What a symlink points at, resolved against the link's own directory:
+/// `huggingface_hub` writes relative links, llmctl absolute ones, and the same
+/// Hub cache holds both. `None` for anything that is not a symlink.
+pub(crate) fn link_target(link: &Path) -> Option<PathBuf> {
+    let target = std::fs::read_link(link).ok()?;
+    if target.is_absolute() { Some(target) } else { Some(link.parent()?.join(target)) }
+}
+
+/// A path with every symlink resolved, or the path itself if it cannot be.
+/// Used as file identity: two catalog entries that resolve here are one model.
+pub(crate) fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Identity of a path *as a name*: the directory it sits in resolved, the final
+/// component left alone.
+///
+/// The difference from [`canonical`] matters in the Hugging Face cache, where
+/// two revisions' snapshot links are two names for one blob. Resolved they are
+/// the same file; as names they are not, and "is anything else still called
+/// this?" is the question that decides whether the blob may go.
+pub(crate) fn name_identity(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => canonical(parent).join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Total size of every regular file under `dir`.
+pub(crate) fn tree_bytes(dir: &Path) -> u64 {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|meta| meta.len())
+        .sum()
+}
+
 /// One inference runtime: discovery result plus its dialect and behavior.
 pub trait RuntimeBackend: Send + Sync {
     /// Identity and probe result, rendered in the Runtime column.
@@ -74,6 +248,26 @@ pub trait RuntimeBackend: Send + Sync {
     /// the FastFlowLM label groups), in which case `profile_key` keeps them one
     /// logical model.
     fn models(&self, ctx: &CatalogCtx) -> Vec<Model>;
+
+    /// Which compute backend a launch with these options will run on —
+    /// `ROCm`, `Vulkan`, `CUDA`, `NPU`, `CPU`. Shown per session, because on a
+    /// machine with several it is the difference between a fast server and a
+    /// slow one, and nothing in the process list says which was chosen.
+    fn device_label(&self, _options: &[OptionItem]) -> Option<String> {
+        None
+    }
+
+    /// The on-disk footprint of `model`, so the user can reclaim it. `None`
+    /// when this runtime stores nothing for the model — it was never
+    /// downloaded, or the runtime has no notion of local storage at all.
+    ///
+    /// `catalog` is this runtime's full model list. A companion file shared
+    /// with another stored model — the projector or dFlash drafter paired with
+    /// every quantization of a repository — has to survive the deletion, and
+    /// nothing but the catalog can say whether it is still spoken for.
+    fn deletion(&self, _model: &Model, _catalog: &[Model]) -> Option<Deletion> {
+        None
+    }
 
     /// A spec's kind specialized for a model — used to bound context length by
     /// what the model was trained for. Most options are model-independent.
@@ -200,6 +394,20 @@ pub fn templates_for(runtime: &str) -> &'static [Template] {
     }
 }
 
+/// How to read per-request rates out of a runtime's log, identified only by
+/// name.
+///
+/// The same exception as [`templates_for`], for the same reason: session
+/// records are read off disk at startup, long before any backend is in hand,
+/// and they carry the runtime's name rather than a handle to it. Everywhere a
+/// backend *is* available, dispatch goes through the trait.
+pub fn throughput_parser(runtime: &str) -> fn(&str) -> Vec<crate::session::throughput::Sample> {
+    match runtime {
+        flm::NAME => flm::parse_throughput,
+        _ => llama_cpp::parse_throughput,
+    }
+}
+
 /// Resolve a binary to an absolute path: honor an explicit path, else search
 /// `$PATH`.
 pub(crate) fn resolve_binary(binary: &str) -> Option<std::path::PathBuf> {
@@ -217,4 +425,84 @@ pub fn discover(config: &Config, paths: &Paths) -> Vec<Box<dyn RuntimeBackend>> 
         Box::new(LlamaCppBackend::discover(&config.runtime.llama_cpp, &paths.cache_dir)),
         Box::new(FlmBackend::discover(&config.runtime.fastflowlm)),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: an in-flight download was matched by catalog id alone, but
+    /// the same partially fetched blobs reach the catalog under a second id
+    /// once the Hub cache is scanned. Overlap is decided by what is on disk.
+    #[test]
+    fn a_plan_overlaps_a_transfer_writing_the_same_files() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("llmctl-overlaps-{nonce}"));
+        let blobs = root.join("blobs");
+        let tree = root.join("flm-model");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&tree).unwrap();
+        let blob = blobs.join("aa");
+        std::fs::write(&blob, b"x").unwrap();
+
+        let plan = Deletion {
+            files: vec![blob.clone()],
+            trees: vec![tree.clone()],
+            ..Deletion::default()
+        };
+        assert!(plan.overlaps(&[blob.clone()]));
+        // The same blob spelled with a traversal is the same file.
+        assert!(plan.overlaps(&[blobs.join("..").join("blobs").join("aa")]));
+        // Anything inside a tree the plan removes counts too.
+        assert!(plan.overlaps(&[tree.join("model.bin")]));
+        assert!(!plan.overlaps(&[blobs.join("bb")]));
+        assert!(!plan.overlaps(&[]));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Regression: the prompt quoted every file's own length, so a GGUF hard
+    /// linked into a second directory was reported as gigabytes reclaimed while
+    /// unlinking one of its two names freed nothing at all.
+    #[test]
+    fn a_file_counts_only_once_its_last_name_goes() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("llmctl-freed-{nonce}"));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let plain = root.join("plain.gguf");
+        std::fs::write(&plain, vec![0u8; 100]).unwrap();
+        assert_eq!(freed_bytes(&[plain.clone()]), 100, "a file with one name frees its length");
+        // Spelling it twice does not free it twice.
+        assert_eq!(freed_bytes(&[plain.clone(), root.join(".").join("plain.gguf")]), 100);
+
+        let shared = root.join("shared.gguf");
+        let other_name = root.join("also-shared.gguf");
+        std::fs::write(&shared, vec![0u8; 400]).unwrap();
+        std::fs::hard_link(&shared, &other_name).unwrap();
+        assert_eq!(freed_bytes(&[shared.clone()]), 0, "the contents survive under the other name");
+        assert_eq!(
+            freed_bytes(&[shared.clone(), other_name.clone()]),
+            400,
+            "unlinking every name does free them"
+        );
+        assert_eq!(
+            freed_bytes(&[plain.clone(), shared.clone()]),
+            100,
+            "and a mixed plan counts only what it fully releases"
+        );
+
+        // A symlink is a name for the blob, not a second copy of it.
+        let link = root.join("link.gguf");
+        std::os::unix::fs::symlink(&plain, &link).unwrap();
+        assert_eq!(freed_bytes(&[link, plain]), 100);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

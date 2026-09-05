@@ -250,9 +250,42 @@ the Vulkan backend** — `pre-allocated tensor (output.weight) in a buffer
 both backends, so the 2.5x is dFlash, not the backend. Not an llmctl bug;
 noted here because the failure looks like one.
 
-## In progress
+### Unreleased — model deletion and session throughput
+Both features live on `feature/ui-enhancements` (PR #25), unmerged and without a
+version assigned; the release umbrella that takes them will decide the number
+and write the notes.
 
-Nothing in flight — v0.4.1 is tagged and the next batch has not started.
+`D` in the Model pane removes the selected model from disk, behind a one-line
+confirmation quoting the model and the space freed (ADR-015). It covers scanned
+GGUFs, the Hugging Face blob cache — where the hash-named files are otherwise
+unreadable, and a scanned GGUF is a symlink whose bytes live in the blob behind
+it — and FastFlowLM model directories. Companions shared with another stored
+quantization survive, and profiles are kept. The plan is anchored to files
+rather than to names throughout: to the snapshot the selected artifact was found
+in, to what is cached on disk rather than what the last refresh saw, and — for
+the live-session guard — to a session's absolute paths, download record, and
+argv. `presence-penalty` was added to the llama.cpp option table alongside it.
+
+The Session Manager reports `tg` (decode) and `pp` (prefill) rates read from the
+per-request timings both runtimes already write to the session log — no
+`--metrics`, no restart, latest measurement unaveraged (ADR-016). Rows became
+aligned columns — status · model · profile · port · size · backend · tg · pp ·
+uptime — shedding the least useful first on a narrow pane; size and compute
+backend are recorded at launch, since neither can be recovered from a running
+server. Sessions are grouped under their runtime, with the manager holding the
+list in that order so the cursor moves down the pane the way it looks. Cells are
+measured and padded in terminal columns, and `format_rate` is bounded by the
+field the rate cell reserves.
+
+`l`/`→` in the Session Manager swaps the Detail pane for a live tail of the
+selected session's log, and back; `L` still opens it full screen (ADR-017). The
+tail costs no reading of its own — the lines are the ones the manager already
+polls each tick for the rates, kept in a small per-session ring buffer instead
+of dropped, and cleaned once on the way in rather than on every frame. On a
+terminal too narrow for a readable pane (under about 102 columns) the jobs list
+takes the whole width and `l` opens the log full screen instead. Below
+80x24 the interface is replaced by the size it needs (ADR-018), which is where
+degrading stops being worth it.
 
 ## Next (post-v0.3.1)
 
@@ -260,6 +293,27 @@ Nothing in flight — v0.4.1 is tagged and the next batch has not started.
 - [ ] Recent sorting and size/quantization filters
 - [ ] Optional per-model MTP/projector precision selector; discovery currently
       follows the publisher's root default and deterministic precision fallback
+
+### Help overlay on a short terminal
+- [ ] The help popup is ~44 rows of content and 24 rows is now a supported
+      terminal (ADR-018), so everything past Options is clipped — including the
+      log-pane keys. Either scroll it (`j`/`k`, which the overlay has no state
+      for today) or lay it out in two columns when the terminal is short: at 80
+      columns two columns of ~22 rows fit a 24-row terminal exactly. Its width
+      now follows its longest row, so a two-column layout has that much less to
+      find.
+
+### Session Manager Detail pane
+- [ ] Trim the Detail pane, which still restates the row it sits beside. Of the
+      fifteen facts it shows, the columns and the runtime heading already carry
+      nine — status, runtime, model, profile, port, size, backend, uptime, and
+      both rates. Only PID, CPU, memory, endpoint, the per-request tokens and
+      seconds behind each rate, and the command line are its own.
+      The live log tail this entry also proposed is done (ADR-017): `l`/`→`
+      swaps the pane for a tail fed by the lines `SessionManager::refresh`
+      already reads each tick. What is left is deciding what the Detail pane
+      keeps once the log is a keystroke away, and whether a download — which has
+      no log — should show anything else in that column.
 
 ### Diffusion model support
 - [ ] Discover `llama-diffusion-cli` beside `llama-server` and on `$PATH`,
@@ -276,7 +330,8 @@ Nothing in flight — v0.4.1 is tagged and the next batch has not started.
 ### FastFlowLM follow-ups
 - [ ] `DownloadRecord::Directory` variant, replacing the sentinel `complete_file`
       used to track `flm serve`'s own native downloads (ADR-013)
-- [ ] `flm remove` for installed models (the CLI supports it; no llmctl binding yet)
+- [x] Removing an installed model — done by llmctl rather than by `flm remove`,
+      for the same reason it downloads them itself (ADR-013, ADR-015)
 - [ ] Surface `think` / `think_toggleable` from the catalog as a profile option
 - [x] `flm bench` — it was a hidden subcommand of v0.9.45 all along, not a
       missing one; `b` now benchmarks the selected FastFlowLM model (ADR-012)

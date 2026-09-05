@@ -24,10 +24,11 @@ use crate::discovery::hf;
 use crate::domain::{FlmModel, Model, OptionItem, Runtime};
 use crate::profiles::registry::{OptionKind, OptionSchema, OptionSpec};
 use crate::profiles::templates::Template;
-use crate::runtime::{CatalogCtx, LaunchContext, RuntimeBackend};
+use crate::runtime::{CatalogCtx, Deletion, LaunchContext, RuntimeBackend, tree_bytes};
 use crate::session::command::Command;
 use crate::session::record::{DownloadBlob, DownloadRecord};
 use crate::session::supervisor;
+use crate::session::throughput::{Phase, Sample};
 
 pub const NAME: &str = "FastFlowLM";
 
@@ -340,6 +341,33 @@ impl RuntimeBackend for FlmBackend {
         models
     }
 
+    /// FastFlowLM only ever runs on the XDNA2 NPU; that is the whole point of
+    /// the runtime.
+    fn device_label(&self, _options: &[OptionItem]) -> Option<String> {
+        Some("NPU".into())
+    }
+
+    /// `flm` gives each model a directory of its own under its model root, so
+    /// removing one is removing that directory — including any `.llmctl-part`
+    /// scratch a cancelled download left in it.
+    fn deletion(&self, model: &Model, catalog: &[Model]) -> Option<Deletion> {
+        let dir = model_dir(model)?;
+        if !dir.is_dir() {
+            return None;
+        }
+        // A directory is named after the repository, not the tag. Two installed
+        // tags resolving to one directory would make this a shared deletion;
+        // the catalog has no such pair today, but do not find out the hard way.
+        let tag = model.flm.as_ref().map(|flm| flm.tag.as_str());
+        if catalog.iter().any(|other| {
+            other.flm.as_ref().is_some_and(|flm| flm.installed && Some(flm.tag.as_str()) != tag)
+                && model_dir(other).as_ref() == Some(&dir)
+        }) {
+            return None;
+        }
+        Some(Deletion { bytes: tree_bytes(&dir), trees: vec![dir], ..Deletion::default() })
+    }
+
     /// `ctx-len` is bounded by the model's trained context.
     fn effective_kind(&self, spec: &OptionSpec, model: &Model) -> OptionKind {
         match (spec.key, model.context_length) {
@@ -489,13 +517,35 @@ fn tag(model: &Model) -> String {
 /// Where `flm` keeps a model's files. `flm` names the directory after the
 /// repository alone, without its owner.
 pub fn model_dir(model: &Model) -> Option<PathBuf> {
-    let flm = model.flm.as_ref()?;
-    Some(model_root().join(repo_dir_name(&flm.repo)))
+    model_dir_in(&model_root(), model)
 }
 
-/// The directory `flm` stores a repository under: its last path segment.
-fn repo_dir_name(repo: &str) -> &str {
-    repo.rsplit('/').next().unwrap_or(repo)
+/// [`model_dir`] against a given root, so the guards below can be tested
+/// without an environment variable the rest of the suite also reads.
+fn model_dir_in(root: &Path, model: &Model) -> Option<PathBuf> {
+    let flm = model.flm.as_ref()?;
+    let name = repo_dir_name(&flm.repo)?;
+    // Only an absolute root locates storage. An empty one — `FLM_MODEL_PATH`
+    // set to nothing, or no home directory to resolve — makes the join below a
+    // bare relative name, and so does a relative `FLM_MODEL_PATH`: either
+    // resolves against whatever working directory llmctl happens to have, so a
+    // deletion would recursively remove a same-named directory sitting beside
+    // it rather than the model.
+    if !root.is_absolute() {
+        return None;
+    }
+    let dir = root.join(name);
+    // Never the root itself. `Entry::url` is `#[serde(default)]`, so a catalog
+    // row with a missing or unparseable URL yields an empty repository, and
+    // `join("")` on the root is the root — which a deletion would then remove
+    // recursively, taking every installed model with it.
+    (dir.parent() == Some(root)).then_some(dir)
+}
+
+/// The directory `flm` stores a repository under: its last path segment, or
+/// `None` when the repository does not name one.
+fn repo_dir_name(repo: &str) -> Option<&str> {
+    repo.rsplit('/').next().filter(|name| !name.is_empty() && *name != "." && *name != "..")
 }
 
 /// FastFlowLM's model root: `$FLM_MODEL_PATH`, else `~/.config/flm/models`.
@@ -703,7 +753,9 @@ impl Entry {
 
     fn to_model(&self, group: &[String], root: &Path, models_dir: &Path) -> Model {
         let repo = self.repo();
-        let dir = root.join(repo_dir_name(&repo));
+        // No usable directory name means no local path: a catalog row whose
+        // URL is missing must not resolve to the model root.
+        let dir = repo_dir_name(&repo).map(|name| root.join(name));
         let mut catalog_path = group.to_vec();
         catalog_path.push(self.name.clone());
         Model {
@@ -712,7 +764,7 @@ impl Entry {
             // Only an installed model has a local path; a catalog entry that
             // hasn't been pulled is still a real, launchable model (`flm serve`
             // downloads it), which is why `is_catalog_dir` also consults `flm`.
-            path: if self.installed { dir } else { PathBuf::new() },
+            path: if self.installed { dir.unwrap_or_default() } else { PathBuf::new() },
             shard_paths: Vec::new(),
             mtp_path: None,
             dflash_path: None,
@@ -744,6 +796,45 @@ impl Entry {
             runtime: NAME.to_string(),
         }
     }
+}
+
+/// Per-request timings from an `flm serve` log line, if it carries any.
+///
+/// `flm` streams `ChatCompletionChunk: {…}` lines and puts a `usage` object on
+/// the final one, with the token counts and the durations behind them:
+///
+/// ```text
+/// ChatCompletionChunk: {…,"usage":{"prompt_tokens":299,"completion_tokens":10,
+///   "prefill_duration_ttft":7.53,"decoding_duration":0.97,
+///   "prefill_speed_tps":39.69,"decoding_speed_tps":10.36}}
+/// ```
+///
+/// It reports the rates too, but the counts and durations are what get used:
+/// they divide out to the same figures and, unlike a rate, can be summed across
+/// requests to average a window.
+pub fn parse_throughput(line: &str) -> Vec<Sample> {
+    let Some((_, json)) = line.split_once("ChatCompletionChunk:") else { return Vec::new() };
+    let Ok(chunk) = serde_json::from_str::<serde_json::Value>(json.trim()) else {
+        return Vec::new();
+    };
+    // Only the closing chunk of a stream carries usage.
+    let Some(usage) = chunk.get("usage") else { return Vec::new() };
+
+    let read = |tokens: &str, duration: &str, phase: Phase| -> Option<Sample> {
+        let sample = Sample {
+            phase,
+            tokens: usage.get(tokens)?.as_u64()?,
+            seconds: usage.get(duration)?.as_f64()?,
+        };
+        sample.rate().is_some().then_some(sample)
+    };
+    [
+        read("prompt_tokens", "prefill_duration_ttft", Phase::Prefill),
+        read("completion_tokens", "decoding_duration", Phase::Decode),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// A tag as a single filesystem-safe path segment (`qwen3:4b` → `qwen3_4b`).
@@ -1013,6 +1104,76 @@ mod tests {
 
     /// FastFlowLM is exclusive (one NPU hardware context) where llama.cpp is
     /// not — the distinction the launch guard rests on.
+    /// Regression: `Entry::url` is optional, so a catalog row without one has
+    /// an empty repository. `join("")` on the model root is the root, and the
+    /// deletion plan would have removed it recursively — every installed model.
+    #[test]
+    fn a_catalog_row_without_a_url_resolves_to_no_directory_at_all() {
+        assert_eq!(repo_dir_name("FastFlowLM/Qwen3-4B-NPU2"), Some("Qwen3-4B-NPU2"));
+        assert_eq!(repo_dir_name(""), None);
+        assert_eq!(repo_dir_name("owner/"), None);
+        assert_eq!(repo_dir_name(".."), None);
+
+        let mut entry = entries()[0].clone();
+        entry.url = String::new();
+        entry.installed = true;
+        let model = entry.to_model(&local("reasoning"), Path::new("/models"), Path::new("/cfg"));
+        assert_eq!(model.path, PathBuf::new(), "no directory means no local path");
+        assert_eq!(model_dir(&model), None, "and nothing for a deletion to remove");
+    }
+
+    /// Regression: an unusable model root used to pass the "never the root
+    /// itself" check, because the parent of a bare `Qwen3-4B-NPU2` is the empty
+    /// path and so is the root. The deletion plan then held a *relative*
+    /// directory, which `remove_dir_all` resolves against llmctl's own working
+    /// directory — someone else's tree entirely.
+    #[test]
+    fn a_model_root_that_is_not_absolute_resolves_to_no_directory_at_all() {
+        let mut entry = entries()[0].clone();
+        entry.installed = true;
+        let model = entry.to_model(&local("reasoning"), Path::new("/models"), Path::new("/cfg"));
+
+        // `FLM_MODEL_PATH=` set to nothing, or no home directory to resolve.
+        assert_eq!(model_dir_in(Path::new(""), &model), None, "an empty root names nothing");
+        // A relative `FLM_MODEL_PATH`, which `flm` resolves against its own
+        // working directory rather than llmctl's.
+        assert_eq!(model_dir_in(Path::new("models"), &model), None, "nor does a relative one");
+
+        let dir = model_dir_in(Path::new("/srv/flm"), &model).expect("an absolute root resolves");
+        assert_eq!(dir.parent(), Some(Path::new("/srv/flm")));
+    }
+
+    /// A verbatim closing chunk from a real `flm serve` log.
+    #[test]
+    fn per_request_timings_are_read_from_the_closing_chunk() {
+        let line = r#"ChatCompletionChunk: {"id":"chatcmpl-2c0e58d9ea2b7e21bd157485","object":"chat.completion.chunk","created":1785106964,"model":"qwen3.6-moe:35b-a3b","choices":[{"index":0,"delta":{"content":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":299,"completion_tokens":10,"total_tokens":309,"load_duration":11.668804608,"prefill_duration_ttft":7.53399552,"decoding_duration":0.965662,"prefill_speed_tps":39.68677698390774,"decoding_speed_tps":10.355590258289132}}"#;
+
+        let samples = parse_throughput(line);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].phase, Phase::Prefill);
+        assert_eq!(samples[0].tokens, 299);
+        assert_eq!(samples[1].phase, Phase::Decode);
+        assert_eq!(samples[1].tokens, 10);
+        // The counts over the durations reproduce the rates `flm` itself
+        // reports, which is why they are used instead of those rates.
+        assert!((samples[0].rate().unwrap() - 39.686_776_983_907_74).abs() < 1e-9);
+        assert!((samples[1].rate().unwrap() - 10.355_590_258_289_132).abs() < 1e-9);
+    }
+
+    /// Streaming emits a chunk per token; only the closing one carries usage.
+    #[test]
+    fn chunks_without_usage_are_not_measurements() {
+        for line in [
+            r#"ChatCompletionChunk: {"id":"x","choices":[{"delta":{"content":"hi"}}]}"#,
+            "ChatCompletionChunk: not json at all",
+            "[FLM]  Start prefill...",
+            "[FLM]  Prefill chunk 1/1 with 299 tokens",
+            "",
+        ] {
+            assert!(parse_throughput(line).is_empty(), "should not measure: {line}");
+        }
+    }
+
     #[test]
     fn only_the_npu_runtime_is_single_session() {
         let flm = FlmBackend::discover(&FastFlowLmConfig::default());
@@ -1306,6 +1467,8 @@ mod tests {
                 health_path: backend.health_path().into(),
                 download: None,
                 profile: "Default".into(),
+                size_bytes: None,
+                device: None,
                 host: "127.0.0.1".into(),
                 port,
             })
@@ -1477,7 +1640,7 @@ mod tests {
         // The Hub needs the full id...
         assert_eq!(entry.repo(), "FastFlowLM/Qwen3-4B-NPU2");
         // ...while flm names the directory after the repository alone.
-        assert_eq!(repo_dir_name(&entry.repo()), "Qwen3-4B-NPU2");
+        assert_eq!(repo_dir_name(&entry.repo()), Some("Qwen3-4B-NPU2"));
         let model = entry.to_model(&local("reasoning"), Path::new("/models"), Path::new("/cfg"));
         assert_eq!(model.path, Path::new("/models/Qwen3-4B-NPU2"));
     }

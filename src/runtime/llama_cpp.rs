@@ -10,10 +10,14 @@ use crate::config::{Defaults, LlamaCppConfig};
 use crate::domain::{Model, OptionItem, RemoteModel, Runtime};
 use crate::profiles::registry::{DEFAULT, OptionKind, OptionSchema, OptionSpec};
 use crate::profiles::templates::Template;
-use crate::runtime::{CatalogCtx, LaunchContext, RuntimeBackend};
+use crate::runtime::{
+    CatalogCtx, Deletion, LaunchContext, RuntimeBackend, canonical, freed_bytes, link_target,
+    name_identity,
+};
 use crate::session::command::Command;
 use crate::session::record::{DownloadBlob, DownloadRecord};
 use crate::session::supervisor;
+use crate::session::throughput::{Phase, Sample};
 
 use OptionKind::{Enum, Float, Int, Str};
 
@@ -168,6 +172,15 @@ pub static SPECS: &[OptionSpec] = &[
         step: 0.05,
         description: "Penalty applied to repeated tokens \
                       (1.0 = disabled; 'default' = llama.cpp's 1.0).",
+    },
+    OptionSpec {
+        key: "presence-penalty",
+        cli: "--presence-penalty",
+        kind: Float { min: Some(-2.0), max: Some(2.0) },
+        default: "0.0",
+        step: 0.05,
+        description: "Repeat alpha presence penalty: a flat penalty on tokens that already \
+                      appeared (0.0 = disabled; 'default' = llama.cpp's 0.0).",
     },
     OptionSpec {
         key: "threads",
@@ -348,9 +361,8 @@ fn omit_token(key: &str) -> Option<&'static str> {
         "batch-size" | "device" | "gpu-layers" | "threads" | "cache-type-k" | "cache-type-v"
         | "spec-draft-n-max" | "spec-draft-n-min" | "reasoning-effort" | "chat-template"
         | "ctx-size" | "temperature" | "top-p" | "top-k" | "min-p" | "repeat-penalty"
-        | "split-mode" | "tensor-split" | "parallel" | "sleep-idle-seconds" | "load-mode" => {
-            Some(DEFAULT)
-        }
+        | "presence-penalty" | "split-mode" | "tensor-split" | "parallel"
+        | "sleep-idle-seconds" | "load-mode" => Some(DEFAULT),
         // host/port are never omitted: llmctl itself needs the concrete
         // endpoint for health checks and the Session Manager display.
         _ => None,
@@ -481,6 +493,41 @@ impl RuntimeBackend for LlamaCppBackend {
         crate::discovery::reconcile(ctx.models_dir, &mut models);
         models.extend(crate::discovery::online::load_cached(ctx.models_dir));
         models
+    }
+
+    /// The `device` option names it outright (`ROCm0` → `ROCm`). Left at
+    /// `default`, llama.cpp picks the first device it discovered, so that is
+    /// what gets reported — and `CPU` when it found none.
+    ///
+    /// `gpu-layers` overrules all of that: offloading nothing runs the model on
+    /// the CPU whichever accelerator `--device` happens to name.
+    fn device_label(&self, options: &[OptionItem]) -> Option<String> {
+        let value = |key: &str| {
+            options
+                .iter()
+                .find(|option| option.key == key)
+                .map(|option| option.value.as_str())
+                .filter(|value| *value != DEFAULT && !value.is_empty())
+        };
+        if value("gpu-layers").and_then(|layers| layers.parse::<i64>().ok()) == Some(0) {
+            return Some("CPU".into());
+        }
+        let device = match value("device") {
+            Some(device) => device,
+            None => self.runtime.devices.first().map(String::as_str).unwrap_or("CPU"),
+        };
+        Some(backend_of(device))
+    }
+
+    /// A GGUF lives in one of two places: a scanned model directory, where it
+    /// is the file the user put there, or the Hugging Face cache, where it is a
+    /// set of hash-named blobs. Both are removable; only the second needs the
+    /// cache layout unpicked for it.
+    fn deletion(&self, model: &Model, catalog: &[Model]) -> Option<Deletion> {
+        match model.remote {
+            Some(_) => crate::discovery::online::deletion(model, catalog),
+            None => local_deletion(model, catalog),
+        }
     }
 
     /// `ctx-size` gains an upper bound equal to the model's trained context
@@ -745,6 +792,178 @@ impl RuntimeBackend for LlamaCppBackend {
     }
 }
 
+/// A GGUF scanned from a configured model directory: its shards, plus the
+/// sidecars no other scanned model is using.
+///
+/// The catalog leaf under `~/.config/llmctl/models/` is left standing apart
+/// from its now-dangling `model.gguf` link — the per-model profiles in it
+/// should survive putting the same GGUF back.
+fn local_deletion(model: &Model, catalog: &[Model]) -> Option<Deletion> {
+    if model.path.as_os_str().is_empty() {
+        return None;
+    }
+    // Paths held by any *other* model. The Hugging Face cache is one of the
+    // directories llmctl scans, so the same GGUF can also be in the catalog as
+    // an online artifact; that twin is the same file under the same name, not
+    // another model laying claim to it. Compared as names rather than resolved:
+    // two snapshot links onto one blob resolve alike but are two artifacts, and
+    // the other one still needs its blob.
+    let identity = canonical(&model.path);
+    let self_name = name_identity(&model.path);
+    let claimed: Vec<PathBuf> = catalog
+        .iter()
+        .filter(|other| {
+            !other.path.as_os_str().is_empty()
+                && other.id != model.id
+                && name_identity(&other.path) != self_name
+        })
+        .flat_map(occupied_paths)
+        .collect();
+
+    // A GGUF scanned out of the Hub cache is a link into `blobs/`, and that
+    // blob may be named by revisions this catalog never listed.
+    let repo_dir = crate::discovery::online::hub_repo_dir(&identity);
+    let paths = occupied_paths(model);
+    let own_links: Vec<PathBuf> = paths
+        .iter()
+        .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()))
+        .cloned()
+        .collect();
+
+    let mut plan = Deletion::default();
+    for path in paths {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        if plan.files.contains(&path) || claimed.contains(&path) {
+            continue;
+        }
+        if !meta.is_symlink()
+            && let Some(repo_dir) = &repo_dir
+            && crate::discovery::online::blob_linked_elsewhere(repo_dir, &path, &own_links)
+        {
+            continue;
+        }
+        plan.files.push(path);
+    }
+    if plan.is_empty() {
+        return None;
+    }
+
+    // A GGUF scanned out of the Hugging Face cache leaves that cache's
+    // directories behind; clear the ones this model emptied.
+    if let Some(repo_dir) = crate::discovery::online::hub_repo_dir(&identity) {
+        let snapshots = repo_dir.join("snapshots");
+        let blobs = repo_dir.join("blobs");
+        // Every directory between an unlinked snapshot file and `snapshots/`
+        // itself — a repository that files its quantizations away nests them,
+        // and one level left behind holds the snapshot open, and with it the
+        // repository. Pruning is a single pass, so the list is sorted deepest
+        // first rather than left in the order the files were planned.
+        let mut prune: Vec<PathBuf> = Vec::new();
+        for file in plan.files.iter().filter(|file| file.starts_with(&snapshots)) {
+            for ancestor in file.ancestors().skip(1).take_while(|dir| *dir != snapshots) {
+                let dir = ancestor.to_path_buf();
+                if !prune.contains(&dir) {
+                    prune.push(dir);
+                }
+            }
+        }
+        prune.push(snapshots.clone());
+        prune.push(blobs.clone());
+        prune.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+        plan.prune = prune;
+        plan.husk =
+            Some(crate::runtime::Husk { empty_first: vec![blobs, snapshots], dir: repo_dir });
+    }
+
+    let leaf_link = model.catalog_dir.join("model.gguf");
+    if std::fs::symlink_metadata(&leaf_link).is_ok_and(|meta| meta.is_symlink()) {
+        plan.files.push(leaf_link);
+    }
+    // Sized once the list is settled, not file by file: what a hard-linked GGUF
+    // frees depends on whether the plan holds its other names too.
+    plan.bytes = freed_bytes(&plan.files);
+    Some(plan)
+}
+
+/// Every file a model occupies: its shards and companions, plus — for each one
+/// that is a symlink — the file the link points at.
+///
+/// Following the link is the difference between reclaiming a model and
+/// reclaiming nothing. In the Hugging Face cache a GGUF *is* a link into
+/// `blobs/`, so the bytes are all in the target and unlinking the name alone
+/// frees zero.
+fn occupied_paths(model: &Model) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = if model.shard_paths.is_empty() {
+        vec![model.path.clone()]
+    } else {
+        model.shard_paths.clone()
+    };
+    paths.extend(
+        [&model.mtp_path, &model.dflash_path, &model.projector_path].into_iter().flatten().cloned(),
+    );
+    // Normalized, because the same blob is reached through an absolute link
+    // from one entry and a `../../blobs/…` one from another, and these paths
+    // are compared to decide what is shared.
+    for target in paths.clone().iter().filter_map(|path| link_target(path)) {
+        let target = canonical(&target);
+        if !paths.contains(&target) {
+            paths.push(target);
+        }
+    }
+    paths
+}
+
+/// The backend behind a llama.cpp device identifier: `ROCm0` → `ROCm`, and a
+/// comma-separated list keeps only the first, since the label names the kind of
+/// hardware rather than how many of it there are.
+fn backend_of(device: &str) -> String {
+    let first = device.split(',').next().unwrap_or(device).trim();
+    let name = first.trim_end_matches(|c: char| c.is_ascii_digit());
+    if name.is_empty() { first.to_string() } else { name.to_string() }
+}
+
+/// Per-request timings from a `llama-server` log line, if it carries any.
+///
+/// llama-server prints these when a request finishes:
+///
+/// ```text
+/// slot print_timing: id 3 | task 131 | prompt eval time = 1419.87 ms /  348 tokens (...)
+/// slot print_timing: id 3 | task 131 |        eval time = 15444.75 ms / 258 tokens (...)
+/// ```
+///
+/// The `ms` figure is time spent on that phase, not elapsed wall clock, which
+/// is exactly what a rate should be divided by. The progress lines the server
+/// also emits mid-request (`n_decoded = …, tg = …`) are deliberately ignored:
+/// they carry a rate but no duration, so they cannot be averaged with these.
+pub fn parse_throughput(line: &str) -> Vec<Sample> {
+    // Order matters: "prompt eval time" ends with "eval time".
+    let (phase, rest) = if let Some((_, rest)) = line.split_once("prompt eval time =") {
+        (Phase::Prefill, rest)
+    } else if let Some((_, rest)) = line.split_once("eval time =") {
+        (Phase::Decode, rest)
+    } else {
+        // `total time = … / N tokens` covers both phases at once; counting it
+        // would double every request.
+        return Vec::new();
+    };
+
+    let Some(milliseconds) = leading_number(rest) else { return Vec::new() };
+    let Some(tokens) = rest.split_once('/').and_then(|(_, after)| leading_number(after)) else {
+        return Vec::new();
+    };
+    let sample = Sample { phase, tokens: tokens as u64, seconds: milliseconds / 1000.0 };
+    if sample.rate().is_none() { Vec::new() } else { vec![sample] }
+}
+
+/// The number at the start of `text`, ignoring the spaces llama.cpp pads its
+/// columns with.
+fn leading_number(text: &str) -> Option<f64> {
+    let text = text.trim_start();
+    let end =
+        text.find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-').unwrap_or(text.len());
+    text[..end].parse().ok()
+}
+
 /// A speculative-decoding type that needs a companion draft GGUF, and which
 /// companion that is. llama.cpp loads either through the same
 /// `--spec-draft-model` slot, so at most one can be selected at a time.
@@ -832,13 +1051,34 @@ fn cli_binary(server: &str) -> Option<String> {
     Some(path.with_file_name(file.replace("llama-server", "llama-cli")).display().to_string())
 }
 
-/// Run `--version` and return a short version string. llama.cpp prints version
-/// info to stderr, so both streams are considered.
+/// Run `--version` and return a short version string.
+///
+/// Both streams are read and then searched, rather than the first non-empty
+/// line of whichever one spoke. llama.cpp prints its version to stderr — but so
+/// does anything wrapping it, and the wrapper speaks first: a `distrobox`
+/// exported binary announces `Starting container...  [ OK ]` there whenever the
+/// container was cold, which the footer then reported as the runtime's version
+/// for the rest of the session.
 fn query_version(path: &Path) -> Option<String> {
     let output = supervisor::output(ProcCommand::new(path).arg("--version")).ok()?;
-    let text = if output.stderr.is_empty() { &output.stdout } else { &output.stderr };
-    let text = String::from_utf8_lossy(text);
-    text.lines().map(str::trim).find(|l| !l.is_empty()).map(|l| l.to_string())
+    let mut text = String::from_utf8_lossy(&output.stderr).into_owned();
+    text.push('\n');
+    text.push_str(&String::from_utf8_lossy(&output.stdout));
+    parse_version(&text)
+}
+
+/// llama.cpp's own version line — `version: 10353 (f8def7f)` — out of output
+/// that may carry a wrapper's chatter around it.
+///
+/// The first non-empty line is the fallback rather than the rule: a build that
+/// words its version differently should still show something, and all llmctl
+/// does with the string is display it.
+fn parse_version(text: &str) -> Option<String> {
+    let lines = || text.lines().map(str::trim).filter(|line| !line.is_empty());
+    lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("version:"))
+        .or_else(|| lines().next())
+        .map(str::to_string)
 }
 
 /// Run `--list-devices` and extract device identifiers from lines such as
@@ -906,6 +1146,34 @@ fn draft_hf_repository(repo: &str, file: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Regression: the version was the first non-empty line of stderr, and
+    /// llama.cpp is not always what speaks there first. A `distrobox` exported
+    /// binary is a shell wrapper around `distrobox-enter`, which announces
+    /// itself on stderr when the container is cold — so the runtime footer read
+    /// `Starting container...  [ OK ]` where the version belonged, and kept
+    /// reading it until llmctl was restarted with the container already warm.
+    #[test]
+    fn a_wrappers_banner_is_not_mistaken_for_the_version() {
+        let version = "version: 10353 (f8def7f)";
+        let built = "built with GNU 13.3.0 for Linux x86_64";
+        assert_eq!(parse_version(&format!("{version}\n{built}\n")).as_deref(), Some(version));
+
+        // `distrobox-enter` pads the banner to 40 columns and follows it with a
+        // tab and its result, all before the wrapped command says anything.
+        let banner = "Starting container...                   \t[ OK ]";
+        assert_eq!(
+            parse_version(&format!("{banner}\n{version}\n{built}\n")).as_deref(),
+            Some(version)
+        );
+
+        // Nothing recognizable still shows something: the string is only ever
+        // displayed, and a build that words its version differently should not
+        // read as a runtime with no version at all.
+        assert_eq!(parse_version(&format!("\n  {banner}\n")).as_deref(), Some(banner.trim()));
+        assert_eq!(parse_version(""), None);
+        assert_eq!(parse_version("  \n\n"), None);
+    }
+
     /// A backend with nothing discovered but every capability advertised — the
     /// dialect logic never touches the binary.
     fn test_backend() -> LlamaCppBackend {
@@ -954,6 +1222,211 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_local_gguf_keeps_a_drafter_another_quantization_shares() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("llmctl-local-delete-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let drafter = dir.join("dflash-model.gguf");
+        std::fs::write(&drafter, vec![0_u8; 4]).unwrap();
+
+        let quant = |name: &str, size: usize| {
+            let path = dir.join(name);
+            std::fs::write(&path, vec![0_u8; size]).unwrap();
+            Model {
+                id: format!("models:{name}"),
+                name: name.into(),
+                path: path.clone(),
+                shard_paths: vec![path],
+                dflash_path: Some(drafter.clone()),
+                ..test_model()
+            }
+        };
+        let q4 = quant("model-Q4.gguf", 10);
+        let q8 = quant("model-Q8.gguf", 20);
+
+        // Both quantizations are on disk, so the drafter they share stays.
+        let plan = local_deletion(&q4, &[q4.clone(), q8.clone()]).expect("a local plan");
+        assert_eq!(plan.files, vec![q4.path.clone()]);
+        assert_eq!(plan.bytes, 10);
+        assert!(!plan.files.contains(&drafter), "a drafter in use is not planned for removal");
+        plan.execute().unwrap();
+        assert!(drafter.is_file());
+
+        // With the last quantization gone, so is the drafter.
+        let plan = local_deletion(&q8, std::slice::from_ref(&q8)).expect("a local plan");
+        assert_eq!(plan.bytes, 24);
+        plan.execute().unwrap();
+        assert!(!drafter.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Regression: the Hugging Face cache is one of the directories llmctl
+    /// scans, and a GGUF in it is a symlink into `blobs/`. Deleting the link
+    /// alone unlinked a name and freed nothing.
+    #[test]
+    fn deleting_a_gguf_scanned_out_of_the_hub_cache_takes_the_blob_behind_it() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let hub = std::env::temp_dir().join(format!("llmctl-scanned-hub-{nonce}"));
+        let repo = hub.join("models--owner--repo");
+        let snapshot = repo.join("snapshots/abc");
+        std::fs::create_dir_all(repo.join("blobs")).unwrap();
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(repo.join("refs"), b"").unwrap();
+        let blob = repo.join("blobs").join("aa".repeat(32));
+        std::fs::write(&blob, vec![0_u8; 4096]).unwrap();
+        // Both link styles occur in a real cache: llmctl writes absolute
+        // targets, `huggingface_hub` relative ones.
+        let link = snapshot.join("model-Q4.gguf");
+        std::os::unix::fs::symlink(PathBuf::from("../../blobs").join("aa".repeat(32)), &link)
+            .unwrap();
+
+        let scanned = Model {
+            id: "models:scanned".into(),
+            name: "model-Q4.gguf".into(),
+            path: link.clone(),
+            shard_paths: vec![link.clone()],
+            ..test_model()
+        };
+        // The same file also reachable through the online catalog: a twin, not
+        // a second model with a claim on the blob.
+        let twin = Model { id: "hf:owner/repo/model-Q4.gguf".into(), ..scanned.clone() };
+
+        let plan = local_deletion(&scanned, &[scanned.clone(), twin]).expect("a local plan");
+        assert_eq!(plan.bytes, 4096, "the blob is where the bytes are");
+        // The twin is the same file under another catalog name, not a second
+        // model with a claim on the blob.
+        assert!(plan.files.contains(&link) && plan.files.contains(&blob));
+
+        plan.execute().unwrap();
+        assert!(!blob.exists(), "the blob must go");
+        assert!(!repo.exists(), "an emptied repository cache is a husk");
+        let _ = std::fs::remove_dir_all(hub);
+    }
+
+    /// The same, for a repository that files its quantizations away in
+    /// subdirectories: a level left behind holds the snapshot open, and with it
+    /// the repository the husk check would have taken.
+    #[test]
+    fn a_nested_scanned_gguf_prunes_every_level_of_the_cache() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let hub = std::env::temp_dir().join(format!("llmctl-scanned-nested-{nonce}"));
+        let repo = hub.join("models--owner--repo");
+        let snapshot = repo.join("snapshots/abc");
+        let nested = snapshot.join("UD/Q4_K_XL");
+        std::fs::create_dir_all(repo.join("blobs")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        let blob = repo.join("blobs").join("aa".repeat(32));
+        std::fs::write(&blob, vec![0_u8; 2048]).unwrap();
+        let link = nested.join("model.gguf");
+        std::os::unix::fs::symlink(&blob, &link).unwrap();
+
+        // The scanner names it by filename alone, whatever it is nested under.
+        let scanned = Model {
+            id: "models:scanned".into(),
+            name: "model.gguf".into(),
+            path: link.clone(),
+            shard_paths: vec![link.clone()],
+            ..test_model()
+        };
+        let plan = local_deletion(&scanned, std::slice::from_ref(&scanned)).expect("a local plan");
+        assert!(plan.prune.contains(&snapshot.join("UD")), "{:?}", plan.prune);
+        assert!(plan.prune.contains(&snapshot), "{:?}", plan.prune);
+        let depths: Vec<usize> = plan.prune.iter().map(|dir| dir.components().count()).collect();
+        assert!(depths.windows(2).all(|pair| pair[0] >= pair[1]), "{:?}", plan.prune);
+
+        plan.execute().unwrap();
+        assert!(!repo.exists(), "a leftover directory kept the repository alive");
+        let _ = std::fs::remove_dir_all(hub);
+    }
+
+    /// A second snapshot naming the same blob is another artifact, not the
+    /// twin: its link resolves alike, but the file has to stay for it.
+    #[test]
+    fn a_blob_a_second_snapshot_link_names_survives_a_scanned_deletion() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let hub = std::env::temp_dir().join(format!("llmctl-scanned-shared-{nonce}"));
+        let repo = hub.join("models--owner--repo");
+        std::fs::create_dir_all(repo.join("blobs")).unwrap();
+        std::fs::create_dir_all(repo.join("snapshots/abc")).unwrap();
+        std::fs::create_dir_all(repo.join("snapshots/old")).unwrap();
+        let blob = repo.join("blobs").join("aa".repeat(32));
+        std::fs::write(&blob, vec![0_u8; 4096]).unwrap();
+        let link = repo.join("snapshots/abc/model-Q4.gguf");
+        let older = repo.join("snapshots/old/model-Q4.gguf");
+        std::os::unix::fs::symlink(&blob, &link).unwrap();
+        std::os::unix::fs::symlink(&blob, &older).unwrap();
+
+        let scanned = Model {
+            id: "models:scanned".into(),
+            name: "model-Q4.gguf".into(),
+            path: link.clone(),
+            shard_paths: vec![link.clone()],
+            ..test_model()
+        };
+        let plan = local_deletion(&scanned, std::slice::from_ref(&scanned)).expect("a local plan");
+        assert_eq!(plan.bytes, 0, "nothing is freed while the older snapshot names the blob");
+        assert!(plan.files.contains(&link) && !plan.files.contains(&blob));
+
+        plan.execute().unwrap();
+        assert!(blob.exists() && older.exists(), "the other snapshot must not dangle");
+        let _ = std::fs::remove_dir_all(hub);
+    }
+
+    #[test]
+    fn a_model_whose_file_is_gone_has_nothing_to_delete() {
+        assert!(local_deletion(&test_model(), &[test_model()]).is_none());
+    }
+
+    /// Verbatim lines from a real session log.
+    #[test]
+    fn per_request_timings_are_read_from_the_server_log() {
+        let pp = "0.37.008.491 I slot print_timing: id  3 | task 0 | prompt eval time =   \
+                  10436.32 ms /  3266 tokens (    3.20 ms per token,   312.95 tokens per second)";
+        let tg = "0.37.008.496 I slot print_timing: id  3 | task 0 |        eval time =    \
+                  9379.48 ms /   174 tokens (   53.91 ms per token,    18.55 tokens per second)";
+
+        let prefill = parse_throughput(pp);
+        assert_eq!(
+            prefill,
+            vec![Sample { phase: Phase::Prefill, tokens: 3266, seconds: 10.43632 }]
+        );
+        // Divides out to the rate the server itself printed.
+        assert!((prefill[0].rate().unwrap() - 312.95).abs() < 0.01);
+
+        let decode = parse_throughput(tg);
+        assert_eq!(decode, vec![Sample { phase: Phase::Decode, tokens: 174, seconds: 9.37948 }]);
+        assert!((decode[0].rate().unwrap() - 18.55).abs() < 0.01);
+    }
+
+    /// `total time` covers both phases at once and would double every request;
+    /// the progress lines carry a rate but no duration, so they cannot be
+    /// averaged with the rest. Neither is a measurement this can use.
+    #[test]
+    fn only_completed_request_timings_count() {
+        for line in [
+            "0.37.008.500 I slot print_timing: id  3 | task 0 |       total time =   19815.80 ms /  3440 tokens",
+            "34.13.260.056 I slot print_timing: id  2 | task 272 | n_decoded =   1653, tg =  18.51 t/s, tg_3s =  19.09 t/s",
+            "0.26.101.658 I slot print_timing: id  3 | task 0 | prompt processing, n_tokens =   2877, progress = 0.88, t =   8.91 s / 322.93 tokens per second",
+            "0.00.000.001 I main: server is listening on http://127.0.0.1:8000",
+            "",
+        ] {
+            assert!(parse_throughput(line).is_empty(), "should not measure: {line}");
+        }
+    }
+
+    #[test]
     fn int_range_is_enforced() {
         let kind = SCHEMA.spec("gpu-layers").unwrap().kind;
         assert_eq!(kind.validate("50").unwrap(), "50");
@@ -985,7 +1458,15 @@ mod tests {
         assert_eq!(SCHEMA.omit_token("batch-size"), Some(DEFAULT));
         assert_eq!(SCHEMA.omit_token("threads"), Some(DEFAULT));
         // The sampling params and ctx-size are omittable too.
-        for key in ["ctx-size", "temperature", "top-p", "top-k", "min-p", "repeat-penalty"] {
+        for key in [
+            "ctx-size",
+            "temperature",
+            "top-p",
+            "top-k",
+            "min-p",
+            "repeat-penalty",
+            "presence-penalty",
+        ] {
             assert_eq!(SCHEMA.omit_token(key), Some(DEFAULT), "{key} should fold the sentinel");
             assert!(SCHEMA.uses_sentinel(key), "{key} should get sentinel affordances");
         }
@@ -1214,6 +1695,33 @@ mod tests {
         let on = std::collections::BTreeMap::from([("mmap".to_string(), "on".to_string())]);
         assert_eq!(backend.legacy_value("load-mode", &on), None);
         assert_eq!(backend.legacy_value("ctx-size", &stored), None);
+    }
+
+    /// `-ngl 0` keeps every layer on the CPU, so the accelerator `--device`
+    /// names is not the one doing the work.
+    #[test]
+    fn offloading_nothing_is_reported_as_cpu() {
+        let mut backend = test_backend();
+        backend.runtime.devices = vec!["ROCm0".into()];
+        let option = |key: &str, value: &str| OptionItem {
+            key: key.into(),
+            value: value.into(),
+            default: DEFAULT.into(),
+            range: None,
+            cli: String::new(),
+            description: String::new(),
+        };
+
+        let cpu = vec![option("device", "ROCm0"), option("gpu-layers", "0")];
+        assert_eq!(backend.device_label(&cpu).as_deref(), Some("CPU"));
+
+        // Any offload at all, and the named device is the one to report.
+        let gpu = vec![option("device", "ROCm0"), option("gpu-layers", "999")];
+        assert_eq!(backend.device_label(&gpu).as_deref(), Some("ROCm"));
+
+        // 'default' hands the decision to llama.cpp, which offloads.
+        let decided = vec![option("device", DEFAULT), option("gpu-layers", DEFAULT)];
+        assert_eq!(backend.device_label(&decided).as_deref(), Some("ROCm"));
     }
 
     #[test]

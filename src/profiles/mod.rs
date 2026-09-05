@@ -192,7 +192,8 @@ mod tests {
         // never at 'default' (= the model's full context).
         assert_eq!(value_of(&opts, "ctx-size"), "4096");
         // Sampling params start omitted — llama.cpp's own defaults apply.
-        for key in ["temperature", "top-p", "top-k", "min-p", "repeat-penalty"] {
+        for key in ["temperature", "top-p", "top-k", "min-p", "repeat-penalty", "presence-penalty"]
+        {
             assert_eq!(value_of(&opts, key), registry::DEFAULT, "{key} should start at default");
         }
     }

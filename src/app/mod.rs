@@ -5,7 +5,7 @@
 //! `IMPLEMENTATION_PLAN.md` → Navigation model).
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 use ratatui::widgets::ListState;
 
@@ -20,7 +20,7 @@ use crate::discovery;
 use crate::discovery::ModelSource;
 use crate::domain::{Model, OptionItem, Profile, format_unix_date, human_size};
 use crate::profiles::{self, ProfileStore};
-use crate::runtime::{CatalogCtx, LaunchContext, RuntimeBackend};
+use crate::runtime::{CatalogCtx, Deletion, LaunchContext, RuntimeBackend};
 use crate::session::{self, LaunchRequest, SessionManager};
 use crate::ui;
 
@@ -46,6 +46,35 @@ pub struct Prompt {
 pub struct Message {
     pub title: String,
     pub lines: Vec<String>,
+}
+
+/// A destructive action held back until the user says yes.
+///
+/// Unlike [`Message`], which any key dismisses, this one distinguishes assent
+/// from everything else: `y`/Enter goes through, any other key walks away.
+pub struct Confirm {
+    pub title: String,
+    pub lines: Vec<String>,
+    action: ConfirmAction,
+}
+
+impl Confirm {
+    /// A confirmation carrying an empty plan, for rendering tests: the layout
+    /// is about the lines, and agreeing to it would delete nothing.
+    #[cfg(test)]
+    pub fn preview(title: &str, lines: Vec<String>) -> Self {
+        Self {
+            title: title.into(),
+            lines,
+            action: ConfirmAction::DeleteModel { model: String::new(), plan: Deletion::default() },
+        }
+    }
+}
+
+enum ConfirmAction {
+    /// Remove a model's files from local storage. Carries the plan computed
+    /// when the prompt opened, so what is deleted is exactly what was shown.
+    DeleteModel { model: String, plan: Deletion },
 }
 
 /// Enums with more variants than this open a [`Selector`] popup on `e`/Enter
@@ -109,6 +138,44 @@ pub struct ModelDownload {
 impl ModelDownload {
     pub fn percent(&self) -> u8 {
         transfer_percent(self.downloaded_bytes, self.total_bytes)
+    }
+
+    /// The paths this transfer is writing, so a deletion can tell whether it
+    /// would remove files still being fetched — whatever the model is called
+    /// in the catalog the user is deleting from.
+    fn targets(&self) -> Vec<PathBuf> {
+        match &self.source {
+            DownloadSource::Hub(remote) => remote
+                .blobs
+                .iter()
+                .filter_map(|blob| discovery::online::cache_blob_paths(&remote.repo, &blob.oid))
+                .flat_map(|(incomplete, complete)| [incomplete, complete])
+                .collect(),
+            DownloadSource::Flm(model) => {
+                crate::runtime::flm::model_dir(model).into_iter().collect()
+            }
+        }
+    }
+}
+
+/// Whether a keystroke agrees to a pending destructive action.
+///
+/// The dialog promises that `y` or Enter deletes and every other key backs out,
+/// so the key code alone will not do: crossterm spells Ctrl+Y as `Char('y')`
+/// with a modifier flag set, and a chord that merely contains the confirm key
+/// is not the key.
+///
+/// Shift is tolerated on the letter alone, because that is how `Y` arrives at
+/// all. It is not tolerated on Enter: a terminal in enhanced-keyboard mode
+/// reports Shift+Enter distinctly, and that is a chord the user meant as
+/// something else.
+fn is_assent(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+        }
+        KeyCode::Enter => key.modifiers.is_empty(),
+        _ => false,
     }
 }
 
@@ -183,6 +250,15 @@ impl Selector {
     pub fn selected(&self) -> Option<&str> {
         self.filtered().get(self.cursor).copied()
     }
+}
+
+/// What the right-hand column of the Session Manager shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPane {
+    /// The selected job's facts.
+    Detail,
+    /// A live tail of the selected session's log.
+    Log,
 }
 
 /// The top-level screen the UI is showing.
@@ -310,8 +386,15 @@ pub struct App {
     pub model_search: Option<ModelSearch>,
     /// A read-only modal message overlay, if any.
     pub message: Option<Message>,
+    /// A destructive action waiting on a yes/no answer, if any.
+    pub confirm: Option<Confirm>,
     /// Which top-level screen is active.
     pub screen: Screen,
+    /// Which pane the Session Manager's right-hand column holds.
+    pub session_pane: SessionPane,
+    /// Whether the last frame had room for that column at all. Written by the
+    /// renderer, which is the only place the terminal's width is known.
+    pub detail_pane_visible: bool,
     /// Running/known inference sessions.
     pub sessions: SessionManager,
     /// Selection cursor in the Session Manager list.
@@ -410,7 +493,10 @@ impl App {
             selector: None,
             model_search: None,
             message: None,
+            confirm: None,
             screen: Screen::Browser,
+            session_pane: SessionPane::Detail,
+            detail_pane_visible: true,
             sessions,
             session_sel: ListState::default(),
             log_lines: Vec::new(),
@@ -861,6 +947,20 @@ impl App {
             self.message = None;
             return;
         }
+        // A pending destructive action takes assent or nothing: `y`/Enter goes
+        // ahead, every other key backs out. Deliberately not "any key
+        // dismisses" like a message — that would make a stray keystroke an
+        // answer.
+        if self.confirm.is_some() {
+            if is_assent(key)
+                && let Some(confirm) = self.confirm.take()
+            {
+                self.run_confirmed(confirm.action);
+            } else {
+                self.confirm = None;
+            }
+            return;
+        }
         // A text prompt is modal: it consumes all input until closed.
         if self.prompt.is_some() {
             self.prompt_key(key);
@@ -961,6 +1061,9 @@ impl App {
             // selected option to its resolved default instead.
             KeyCode::Char('a') => self.prompt_new_profile(),
             KeyCode::Char('r') => self.prompt_rename_profile(),
+            // In the Model pane the pair is symmetric: `d` fetches the model,
+            // `D` gives the disk space back. Elsewhere `D` duplicates a profile.
+            KeyCode::Char('D') if self.focus == Pane::Model => self.prompt_delete_model(),
             KeyCode::Char('D') => self.prompt_duplicate_profile(),
             KeyCode::Char('d') if self.focus == Pane::Model && self.download_available() => {
                 self.download_selected_model()
@@ -1180,9 +1283,9 @@ impl App {
             KeyCode::Char('d') => self.remove_async_job(),
             KeyCode::Char('c') => self.copy_endpoint(),
             KeyCode::Char('y') => self.yank_session_command(),
-            KeyCode::Char('L') | KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
-                self.open_logs()
-            }
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => self.toggle_session_pane(),
+            KeyCode::Char('h') | KeyCode::Left => self.session_pane = SessionPane::Detail,
+            KeyCode::Char('L') => self.open_logs(),
             KeyCode::F(5) => {
                 self.sessions.rediscover();
                 self.sync_session_selection();
@@ -1289,6 +1392,8 @@ impl App {
             runtime: backend.descriptor().name.clone(),
             model: model.name.clone(),
             model_path: backend.process_token(&ctx),
+            size_bytes: (model.size_bytes > 0).then_some(model.size_bytes),
+            device: backend.device_label(&options),
             command: backend.build_command(&ctx),
             health_path: backend.health_path().to_string(),
             download: backend.launch_download(&ctx),
@@ -1383,7 +1488,24 @@ impl App {
         let Some(remote) = model.remote.clone() else { return };
         let total_bytes = remote.blobs.iter().map(|blob| blob.size_bytes).sum();
         let downloaded_bytes = discovery::online::cached_downloaded_bytes(&remote);
-        if remote.file.is_none() || (total_bytes > 0 && downloaded_bytes >= total_bytes) {
+        if remote.file.is_none() {
+            return;
+        }
+        // Every blob already in the cache, yet the model reads as absent: a
+        // deletion that spared a blob another revision shares took the snapshot
+        // link with it, and the link is what the browser sees. There is nothing
+        // to transfer, so relink instead of opening a download with no work in
+        // it. On an artifact that is merely already downloaded this is a no-op.
+        if total_bytes > 0 && downloaded_bytes >= total_bytes {
+            match discovery::online::finalize_cached_download(&remote) {
+                Ok(_) => self.reload_catalog_in_place(),
+                Err(error) => {
+                    self.message = Some(Message {
+                        title: "Cannot download".into(),
+                        lines: vec![format!("{error:#}")],
+                    })
+                }
+            }
             return;
         }
         if remote.gated && std::env::var_os("HF_TOKEN").is_none() {
@@ -1841,6 +1963,31 @@ impl App {
         copy_to_clipboard(&cmd.display());
         self.message =
             Some(Message { title: "Session command".into(), lines: command_message_lines(&cmd) });
+    }
+
+    /// Swap the Session Manager's right-hand column between the selected job's
+    /// facts and a live tail of its log (`l` / `→`, and back).
+    ///
+    /// The tail sits beside the list rather than over it, because the question
+    /// it answers — what is this server doing right now? — is usually asked
+    /// while watching the other sessions too. `L` still gives the log the whole
+    /// screen, which is what reading back through one wants.
+    fn toggle_session_pane(&mut self) {
+        // A download writes no log, so there is nothing to swap to.
+        if self.selected_server_index().is_none() {
+            return;
+        }
+        // On a terminal too narrow for the column, the log has nowhere to go
+        // but over the whole screen — which is better than the key doing
+        // nothing at all.
+        if !self.detail_pane_visible {
+            self.open_logs();
+            return;
+        }
+        self.session_pane = match self.session_pane {
+            SessionPane::Detail => SessionPane::Log,
+            SessionPane::Log => SessionPane::Detail,
+        };
     }
 
     /// Open the log-tail screen for the selected session (`L`).
@@ -2307,6 +2454,165 @@ impl App {
                         && model.remote.as_ref().is_some_and(|remote| remote.file.is_some())
                 }
             })
+    }
+
+    /// Whether `D` can remove the selection from local storage.
+    ///
+    /// Deliberately the cheap test — a stored model is one with a local path,
+    /// true of a scanned GGUF, a cached Hub artifact, and an installed
+    /// FastFlowLM tag alike. The footer asks this on every 250 ms redraw, so
+    /// the plan itself (which stats every blob) waits until `D` is pressed.
+    pub fn delete_available(&self) -> bool {
+        self.focus == Pane::Model
+            && self.selected_model().is_some_and(|model| !model.path.as_os_str().is_empty())
+    }
+
+    /// What deleting the selected model would remove, or `None` if the runtime
+    /// stores nothing for it.
+    fn deletion_plan(&self) -> Option<Deletion> {
+        let model = self.selected_model()?;
+        let backend = self.runtimes.selected()?;
+        backend.deletion(model, self.catalog_source()).filter(|plan| !plan.is_empty())
+    }
+
+    /// Ask before removing the selected model's files. The plan is computed
+    /// here and carried into the confirmation, so what the user agreed to is
+    /// exactly what gets unlinked.
+    fn prompt_delete_model(&mut self) {
+        let Some(model) = self.selected_model().cloned() else { return };
+        let Some(plan) = self.deletion_plan() else {
+            self.message = Some(Message {
+                title: "Nothing to delete".into(),
+                lines: vec![format!("{} is not stored locally.", model.name)],
+            });
+            return;
+        };
+        // Checked against the plan rather than the selection: the same files
+        // reach the catalog under more than one identity.
+        if let Some(blocker) = self.deletion_blocker(&model, &plan) {
+            self.message = Some(Message { title: "Cannot delete".into(), lines: vec![blocker] });
+            return;
+        }
+
+        // One line: the model, and what removing it buys back. The paths are
+        // llmctl's business, and the size is the only part the user weighs.
+        let lines = vec![format!("Remove {} ({}) from disk?", model.name, human_size(plan.bytes))];
+        self.confirm = Some(Confirm {
+            title: "Delete model".into(),
+            lines,
+            action: ConfirmAction::DeleteModel { model: model.name.clone(), plan },
+        });
+    }
+
+    /// Why the selected model must not be deleted right now: something is using
+    /// the very files the deletion would pull out from under it.
+    fn deletion_blocker(&self, model: &Model, plan: &Deletion) -> Option<String> {
+        let runtime = self.runtimes.selected()?.descriptor().name.clone();
+        // By file wherever a file was recorded: a session stores the catalog
+        // name it was launched under, so deleting the same GGUF through its
+        // other entry would sail past a name-only check and unlink a model
+        // being served — while two unrelated models sharing a filename would
+        // block each other under one. The name is left to answer only for the
+        // launches whose process token is not a path at all: a FastFlowLM tag,
+        // or the repo-relative filename of a native Hub launch.
+        if self.sessions.pathless_session_for(&runtime, &model.name)
+            || plan.overlaps(&self.sessions.active_model_paths(&runtime))
+        {
+            return Some(format!("{} is serving a live session; stop it first.", model.name));
+        }
+        // Identity by id is not enough: a Hub artifact downloads under an
+        // `hf:*` id, and a rescan of the Hub cache lists the same partially
+        // materialized files again under a `models:*` one. Deleting through
+        // that twin would pull completed shards out from under the transfer,
+        // so ask what each is writing instead of what it is called.
+        let live = self.model_downloads.iter().filter(|download| {
+            matches!(
+                download.status,
+                ModelDownloadStatus::Downloading | ModelDownloadStatus::Cancelling
+            )
+        });
+        for download in live {
+            if download.model_id == model.id || plan.overlaps(&download.targets()) {
+                return Some(format!("{} is downloading; cancel it first.", download.model));
+            }
+        }
+        None
+    }
+
+    fn run_confirmed(&mut self, action: ConfirmAction) {
+        match action {
+            ConfirmAction::DeleteModel { model, plan } => self.delete_model(&model, plan),
+        }
+    }
+
+    fn delete_model(&mut self, model: &str, plan: Deletion) {
+        let freed = human_size(plan.bytes);
+        // Finished transfers this deletion invalidates, resolved *before* the
+        // files go. A completed job is not resumable, so leaving it in the list
+        // would make `d` on the model jump to it and do nothing instead of
+        // downloading it again.
+        let stale: Vec<(u64, String)> = self
+            .model_downloads
+            .iter()
+            .filter(|download| matches!(download.status, ModelDownloadStatus::Downloaded(_)))
+            .filter(|download| plan.overlaps(&download.targets()))
+            .map(|download| (download.id, download.model_id.clone()))
+            .collect();
+        let result = plan.execute();
+        if result.is_ok() {
+            for (id, model_id) in &stale {
+                // Best-effort: a record left behind reappears as a resumable
+                // job, which is a nuisance rather than a hazard.
+                let _ = discovery::online::delete_download_record(&self.models_dir, model_id);
+                self.model_downloads.retain(|download| download.id != *id);
+            }
+            self.sync_session_selection();
+        }
+        self.reload_catalog_in_place();
+        self.message = Some(match result {
+            Ok(()) => Message {
+                title: "Model removed".into(),
+                lines: vec![format!("{model} deleted from disk, freeing {freed}.")],
+            },
+            Err(error) => {
+                Message { title: "Delete failed".into(), lines: vec![format!("{error:#}")] }
+            }
+        });
+    }
+
+    /// Re-read the catalog after a deletion without moving the browser.
+    ///
+    /// `F5` would also work, but it resets to the catalog root and — in the
+    /// online view — re-queries the Hub, which is a lot of upheaval for "one
+    /// artifact is no longer on disk".
+    fn reload_catalog_in_place(&mut self) {
+        if self.runtimes.selected().is_some_and(|backend| backend.supports_online_browse()) {
+            self.scanned_models = discovery::scan_models(&self.model_sources, &self.model_cache);
+            discovery::reconcile(&self.models_dir, &mut self.scanned_models);
+            self.scanned_models.extend(discovery::online::load_cached(&self.models_dir));
+            self.store.sync_models(&self.scanned_models);
+        } else {
+            self.refresh_flm_models(true);
+        }
+
+        let prefixes: Vec<Vec<String>> =
+            self.catalog_history.iter().map(|(_, _, prefix)| prefix.clone()).collect();
+        let rebuilt: Vec<Vec<Model>> =
+            prefixes.iter().map(|prefix| self.catalog_children(prefix)).collect();
+        for (level, items) in self.catalog_history.iter_mut().zip(rebuilt) {
+            level.0 = items;
+        }
+
+        let selected = self.selected_model().map(|model| model.id.clone());
+        let cursor = self.models.state.selected().unwrap_or(0);
+        self.models.replace(self.catalog_children(&self.catalog_prefix.clone()));
+        let restored = selected
+            .and_then(|id| self.models.items.iter().position(|model| model.id == id))
+            .unwrap_or_else(|| cursor.min(self.models.items.len().saturating_sub(1)));
+        if !self.models.items.is_empty() {
+            self.models.state.select(Some(restored));
+        }
+        self.rebuild_below(Pane::Model);
     }
 
     /// Whether the selected runtime ships a benchmark tool for this model.
@@ -2996,87 +3302,11 @@ fn copy_to_clipboard(text: &str) {
 fn read_log_tail(path: &std::path::Path, max_lines: usize) -> Vec<String> {
     let bytes = std::fs::read(path).unwrap_or_default();
     let content = String::from_utf8_lossy(&bytes);
-    let mut lines: Vec<String> = content.lines().map(visible_line).collect();
+    let mut lines: Vec<String> = content.lines().map(session::logtail::visible_line).collect();
     if lines.len() > max_lines {
         lines = lines.split_off(lines.len() - max_lines);
     }
     lines
-}
-
-/// Variation selectors (VS1–VS16 and the supplementary block) change how the
-/// preceding character is drawn without being drawn themselves — which is
-/// exactly what makes their width unmeasurable.
-fn is_variation_selector(c: char) -> bool {
-    matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}')
-}
-
-/// What a terminal would show for one log line.
-///
-/// A carriage return rewrites the row from column 0, so a progress bar that
-/// ticked a hundred times arrives as one line holding a hundred states. Only the
-/// last one was ever visible, and it is the only one worth showing in a log
-/// tail — the rest would be a wall of `Downloading: 0.3% … 0.5% …`.
-fn visible_line(raw: &str) -> String {
-    raw.split('\r')
-        .map(strip_control)
-        .filter(|segment| !segment.trim().is_empty())
-        .last()
-        .unwrap_or_default()
-}
-
-/// Drop ANSI escape sequences, stray control bytes, and variation selectors,
-/// keeping printable text.
-///
-/// Left in place, `ESC[K` (erase to end of line) would wipe the rest of the row
-/// including the log pane's border, and `ESC[?25l` would hide the cursor for the
-/// rest of the session.
-///
-/// Variation selectors go for a subtler reason. `⬇️` is `U+2B07 U+FE0F`, and the
-/// selector asks for emoji presentation, which a terminal draws two columns
-/// wide — but `unicode-width` still measures the pair as one. The renderer then
-/// lays the row out one cell narrower than it actually paints, and everything to
-/// its right, border included, is overwritten. Dropping the selector leaves a
-/// bare `U+2B07`, which measures and draws as one column. Characters that are
-/// emoji by default (`🔗`, `🔒`) carry no selector and already measure correctly.
-fn strip_control(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\x1b' {
-            if is_variation_selector(c) {
-                continue;
-            }
-            if c == '\t' || !c.is_control() {
-                out.push(c);
-            }
-            continue;
-        }
-        match chars.next() {
-            // CSI: parameter bytes, then a final byte in @..~ .
-            Some('[') => {
-                for c in chars.by_ref() {
-                    if ('\x40'..='\x7e').contains(&c) {
-                        break;
-                    }
-                }
-            }
-            // OSC: runs until BEL or a String Terminator.
-            Some(']') => {
-                while let Some(c) = chars.next() {
-                    if c == '\x07' {
-                        break;
-                    }
-                    if c == '\x1b' && chars.peek() == Some(&'\\') {
-                        chars.next();
-                        break;
-                    }
-                }
-            }
-            // Any other escape is two characters; both are already consumed.
-            _ => {}
-        }
-    }
-    out
 }
 
 /// Cycle through automatic device selection and the devices discovered from
@@ -3107,68 +3337,25 @@ mod tests {
         }
     }
 
-    /// Regression: `flm` writes progress to its log the way it would to a
-    /// terminal. A bare carriage return sent the cursor back to column 0 and
-    /// `ESC[K` erased to end of line, so those rows overwrote the log pane's
-    /// borders and the text beside them.
+    /// Regression: the confirm dialog matched on the key code alone, so
+    /// Ctrl+Y — which crossterm reports as `Char('y')` plus a modifier — ran
+    /// the deletion the dialog was asking about.
     #[test]
-    fn log_lines_are_reduced_to_what_a_terminal_would_show() {
-        // Verbatim bytes from a real FastFlowLM session log.
-        let overall = "\r[FLM]  Overall progress:  1/6 files";
-        assert_eq!(visible_line(overall), "[FLM]  Overall progress:  1/6 files");
+    fn only_an_unmodified_key_confirms_a_deletion() {
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        assert!(is_assent(key(KeyCode::Char('y'), KeyModifiers::NONE)));
+        assert!(is_assent(key(KeyCode::Char('Y'), KeyModifiers::SHIFT)));
+        assert!(is_assent(key(KeyCode::Enter, KeyModifiers::NONE)));
 
-        // A progress bar redrawn in place: only the final state was ever visible.
-        let progress = "\u{1b}[?25l\r\u{1b}[K[FLM]  Downloading: 0.0% (0.0MB / 2340.0MB)\
-                        \r\u{1b}[K[FLM]  Downloading: 0.3% (6.0MB / 2340.0MB)\
-                        \r\u{1b}[K[FLM]  Downloading: 100.0% (2340.0MB / 2340.0MB)\u{1b}[?25h";
-        assert_eq!(visible_line(progress), "[FLM]  Downloading: 100.0% (2340.0MB / 2340.0MB)");
-
-        // Cursor show/hide around plain text leaves just the text.
-        assert_eq!(
-            visible_line("\u{1b}[?25l\u{1b}[?25h[FLM]  Checking Hash..."),
-            "[FLM]  Checking Hash..."
-        );
-
-        // Nothing survives a line that was only control bytes.
-        assert_eq!(visible_line("\u{1b}[?25l\u{1b}[?25h"), "");
-
-        // Ordinary lines pass through untouched, including colour codes.
-        assert_eq!(visible_line("plain server line"), "plain server line");
-        assert_eq!(visible_line("\u{1b}[31mred\u{1b}[0m text"), "red text");
-    }
-
-    /// Regression: a variation selector makes a character draw two columns wide
-    /// while `unicode-width` still measures one, so the log pane laid out rows
-    /// narrower than it painted them and clobbered its own border.
-    #[test]
-    fn rendered_log_width_matches_what_the_terminal_draws() {
-        use unicode_width::UnicodeWidthStr;
-
-        // Verbatim from a FastFlowLM session log: U+2B07 followed by U+FE0F.
-        let arrow = visible_line("[\u{2B07}\u{FE0F} ]  Incoming Request: GET");
-        assert_eq!(arrow, "[\u{2B07} ]  Incoming Request: GET");
-        // The selector is gone, so the measured width is now the drawn width.
-        assert!(!arrow.chars().any(is_variation_selector));
-        assert_eq!(arrow.width(), arrow.chars().count());
-
-        // Characters that are emoji by default carry no selector and already
-        // measure correctly at two columns; they must survive untouched.
-        let link = visible_line("[\u{1F517} ]  TCP connection established");
-        assert!(link.starts_with("[\u{1F517}"));
-        assert_eq!(link.width(), link.chars().count() + 1);
-    }
-
-    #[test]
-    fn no_rendered_log_line_can_carry_control_bytes() {
-        // Whatever a server writes, nothing that could move the cursor or erase
-        // the frame may reach the terminal.
-        let nasty = "\u{1b}[2J\u{1b}]0;title\u{7}\rone\u{1b}[Ktwo\u{0}\u{8}";
-        let rendered = visible_line(nasty);
-        assert!(
-            !rendered.chars().any(|c| c.is_control() && c != '\t'),
-            "control byte survived: {rendered:?}"
-        );
-        assert_eq!(rendered, "onetwo");
+        assert!(!is_assent(key(KeyCode::Char('y'), KeyModifiers::CONTROL)));
+        assert!(!is_assent(key(KeyCode::Char('Y'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)));
+        assert!(!is_assent(key(KeyCode::Char('y'), KeyModifiers::ALT)));
+        assert!(!is_assent(key(KeyCode::Enter, KeyModifiers::CONTROL)));
+        // A terminal in enhanced-keyboard mode reports Shift+Enter distinctly,
+        // and it is a chord the user pressed meaning something else.
+        assert!(!is_assent(key(KeyCode::Enter, KeyModifiers::SHIFT)));
+        assert!(!is_assent(key(KeyCode::Char('n'), KeyModifiers::NONE)));
+        assert!(!is_assent(key(KeyCode::Esc, KeyModifiers::NONE)));
     }
 
     #[test]
@@ -3483,6 +3670,8 @@ mod tests {
             health_path: "/v1/models".into(),
             download: None,
             profile: "Default".into(),
+            size_bytes: None,
+            device: None,
             host: "127.0.0.1".into(),
             port: 52625,
         };
@@ -3504,6 +3693,65 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         assert!(app.single_session_conflict(flm).is_none(), "guard stuck after the session ended");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Drives the real app: `D` on a local GGUF must ask first, must not touch
+    /// the file when the answer is anything but yes, and must remove it when it
+    /// is. Deleting is irreversible, so the "any stray key cancels" half of the
+    /// contract matters as much as the delete itself.
+    #[test]
+    #[ignore = "builds a SessionManager; run with --ignored --test-threads=1"]
+    fn deleting_a_model_asks_first_and_only_yes_removes_the_file() {
+        let stamp =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("llmctl-delete-{stamp}"));
+        let paths = Paths {
+            config_file: root.join("config.toml"),
+            models_dir: root.join("models"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+            sessions_dir: root.join("sessions"),
+        };
+        paths.ensure_dirs().unwrap();
+        let source = root.join("gguf");
+        std::fs::create_dir_all(&source).unwrap();
+        let gguf = source.join("test-model.gguf");
+        std::fs::write(&gguf, vec![0_u8; 2048]).unwrap();
+
+        let mut config = Config::default();
+        config.models.paths = vec![source.clone()];
+        let mut app = App::new(config, paths);
+        let llama = app
+            .runtimes
+            .items
+            .iter()
+            .position(|backend| backend.supports_online_browse())
+            .expect("llama.cpp backend");
+        app.runtimes.state.select(Some(llama));
+        app.rebuild_below(Pane::Runtime);
+        app.focus = Pane::Model;
+        // Walk down to the GGUF leaf, wherever the scan filed it.
+        while app.selected_model().is_none() && !app.models.is_empty() {
+            app.on_key(KeyEvent::from(KeyCode::Char('l')));
+        }
+        assert_eq!(app.selected_model().map(|m| m.name.clone()), Some("test-model.gguf".into()));
+        assert!(app.delete_available(), "a scanned GGUF is deletable");
+
+        // Asked, answered with a stray key: the file stays.
+        app.on_key(KeyEvent::from(KeyCode::Char('D')));
+        assert!(app.confirm.is_some(), "D must open a confirmation");
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        assert!(app.confirm.is_none());
+        assert!(gguf.is_file(), "a stray key must not delete anything");
+
+        // Asked, answered yes.
+        app.on_key(KeyEvent::from(KeyCode::Char('D')));
+        app.on_key(KeyEvent::from(KeyCode::Char('y')));
+        assert!(!gguf.exists(), "y must delete the file");
+        assert!(app.message.is_some(), "the outcome is reported");
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -12,6 +12,8 @@ and watch them from a built-in session manager.
 > (CPU/GPU) and **FastFlowLM** (`flm`, AMD XDNA2 NPU). Others (vLLM, Ollama, …)
 > are future work behind the `RuntimeBackend` trait.
 
+![The session manager: a llama.cpp server on ROCm, with its live rates](docs/media/sessions.png)
+
 ## Features
 
 - **Two runtimes, one workflow** — llama.cpp for CPU/GPU GGUF inference, and
@@ -55,18 +57,29 @@ and watch them from a built-in session manager.
   bench` benchmarking. Downloads are llmctl's own, so they resume. The XDNA
   driver grants a single hardware context, so llmctl runs one FastFlowLM model
   at a time and says which session holds the device.
+- **Storage you can take back** — `D` removes a model's files from disk, asking
+  once and quoting what it frees. It identifies the hash-named blobs behind a
+  Hugging Face artifact, keeps companions another quantization still needs, and
+  keeps your profiles.
 - **Detached sessions** — `s` launches a server in its own process group
   (`setsid`), with stdout/stderr redirected to a per-session log file and
   automatic port-conflict resolution. Sessions are rediscovered across restarts.
-- **Session manager** (`t`) — live status (Downloading / Starting / Running /
-  Crashed), PID,
-  port, uptime, and `/proc`-sampled CPU & memory; a `/health` probe promotes
-  Downloading → Starting → Running. Stop (`x`), kill (`K`), restart (`R`), copy endpoint (`c`),
-  and tail logs (`L`).
+- **Session manager** (`t`) — sessions grouped under the runtime serving them,
+  in aligned columns of live status (Downloading /
+  Starting / Running / Crashed), model, profile, port, size, compute backend
+  (ROCm / Vulkan / CUDA / NPU), throughput (`tg` and `pp` in tokens per second,
+  as the server last reported them), and uptime. Plus PID and `/proc`-sampled
+  CPU & memory;
+  a `/health` probe promotes Downloading → Starting → Running. Stop (`x`),
+  kill (`K`), restart (`R`), copy endpoint (`c`), and tail the log — `l` beside
+  the list, `L` full screen.
 
 ## Requirements
 
 - **Linux** (`setsid`, `/proc` sampling, and POSIX signals).
+- **A terminal of at least 80×24.** Below that llmctl says so rather than
+  drawing a frame nothing fits in; above it panes and columns are shed as room
+  runs out.
 - **At least one runtime.** Each is optional and discovered independently; a
   runtime that is missing or unusable is still listed, with the reason shown in
   the status line instead of failing at launch.
@@ -114,6 +127,8 @@ Navigate `Runtime ▸ Model ▸ Profile ▸ Options`, tune a profile, then press
 to launch (or `y` to copy the command). Press `?` at any time for the keybinding
 overlay.
 
+![Browsing the model catalog](docs/media/catalog.png)
+
 ### Keybindings
 
 | Key | Action |
@@ -125,6 +140,7 @@ overlay.
 | `/` | Search recursively in the current catalog directory |
 | `s` | Sort online models: Trending / Most likes / Most downloads |
 | `d` | Download the selected online GGUF file |
+| `D` | Delete the selected model from disk (asks first) |
 | **Profiles** | |
 | `a` | Create profile |
 | `r` | Rename (custom profiles only) |
@@ -143,55 +159,45 @@ overlay.
 | `t` | Session manager |
 | `x` / `K` | Stop / kill a server; cancel a download |
 | `R` | Restart a server or resume a download |
-| `L` | View logs |
+| `l` / `→` | Tail the session's log beside the list (again for Detail) |
+| `L` | View the log full screen |
 | `c` | Copy endpoint |
 | **General** | |
 | `F5` | Rescan / reload |
 | `?` / `q` | Help / quit |
 
+### Session throughput
+
+Each session shows its speed, read from the timings the server already writes to
+its own log — nothing to enable, and it works for sessions llmctl rediscovered
+after a restart. `tg` is token generation (decode) and `pp` is prompt processing
+(prefill), each the runtime's own figure for its most recent request rather than
+an average llmctl computed — only the server knows how much of the elapsed time
+was work rather than idling. The Detail pane adds the tokens and duration behind
+each.
+
+Sessions are grouped under the runtime serving them, so "what have I got up on
+the NPU?" is one glance rather than a scan down a backend column. Columns are
+model, profile, port, size, compute backend, `tg`, `pp`, and uptime; a narrow
+pane sheds the least useful first, so the list never wraps and the Detail pane
+always has all of them. Within a row nothing is ever omitted — a session that
+has served no requests shows `tg --.-- t/s`, so its columns still line up with
+those of a busy one.
+
 ### Launch options
 
-Each runtime exposes its own curated option set; the sections below cover
-llama.cpp, then FastFlowLM.
+Each runtime exposes its own curated option set, edited with live validation and
+auto-saved per model. llama.cpp covers context size, GPU layers, device
+selection, sampling, threads and batching, flash attention, KV cache types,
+multi-GPU placement, server slots, speculative decoding, and host/port —
+including `mtp-*`, `dflash-*`, and `mmproj-*` companions found beside a model,
+which are wired to the right flag on their own. An NPU has none of those, so
+FastFlowLM gets its own vocabulary: power mode, context and prefill chunk
+length, queue length, preemption, and the ASR and embedding companions, each
+clamped to what the selected model supports. Options left at their default are
+omitted from the command line.
 
-#### llama.cpp
-
-A curated set of `llama-server` flags, including context size,
-GPU layers, device selection (`--device`, with a selector populated by
-`llama-server --list-devices`), sampling (`temperature`, `top-p`, `top-k`,
-`min-p`, `repeat-penalty`),
-threads, batch size, flash attention, reasoning, KV cache types (`--cache-type-k`
-/ `--cache-type-v`), load mode (`-lm`, replacing the deprecated `--no-mmap` —
-`none` is the ROCm/AMD-friendly setting), multi-GPU placement
-(`-sm`, `-ts`), server slots (`-np`), idle sleep (`--sleep-idle-seconds`),
-host/port, and
-speculative decoding (`--spec-type`, `--spec-draft-n-max`, `--spec-draft-n-min`).
-Local models with integrated MTP heads default to `draft-mtp`; a same-directory
-`mtp-<base>.gguf` sidecar is passed through `--spec-draft-model` automatically,
-including repositories that omit the base artifact's quantization suffix from
-the sidecar name. A `dflash-*.gguf` drafter beside the model (as shipped for
-Muse-Glimmer) defaults `spec-type` to `draft-dflash` once downloaded and fills
-the same `--spec-draft-model` slot; `spec-draft-n-max` then starts at the
-drafter's trained block size, which is worth far more than llama.cpp's default
-of 3 (measurements in ADR-014). A compatible local `mmproj-*.gguf` is passed
-through `--mmproj`. For uncached Hub models, recent llama.cpp builds
-auto-discover root MTP and projector companions from `-hf`; downloaded
-companions become explicit local paths on subsequent launches. A dFlash drafter
-has no such remote form — `--spec-draft-hf` selects by quantization only — so
-llmctl asks you to download the model (`d`) before drafting with it.
-Any option left at its default value is omitted from the command line.
-
-#### FastFlowLM
-
-An NPU has no GPU layers or flash attention, so `flm` gets its own vocabulary:
-power mode (`--pmode`: powersaver / balanced / performance / turbo), context
-length, prefill chunk length, NPU queue length, socket limit, preemption, CORS,
-the ASR and embedding companion models, vision pre-resize, and host/port.
-Templates (Default, Chat, Long Context, Server, Low Power) mirror llama.cpp's
-intent in FastFlowLM's dialect. Options are clamped to what the selected model
-actually supports — its trained context length and maximum prefill.
-`--host`/`--port` are always emitted, because llmctl needs the concrete endpoint
-to health-check the server and re-acquire it after a restart.
+![Editing a profile's options, with the range, default, and flag for each](docs/media/options.png)
 
 ## Configuration
 
@@ -235,51 +241,36 @@ inspect and extend. Older `[models].paths` arrays remain supported, but named
 `[[models.sources]]` entries provide stable catalog names and layout control.
 Your `$HOME` is never scanned wholesale.
 
+### Removing a model
+
+`D` on a model in the browser removes its files from local storage — the
+mirror image of `d`. It asks first, quoting the model and the space it frees:
+`Remove Muse-Glimmer-30B-UD-Q4_K_XL.gguf (15.1 GB) from disk?`. `y` or Enter
+goes ahead, any other key cancels.
+
+This matters most for the Hugging Face cache, where a model is a set of
+hash-named blobs that cannot be identified by eye: `D` maps the artifact you
+selected in the browser onto the exact blobs, snapshot links, and — once the
+repository holds nothing else — the whole `models--org--repo` directory. It
+works the same way on scanned GGUFs and on FastFlowLM's model directories —
+including a GGUF llmctl found by *scanning* the Hub cache, where the file is a
+symlink and the bytes are in the blob behind it.
+
+A projector or dFlash drafter shared with another quantization you still have
+is kept, and the quoted size excludes it. Profiles for the model are kept too,
+so re-downloading it restores your settings. A model with a live session, or one
+currently downloading, is refused until you stop it.
+
 ### Online models
 
-Under the llama.cpp runtime, enter `online`, then `huggingface`. Selecting the
-source fetches 30 trending llama.cpp-compatible GGUF repositories. Repositories
-appear as flat `provider/repository` rows with likes and download counts;
-entering one fetches its GGUF variants. Choose an artifact, configure a normal
-profile, and press `s`. llmctl launches llama.cpp with `--hf-repo` and
-`--hf-file`, then links the downloaded file from the standard Hugging Face
-cache into the managed catalog. `mtp-*`, `dflash-*`, and `mmproj-*` files stay
-hidden as standalone artifacts; the publisher's root MTP default, the
-repository's dFlash drafter, and a compatible projector are attached to each base
-model. Direct downloads include those companions, while native `-hf` launches use
-llama.cpp's companion auto-discovery.
-
-Press `d` on an uncached online GGUF to download it without starting a server.
-Multiple models can download concurrently in a Downloads pane below Sessions.
-The left jobs column is split 70/30 between servers and downloads, with one
-continuous up/down selection across both panes. Each download row shows
-aggregate shard progress; `x` cancels the selected transfer while preserving
-its partial files, and `R` (or `d` on the model) resumes it. Completed rows
-retain the final cache path in their detail pane. Incomplete jobs are recorded
-under `online/huggingface/.downloads` in the managed model directory. After an
-llmctl restart they return as `Interrupted`, with progress reconstructed from
-the Hub cache; press `R` to continue them.
-
-The online repository pane is titled `Trending`, `Most likes`, or `Most downloads`.
-Inside a repository, the GGUF files pane uses the standard `Model` title, like
-local repositories. Press `s` to cycle between Hub trending score, most likes,
-and most downloads. A view change or online `F5` discards generated online layout
-metadata and fetches a clean first page for the active view; profile YAML and
-download records and model data are preserved. `/` performs debounced server-side search
-across Hugging Face.
-Hub search results remain transient until Enter saves the selected repository;
-closing the search does not expand the local catalogue. Inside a repository it
-searches only fetched GGUF artifacts. Online results never mix into local
-folder searches. Set `HF_TOKEN` in the environment for gated/private models;
-llmctl never persists the token.
-
-## Roadmap
-
-Done: TUI skeleton, model/runtime discovery, profiles & options, and launch &
-session management. Planned next: log search & startup-failure classification,
-incremental search/filters, and polish. See [docs/roadmap.md](docs/roadmap.md)
-for the full picture and [docs/decisions.md](docs/decisions.md) for the
-architectural decision records.
+Under the llama.cpp runtime, enter `online`, then `huggingface`, for 30 trending
+GGUF repositories — or `/` to search the Hub. Pick an artifact, configure a
+profile as usual, and `s` launches it straight from the Hugging Face cache while
+`d` downloads it first. Downloads run concurrently in their own pane below
+Sessions, bring each model's companion files with them, and resume after a
+cancel (`x`) or an llmctl restart (`R`). `s` on a repository list cycles the sort
+between trending, most likes, and most downloads. Set `HF_TOKEN` in the
+environment for gated or private models; llmctl never persists it.
 
 ## License
 

@@ -7,10 +7,13 @@
 
 pub mod command;
 pub mod health;
+pub mod logtail;
 pub mod proc;
 pub mod record;
 pub mod supervisor;
+pub mod throughput;
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,9 +22,11 @@ use anyhow::{Result, anyhow};
 
 use command::Command;
 use health::Health;
+use logtail::LogTail;
 use proc::CpuSample;
 use record::{DownloadRecord, SessionRecord};
 use supervisor::{DetachedSupervisor, LaunchSpec, SessionSupervisor};
+use throughput::Throughput;
 
 /// Observable lifecycle state of a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +115,13 @@ pub struct Session {
     requested_stop: bool,
     /// Previous CPU sample for delta-based percentage.
     last_cpu: Option<CpuSample>,
+    /// Prompt-processing and token-generation rates, and the position in the
+    /// server's log they are read from.
+    pub throughput: Throughput,
+    log_tail: LogTail,
+    /// The tail of what the server has written, kept so the Session Manager can
+    /// show it without re-reading the file. See [`remember`].
+    recent: VecDeque<String>,
     /// Set while a restart is waiting out the old process; see [`PendingRestart`].
     restart_pending: Option<PendingRestart>,
 }
@@ -125,8 +137,17 @@ impl Session {
             download_percent,
             requested_stop: false,
             last_cpu: None,
+            throughput: Throughput::default(),
+            log_tail: LogTail::default(),
+            recent: VecDeque::new(),
             restart_pending: None,
         }
+    }
+
+    /// A session with pre-seeded rates, for rendering tests.
+    #[cfg(test)]
+    pub fn probe(record: SessionRecord, status: SessionStatus, throughput: Throughput) -> Self {
+        Self { throughput, ..Self::new(record, status) }
     }
 
     /// Seconds the process has been alive (None for terminal states).
@@ -140,6 +161,45 @@ impl Session {
     pub fn status_label(&self) -> String {
         session_status_label(self.status, self.download_percent)
     }
+
+    /// The last `count` lines the server wrote, oldest first.
+    pub fn recent_log(&self, count: usize) -> Vec<&str> {
+        let skip = self.recent.len().saturating_sub(count);
+        self.recent.iter().skip(skip).map(String::as_str).collect()
+    }
+
+    /// Seed the log tail directly, for rendering tests.
+    #[cfg(test)]
+    pub fn with_log(mut self, lines: &[&str]) -> Self {
+        remember(&mut self.recent, &lines.iter().map(|l| l.to_string()).collect::<Vec<_>>());
+        self
+    }
+}
+
+/// How much of a session's log the Session Manager keeps in memory.
+///
+/// Deep enough to fill the pane on the tallest terminal anyone drives this with,
+/// shallow enough that a dozen sessions cost a few hundred kilobytes between
+/// them. The file keeps the rest; `L` opens it.
+const RECENT_LINES: usize = 200;
+
+/// Append what a server just wrote to the tail kept for it, dropping the oldest
+/// lines past [`RECENT_LINES`].
+///
+/// Lines are cleaned on the way in, not on the way out: a progress bar redrawn
+/// a thousand times arrives as one line holding a thousand states, and the pane
+/// would otherwise reduce it again on every frame.
+fn remember(recent: &mut VecDeque<String>, appended: &[String]) {
+    for line in appended {
+        let line = logtail::visible_line(line);
+        if line.trim().is_empty() {
+            continue;
+        }
+        if recent.len() == RECENT_LINES {
+            recent.pop_front();
+        }
+        recent.push_back(line);
+    }
 }
 
 fn session_status_label(status: SessionStatus, download_percent: Option<u8>) -> String {
@@ -149,6 +209,53 @@ fn session_status_label(status: SessionStatus, download_percent: Option<u8>) -> 
         }
         _ => status.label().into(),
     }
+}
+
+/// The model file a session has open, where its process token names one.
+///
+/// Only an absolute path locates storage. A tag (`qwen3:4b`) and a repo-relative
+/// filename (`Q4_K_M/model.gguf`) are both non-empty and both resolve against
+/// whatever the process's working directory happened to be, so treating either
+/// as a path would compare it against an absolute deletion plan, match nothing,
+/// and wave the deletion through.
+fn storage_path(record: &SessionRecord) -> Option<PathBuf> {
+    let path = PathBuf::from(&record.model_path);
+    path.is_absolute().then_some(path)
+}
+
+/// The cache files a session's own transfer is writing.
+///
+/// A launch that fetches its own artifacts records where every blob is going,
+/// and those paths are absolute even where the process token is not. They are
+/// what identifies such a session's storage, because its *name* does not: the
+/// online catalog calls a nested artifact `Q4/model.gguf` and the scanner that
+/// finds the same file in the cache afterwards calls it `model.gguf`, so
+/// deleting through the second one would answer a question the first was asked.
+fn download_paths(record: &SessionRecord) -> Vec<PathBuf> {
+    record
+        .download
+        .iter()
+        .flat_map(|download| download.blobs.iter())
+        .flat_map(|blob| [blob.complete_file.clone(), blob.incomplete_file.clone()])
+        .collect()
+}
+
+/// Every absolute path in a session's own command line.
+///
+/// The model is not the only file a server holds open: a projector, an MTP
+/// sidecar or a dFlash drafter is passed as its own flag, and a companion
+/// already in the cache is named there and nowhere else — not in the process
+/// token, and not in the download record, which lists only what this launch is
+/// fetching. Deleting another quantization of the same repository would then
+/// take a companion out from under a running server, because a companion is
+/// spared only for the *cached* siblings the catalog lists and the running one
+/// may not be among them.
+///
+/// Reading the argv over-blocks slightly: a log path or a binary is a path too.
+/// Neither ever appears in a deletion plan, and erring towards refusing a
+/// deletion is the right direction for a guard.
+fn command_paths(record: &SessionRecord) -> impl Iterator<Item = PathBuf> + '_ {
+    record.command.iter().map(PathBuf::from).filter(|path| path.is_absolute())
 }
 
 fn download_percent(record: &SessionRecord) -> Option<u8> {
@@ -194,6 +301,10 @@ pub struct LaunchRequest {
     pub health_path: String,
     pub download: Option<DownloadRecord>,
     pub profile: String,
+    /// Total size of the model's files, for the Session Manager.
+    pub size_bytes: Option<u64>,
+    /// The compute backend the server will use, as the runtime resolved it.
+    pub device: Option<String>,
     pub host: String,
     pub port: u16,
 }
@@ -222,6 +333,34 @@ impl SessionManager {
         mgr
     }
 
+    /// A manager whose supervisor never spawns, for tests about bookkeeping.
+    ///
+    /// Constructing a [`DetachedSupervisor`] sets `SIGCHLD` to `SIG_IGN` for the
+    /// whole process, so any test that merely wants a `SessionManager` struct
+    /// breaks child reaping for whatever else `cargo test` is running in
+    /// parallel at that moment — `Command::output` fails, `Command::spawn`
+    /// panics. Tests that do need real processes are `#[ignore]`d and run
+    /// single-threaded; these take a supervisor that touches no signals.
+    #[cfg(test)]
+    fn without_supervisor(dir: PathBuf, log_dir: PathBuf) -> Self {
+        struct NeverSpawns;
+        impl SessionSupervisor for NeverSpawns {
+            fn spawn(&self, _spec: &LaunchSpec) -> Result<supervisor::Spawned> {
+                Err(anyhow!("this test's supervisor does not spawn"))
+            }
+            fn stop(&self, _pid: i32) -> Result<()> {
+                Ok(())
+            }
+            fn kill(&self, _pid: i32) -> Result<()> {
+                Ok(())
+            }
+        }
+        let mut mgr =
+            Self { dir, log_dir, supervisor: Box::new(NeverSpawns), sessions: Vec::new() };
+        mgr.rediscover();
+        mgr
+    }
+
     /// Reload persisted records; keep those whose process is still alive and
     /// matches, delete the JSON for the rest (the spec's "stale records removed").
     pub fn rediscover(&mut self) {
@@ -240,6 +379,7 @@ impl SessionManager {
                 record.delete(&self.dir);
             }
         }
+        self.group_by_runtime();
     }
 
     /// Launch the already-built command in `req`, moving to a free port if the
@@ -259,10 +399,12 @@ impl SessionManager {
 
         let record = SessionRecord {
             id,
-            name: session_name(&req.model, &req.profile),
+            name: session_name(&req.model),
             runtime: req.runtime,
             model: req.model,
             model_path: req.model_path,
+            size_bytes: req.size_bytes,
+            device: req.device,
             profile: req.profile,
             pid: spawned.pid,
             host: req.host,
@@ -279,8 +421,35 @@ impl SessionManager {
         } else {
             SessionStatus::Starting
         };
+        let launched = record.id.clone();
         self.sessions.push(Session::new(record, status));
-        Ok(self.sessions.len() - 1)
+        self.group_by_runtime();
+        Ok(self
+            .sessions
+            .iter()
+            .position(|session| session.record.id == launched)
+            .unwrap_or(self.sessions.len() - 1))
+    }
+
+    /// Order the list so each runtime's sessions sit together, the groups in the
+    /// order they first appeared and each group in launch order.
+    ///
+    /// The Session Manager heads every group with its runtime's name, and a list
+    /// whose stored order differs from its displayed one would send the cursor
+    /// jumping between groups on every keypress. Keeping the order here rather
+    /// than in the renderer means the index a row is drawn at is the index every
+    /// action uses.
+    fn group_by_runtime(&mut self) {
+        let mut order: Vec<String> = Vec::new();
+        for session in &self.sessions {
+            if !order.contains(&session.record.runtime) {
+                order.push(session.record.runtime.clone());
+            }
+        }
+        // Stable, so launch order survives inside each group.
+        self.sessions.sort_by_key(|session| {
+            order.iter().position(|runtime| *runtime == session.record.runtime).unwrap_or(0)
+        });
     }
 
     /// The first session of `runtime` that still holds its resources — anything
@@ -290,6 +459,47 @@ impl SessionManager {
     /// Used to enforce [`crate::runtime::RuntimeBackend::single_session`].
     pub fn active_for_runtime(&self, runtime: &str) -> Option<&Session> {
         self.sessions.iter().find(|s| !s.status.is_terminal() && s.record.runtime == runtime)
+    }
+
+    /// Whether a live session of `runtime` is serving `model` and named no file
+    /// on disk when it was launched.
+    ///
+    /// `model_path` holds the process token
+    /// ([`RuntimeBackend::process_token`](crate::runtime::RuntimeBackend::process_token)),
+    /// which only sometimes *is* a path: a FastFlowLM session records the tag
+    /// `flm serve` was given, and a llama.cpp launch that fetches its own
+    /// artifacts records the repo-relative filename it asked the Hub for.
+    /// Neither locates storage, so those sessions are recognized by the name
+    /// they were launched under — the only handle there is. Where a real path
+    /// was recorded the files answer better (see
+    /// [`SessionManager::active_model_paths`]), and two unrelated models that
+    /// happen to share a filename stay independent.
+    pub fn pathless_session_for(&self, runtime: &str, model: &str) -> bool {
+        self.sessions.iter().any(|s| {
+            !s.status.is_terminal()
+                && s.record.runtime == runtime
+                && s.record.model == model
+                && storage_path(&s.record).is_none()
+        })
+    }
+
+    /// Every file the live sessions of `runtime` have open or are writing —
+    /// models, their companions, and the blobs a launch is still fetching.
+    ///
+    /// Names are not enough to decide what is in use: one GGUF reaches the
+    /// catalog under more than one entry, and a session records the name it was
+    /// launched under. The files it opened are the same either way.
+    pub fn active_model_paths(&self, runtime: &str) -> Vec<PathBuf> {
+        self.sessions
+            .iter()
+            .filter(|s| !s.status.is_terminal() && s.record.runtime == runtime)
+            .flat_map(|s| {
+                storage_path(&s.record)
+                    .into_iter()
+                    .chain(download_paths(&s.record))
+                    .chain(command_paths(&s.record))
+            })
+            .collect()
     }
 
     /// The live pid that actually backs a session, re-acquiring the real server
@@ -363,6 +573,11 @@ impl SessionManager {
 
             let rss = proc::rss_bytes(pid);
             let sample = proc::cpu_sample(pid);
+            // The server already timed its own requests; read what it wrote
+            // rather than timing anything here (see `session::throughput`).
+            let parse = crate::runtime::throughput_parser(&self.sessions[idx].record.runtime);
+            let log_file = self.sessions[idx].record.log_file.clone();
+            let appended = self.sessions[idx].log_tail.poll(&log_file);
             // Once a session is Running its status no longer depends on the
             // probe — the `was_running` arm below keeps it Running for as long
             // as the process lives — so re-probing every tick buys nothing. It
@@ -375,6 +590,10 @@ impl SessionManager {
             let s = &mut self.sessions[idx];
             s.rss_bytes = rss;
             s.download_percent = progress;
+            for measurement in appended.iter().flat_map(|line| parse(line)) {
+                s.throughput.record(measurement);
+            }
+            remember(&mut s.recent, &appended);
             if let Some(now) = sample {
                 if let Some(prev) = prev {
                     s.cpu_percent = proc::cpu_percent(prev, now);
@@ -530,6 +749,13 @@ impl SessionManager {
         session.last_cpu = None;
         session.cpu_percent = None;
         session.rss_bytes = None;
+        // The rates and the read position belong to the process that just went
+        // away. The replacement writes its own log from byte zero and has said
+        // nothing yet about how fast it runs; carrying either across would show
+        // the old process's figures as if they were the new one's.
+        session.throughput = Throughput::default();
+        session.log_tail = LogTail::default();
+        session.recent.clear();
         Ok(())
     }
 
@@ -580,9 +806,10 @@ fn next_id() -> String {
 }
 
 /// Derive a session name like `qwen3-32b-q6_k-coding` from model + profile.
-fn session_name(model: &str, profile: &str) -> String {
-    let model = model.strip_suffix(".gguf").unwrap_or(model);
-    format!("{}-{}", slug(model), slug(profile))
+/// A session's display name: the model alone. The profile is a column of its
+/// own in the Session Manager, so folding it in here would say it twice.
+fn session_name(model: &str) -> String {
+    slug(model.strip_suffix(".gguf").unwrap_or(model))
 }
 
 /// Lowercase, replacing runs of non-alphanumeric characters with a single dash.
@@ -626,11 +853,70 @@ pub fn format_uptime(secs: u64) -> String {
 mod tests {
     use super::*;
 
+    /// The pane beside the session list reads this buffer, so what goes in is
+    /// what a terminal would have shown — and only the tail of it.
+    #[test]
+    fn the_log_tail_keeps_the_last_lines_as_a_terminal_would_show_them() {
+        let mut recent = VecDeque::new();
+
+        // A progress bar redrawn in place is one line, in its final state.
+        remember(
+            &mut recent,
+            &[
+                "starting".into(),
+                "\u{1b}[?25l\r\u{1b}[K[FLM]  Downloading: 0.3% (6.0MB / 2340.0MB)\r\u{1b}[K[FLM]  Downloading: 100.0% (2340.0MB / 2340.0MB)".into(),
+                // Nothing but control bytes was never on screen at all.
+                "\u{1b}[?25l\u{1b}[?25h".into(),
+                "   ".into(),
+            ],
+        );
+        assert_eq!(
+            recent.iter().collect::<Vec<_>>(),
+            ["starting", "[FLM]  Downloading: 100.0% (2340.0MB / 2340.0MB)"]
+        );
+
+        // Past the cap the oldest lines go, and the newest are the ones kept.
+        let flood: Vec<String> = (0..RECENT_LINES * 2).map(|i| format!("line {i}")).collect();
+        remember(&mut recent, &flood);
+        assert_eq!(recent.len(), RECENT_LINES);
+        assert_eq!(recent.front().map(String::as_str), Some("line 200"));
+        assert_eq!(recent.back().map(String::as_str), Some("line 399"));
+    }
+
+    #[test]
+    fn the_log_tail_hands_out_its_newest_lines() {
+        let session = Session::new(
+            record::SessionRecord {
+                id: "1".into(),
+                name: "n".into(),
+                runtime: "llama.cpp".into(),
+                model: "m".into(),
+                model_path: "m".into(),
+                profile: "p".into(),
+                size_bytes: None,
+                device: None,
+                pid: 1,
+                host: "127.0.0.1".into(),
+                port: 8000,
+                command: vec![],
+                health_path: "/health".into(),
+                log_file: Default::default(),
+                download: None,
+                started_unix: 0,
+            },
+            SessionStatus::Running,
+        )
+        .with_log(&["a", "b", "c"]);
+        assert_eq!(session.recent_log(2), ["b", "c"], "the tail, not the head");
+        assert_eq!(session.recent_log(9), ["a", "b", "c"], "asking for more is not an error");
+    }
+
     #[test]
     fn slug_and_session_name() {
         assert_eq!(slug("Qwen3-32B-Q6_K"), "qwen3-32b-q6_k");
         assert_eq!(slug("Long Context"), "long-context");
-        assert_eq!(session_name("Gemma-27B-Q4_K_M.gguf", "Coding"), "gemma-27b-q4_k_m-coding");
+        // The profile is its own column and is deliberately not folded in.
+        assert_eq!(session_name("Gemma-27B-Q4_K_M.gguf"), "gemma-27b-q4_k_m");
     }
 
     #[test]
@@ -684,6 +970,8 @@ mod tests {
                 model: "m".into(),
                 model_path: "m".into(),
                 profile: "Default".into(),
+                size_bytes: None,
+                device: None,
                 pid: 1,
                 host: "127.0.0.1".into(),
                 port: 1,
@@ -781,6 +1069,8 @@ mod tests {
             health_path: "/health".into(),
             download: None,
             profile: "Default".into(),
+            size_bytes: None,
+            device: None,
             host: "127.0.0.1".into(),
             port: 18900,
         };
@@ -863,6 +1153,8 @@ mod tests {
             health_path: "/v1/models".into(),
             download: None,
             profile: "Default".into(),
+            size_bytes: None,
+            device: None,
             host: "127.0.0.1".into(),
             port: 18930,
         };
@@ -919,6 +1211,8 @@ mod tests {
                 model: "m".into(),
                 model_path: "300".into(),
                 profile: "Default".into(),
+                size_bytes: None,
+                device: None,
                 pid: -1,
                 host: "127.0.0.1".into(),
                 port: 18931,
@@ -931,10 +1225,21 @@ mod tests {
             SessionStatus::Crashed,
         ));
 
+        // Rates the old process reported, which the replacement has not earned.
+        mgr.sessions[0].throughput.record(throughput::Sample {
+            phase: throughput::Phase::Decode,
+            tokens: 100,
+            seconds: 2.0,
+        });
+
         mgr.restart(0).expect("restart");
         assert!(mgr.poll_restarts().is_empty(), "no spawn errors expected");
         assert_eq!(mgr.sessions[0].status, SessionStatus::Starting);
         assert!(mgr.sessions[0].record.pid > 0);
+        assert!(
+            mgr.sessions[0].throughput.rate(throughput::Phase::Decode).is_none(),
+            "the replacement kept the old process's rates"
+        );
 
         sleep(Duration::from_millis(100));
         let _ = mgr.kill(0);
@@ -942,12 +1247,15 @@ mod tests {
     }
 
     /// A replacement that cannot be spawned at all reports the failure instead
-    /// of leaving the session stuck in `Restarting`.
+    /// of leaving the session stuck in `Restarting`. The refusal comes from the
+    /// supervisor here rather than from a real failed exec — that path is
+    /// covered by the `#[ignore]`d restart tests, which get a process to
+    /// themselves.
     #[test]
     fn a_replacement_that_cannot_spawn_is_reported() {
         let base = std::env::temp_dir().join(format!("llmctl-restart-bad-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
-        let mut mgr = SessionManager::new(base.join("sessions"), base.join("logs"));
+        let mut mgr = SessionManager::without_supervisor(base.join("sessions"), base.join("logs"));
         mgr.sessions.push(Session::new(
             SessionRecord {
                 id: "0-0".into(),
@@ -956,6 +1264,8 @@ mod tests {
                 model: "m".into(),
                 model_path: "nothing".into(),
                 profile: "Default".into(),
+                size_bytes: None,
+                device: None,
                 pid: -1,
                 host: "127.0.0.1".into(),
                 port: 18932,
@@ -977,11 +1287,140 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// The Session Manager heads each runtime's sessions with its name, so the
+    /// list is kept grouped: each runtime's sessions contiguous, the groups in
+    /// the order they first appeared, launch order intact inside each.
+    #[test]
+    fn sessions_are_grouped_by_runtime_without_disturbing_launch_order() {
+        let base = std::env::temp_dir().join(format!("llmctl-grouping-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut mgr = SessionManager::without_supervisor(base.join("sessions"), base.join("logs"));
+        let record = |id: &str, runtime: &str| SessionRecord {
+            id: id.into(),
+            name: id.into(),
+            runtime: runtime.into(),
+            model: "m".into(),
+            model_path: "m".into(),
+            profile: "Default".into(),
+            size_bytes: None,
+            device: None,
+            pid: -1,
+            host: "127.0.0.1".into(),
+            port: 18934,
+            command: Vec::new(),
+            health_path: "/health".into(),
+            log_file: base.join("s.log"),
+            download: None,
+            started_unix: 0,
+        };
+        for (id, runtime) in
+            [("a", "llama.cpp"), ("b", "FastFlowLM"), ("c", "llama.cpp"), ("d", "FastFlowLM")]
+        {
+            mgr.sessions.push(Session::new(record(id, runtime), SessionStatus::Running));
+        }
+
+        mgr.group_by_runtime();
+        let order: Vec<&str> = mgr.sessions.iter().map(|s| s.record.id.as_str()).collect();
+        assert_eq!(order, vec!["a", "c", "b", "d"]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Deleting a model asks two questions of the live sessions: which files
+    /// are open, and — only for launches that opened none — which name is in
+    /// use. Sharing a filename with a served model must not be enough.
+    #[test]
+    fn only_a_pathless_session_is_matched_by_name() {
+        let base = std::env::temp_dir().join(format!("llmctl-pathless-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut mgr = SessionManager::without_supervisor(base.join("sessions"), base.join("logs"));
+        let record = |id: &str, model_path: &str| SessionRecord {
+            id: id.into(),
+            name: id.into(),
+            runtime: "llama.cpp".into(),
+            model: "model.gguf".into(),
+            model_path: model_path.into(),
+            profile: "Default".into(),
+            size_bytes: None,
+            device: None,
+            pid: -1,
+            host: "127.0.0.1".into(),
+            port: 18933,
+            command: Vec::new(),
+            health_path: "/health".into(),
+            log_file: base.join("s.log"),
+            download: None,
+            started_unix: 0,
+        };
+
+        // A local launch: the file it loaded is on the record, so the name says
+        // nothing that the path does not say better.
+        mgr.sessions.push(Session::new(record("local", "/a/model.gguf"), SessionStatus::Running));
+        assert!(!mgr.pathless_session_for("llama.cpp", "model.gguf"));
+        assert_eq!(mgr.active_model_paths("llama.cpp"), vec![PathBuf::from("/a/model.gguf")]);
+
+        // A launch that fetches from the Hub itself records the repo-relative
+        // filename it asked for, which locates nothing on disk; the name is all
+        // there is to go on.
+        mgr.sessions
+            .push(Session::new(record("remote", "Q4_K_M/model.gguf"), SessionStatus::Running));
+        assert!(mgr.pathless_session_for("llama.cpp", "model.gguf"));
+        assert!(!mgr.pathless_session_for("llama.cpp", "other.gguf"));
+        assert!(!mgr.pathless_session_for("FastFlowLM", "model.gguf"));
+        // And it adds nothing to the paths, or a relative path would be
+        // compared against an absolute plan and match nothing.
+        assert_eq!(mgr.active_model_paths("llama.cpp"), vec![PathBuf::from("/a/model.gguf")]);
+
+        // A FastFlowLM tag is a name too, not a path.
+        let mut tagged = record("tagged", "qwen3:4b");
+        tagged.runtime = "FastFlowLM".into();
+        mgr.sessions.push(Session::new(tagged, SessionStatus::Running));
+        assert!(mgr.pathless_session_for("FastFlowLM", "model.gguf"));
+        assert!(mgr.active_model_paths("FastFlowLM").is_empty());
+
+        // A stopped session holds nothing.
+        mgr.sessions[1].status = SessionStatus::Stopped;
+        assert!(!mgr.pathless_session_for("llama.cpp", "model.gguf"));
+
+        // What such a session is really holding is on its download record, in
+        // absolute paths — the identity its name cannot supply, since the
+        // online catalog and the cache scanner call the same artifact
+        // different things.
+        let mut fetching = record("fetching", "Q4/model.gguf");
+        fetching.download = Some(DownloadRecord {
+            blobs: vec![record::DownloadBlob {
+                incomplete_file: PathBuf::from("/hub/blobs/aa.incomplete"),
+                complete_file: PathBuf::from("/hub/blobs/aa"),
+                expected_bytes: 10,
+            }],
+        });
+        mgr.sessions.push(Session::new(fetching, SessionStatus::Downloading));
+        let paths = mgr.active_model_paths("llama.cpp");
+        assert!(paths.contains(&PathBuf::from("/hub/blobs/aa")), "{paths:?}");
+        assert!(paths.contains(&PathBuf::from("/hub/blobs/aa.incomplete")), "{paths:?}");
+
+        // And a companion already cached is named only in the argv: the
+        // transfer is not fetching it, and the process token is the base
+        // artifact. Relative arguments are not paths and stay out.
+        let mut companion = record("companion", "Q4/model.gguf");
+        companion.command = vec![
+            "llama-server".into(),
+            "--mmproj".into(),
+            "/hub/blobs/mmproj".into(),
+            "--port".into(),
+            "8080".into(),
+        ];
+        mgr.sessions.push(Session::new(companion, SessionStatus::Running));
+        let paths = mgr.active_model_paths("llama.cpp");
+        assert!(paths.contains(&PathBuf::from("/hub/blobs/mmproj")), "{paths:?}");
+        assert!(!paths.contains(&PathBuf::from("8080")), "{paths:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn resolve_port_skips_a_bound_port() {
         let dir = std::env::temp_dir().join(format!("llmctl-mgr-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mgr = SessionManager::new(dir.clone(), dir);
+        let mgr = SessionManager::without_supervisor(dir.clone(), dir);
         // Bind an ephemeral port so it is guaranteed in use, then confirm the
         // resolver moves past it to a free, higher port.
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();

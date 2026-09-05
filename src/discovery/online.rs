@@ -1,5 +1,6 @@
 //! Lazy Hugging Face catalog discovery backed by the managed model tree.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::discovery::hf;
 use crate::domain::{Model, RemoteBlob, RemoteModel};
+use crate::runtime::{Deletion, Husk, canonical, freed_bytes, link_target, name_identity};
 
 const API: &str = "https://huggingface.co/api/models";
 const SOURCE: [&str; 2] = ["online", "huggingface"];
@@ -904,6 +906,226 @@ pub fn finalize_cached_download(remote: &RemoteModel) -> Result<PathBuf> {
     cached_file(&remote.repo, primary).context("completed cache link is unavailable")
 }
 
+/// Everything the Hugging Face cache holds for one downloaded artifact: its
+/// blobs (plus any partial left by an interrupted download), the snapshot links
+/// that name them, and — once the repository has nothing else cached — the
+/// repository directory itself.
+///
+/// The blobs are the whole point. `models--org--repo/blobs/` is a set of files
+/// named by content hash, so "which of these is the Q4_K_M I stopped using" is
+/// not a question the filesystem can answer. This maps the artifact the user
+/// selected in the browser onto the exact hashes behind it.
+pub fn deletion(model: &Model, catalog: &[Model]) -> Option<Deletion> {
+    deletion_in(&hugging_face_cache()?, model, catalog)
+}
+
+fn deletion_in(hub: &Path, model: &Model, catalog: &[Model]) -> Option<Deletion> {
+    let remote = model.remote.as_ref()?;
+    remote.file.as_ref()?; // a repository directory node stores nothing itself
+    let repo_dir = hub.join(format!("models--{}", remote.repo.replace('/', "--")));
+    if !repo_dir.is_dir() {
+        return None;
+    }
+    // The revision holding the file the user selected, in order of how directly
+    // each source knows it.
+    //
+    // `model.path` is the strongest: it is a snapshot the artifact was actually
+    // found in, so it names the revision the browser is showing. `refs/main`
+    // comes next, because it is at least on disk — the catalog's own revision
+    // is a sha the Hub reported, and after an upstream update it names a
+    // snapshot that was never fetched.
+    //
+    // The order matters in both directions. `refs/main` moves whenever anything
+    // pulls a newer revision — `huggingface-cli`, or a `-hf` launch — and it
+    // moves without the browser noticing, so planning against it after the
+    // catalog was loaded would delete the *new* revision's files and leave the
+    // selected model where it was.
+    let revision = revision_of(&repo_dir, &model.path)
+        .or_else(|| cached_revision(&repo_dir))
+        .or_else(|| remote.revision.clone())
+        .unwrap_or_else(|| "main".to_string());
+    let snapshot = repo_dir.join("snapshots").join(&revision);
+
+    // Artifacts of the same repository that are themselves still cached. Their
+    // files stay — including the projector and dFlash drafter this artifact
+    // lists but does not own.
+    //
+    // Cached is read off the snapshot being planned against, not off
+    // `Model::path`. That field is what the last catalog refresh saw, and the
+    // cache moves underneath it: a `-hf` launch fetches its artifacts itself,
+    // and `huggingface-cli` fills the same directories from outside llmctl
+    // entirely. A sibling that arrived since the refresh still has an empty
+    // path, and taking that for "not cached" would let this deletion carry off
+    // a projector or drafter the new arrival shares and now needs.
+    let siblings: Vec<&RemoteModel> = catalog
+        .iter()
+        .filter(|other| other.id != model.id)
+        .filter_map(|other| other.remote.as_ref())
+        .filter(|other| other.repo == remote.repo)
+        .filter(|other| other.file.as_ref().is_some_and(|file| snapshot.join(file).exists()))
+        .collect();
+    let spoken_for: HashSet<&str> = siblings
+        .iter()
+        .flat_map(|other| other.blobs.iter().map(|blob| blob.file.as_str()))
+        .collect();
+
+    // The snapshot links this deletion removes. A blob is only free once
+    // nothing *outside* this set still names it — another revision cached in
+    // the same repository shares blobs with this one wherever the file did not
+    // change between them.
+    let our_links: Vec<PathBuf> = remote
+        .blobs
+        .iter()
+        .filter(|blob| !spoken_for.contains(blob.file.as_str()))
+        .map(|blob| snapshot.join(&blob.file))
+        .collect();
+
+    let mut plan = Deletion::default();
+    let mut prune: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for blob in &remote.blobs {
+        if spoken_for.contains(blob.file.as_str()) {
+            continue;
+        }
+        let link = snapshot.join(&blob.file);
+        // The link is authoritative about which blob this revision uses; the
+        // recorded oid may name a different one. A cache written by
+        // `huggingface_hub` rather than by llmctl is reachable only this way.
+        let linked = link_target(&link).map(|target| canonical(&target));
+
+        let mut candidates = Vec::new();
+        if let Some((incomplete, complete)) = cache_blob_paths_in(hub, &remote.repo, &blob.oid) {
+            // A `.downloadInProgress` file is scratch for this oid either way.
+            candidates.push(incomplete);
+            if linked.is_none() {
+                // Nothing links the blob yet — an interrupted download leaves
+                // it addressable only by oid.
+                candidates.push(complete);
+            }
+        }
+        candidates.extend(linked);
+        candidates.push(link.clone());
+        for candidate in candidates {
+            let Ok(meta) = fs::symlink_metadata(&candidate) else { continue };
+            // The links go regardless; the blob behind them stays as long as
+            // another revision's snapshot still points at it.
+            if !meta.is_symlink() && blob_linked_elsewhere(&repo_dir, &candidate, &our_links) {
+                continue;
+            }
+            // Deduplicate by the file itself, not by spelling: a relative
+            // `../../blobs/<oid>` link and the recorded blob path name one
+            // file, and counting it twice doubles the size the prompt quotes.
+            let identity =
+                if meta.is_symlink() { candidate.clone() } else { canonical(&candidate) };
+            if seen.insert(identity) {
+                plan.files.push(candidate);
+            }
+        }
+        // A split artifact may sit in a subdirectory of the snapshot — and a
+        // repository that files its quantizations away can nest them several
+        // deep. Every level between the file and the snapshot is offered, or
+        // the one left behind holds the snapshot directory open and, with it,
+        // the whole repository.
+        for ancestor in link.ancestors().skip(1).take_while(|dir| *dir != snapshot) {
+            let dir = ancestor.to_path_buf();
+            if !prune.contains(&dir) {
+                prune.push(dir);
+            }
+        }
+    }
+    if plan.is_empty() {
+        return None;
+    }
+
+    // The managed catalog leaf keeps its profiles — a re-download should not
+    // cost the user their settings — but its `model.gguf` link would dangle.
+    let leaf_link = model.catalog_dir.join("model.gguf");
+    if fs::symlink_metadata(&leaf_link).is_ok_and(|meta| meta.is_symlink()) {
+        plan.files.push(leaf_link);
+    }
+
+    prune.push(snapshot);
+    prune.push(repo_dir.join("snapshots"));
+    prune.push(repo_dir.join("blobs"));
+    // Deepest first, as `Deletion::prune` requires: pruning is one pass of
+    // `remove_dir`, which refuses a directory that still holds its child, and
+    // nothing comes back to it. Two artifacts at different depths interleave
+    // their ancestors in the order the blobs were walked, so sort rather than
+    // trust that order. Stable, so `snapshots` still precedes its sibling
+    // `blobs` and the husk sees both gone.
+    prune.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    plan.prune = prune;
+    // Sized once the list is settled, not blob by blob: what a hard-linked blob
+    // frees depends on whether the plan holds its other names too.
+    plan.bytes = freed_bytes(&plan.files);
+    if siblings.is_empty() {
+        plan.husk = Some(Husk {
+            empty_first: vec![repo_dir.join("blobs"), repo_dir.join("snapshots")],
+            dir: repo_dir,
+        });
+    }
+    Some(plan)
+}
+
+/// The revision a cached path sits under: the directory immediately below
+/// `<repo>/snapshots/`.
+///
+/// `None` for a path outside this repository's snapshots — an empty one, from
+/// an artifact that is not cached at all, or a GGUF scanned from a plain model
+/// directory that happens to carry the same remote metadata.
+fn revision_of(repo_dir: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(repo_dir.join("snapshots")).ok()?;
+    let revision = relative.components().next()?.as_os_str().to_str()?;
+    // The revision alone is not a file: `snapshots/<rev>` with nothing under it
+    // is not a path any artifact was found at.
+    (relative != Path::new(revision)).then(|| revision.to_string())
+}
+
+/// The revision the cache currently holds for a repository, from `refs/main` —
+/// the same pointer [`cached_file_in`] resolves a model's path through.
+fn cached_revision(repo_dir: &Path) -> Option<String> {
+    let revision = fs::read_to_string(repo_dir.join("refs/main")).ok()?;
+    let revision = revision.trim();
+    (!revision.is_empty()).then(|| revision.to_string())
+}
+
+/// The Hugging Face repository cache directory `path` lives in, if any.
+///
+/// A GGUF is reached two ways: through the online catalog, which knows the repo
+/// it came from, and through a plain directory scan, because the Hub cache is
+/// one of the well-known locations llmctl scans. The second route has only a
+/// path to go on, so the layout is recognized by shape: a `models--*` ancestor
+/// holding both `blobs/` and `snapshots/`.
+pub fn hub_repo_dir(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .filter(|dir| {
+            dir.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("models--"))
+        })
+        .find(|dir| dir.join("blobs").is_dir() && dir.join("snapshots").is_dir())
+        .map(Path::to_path_buf)
+}
+
+/// Whether any snapshot link in `repo_dir` other than `ours` still resolves to
+/// `blob`.
+///
+/// `blobs/` is content-addressed, so one file backs every revision whose copy
+/// of it is byte-identical — a repository that bumps its README gets a second
+/// snapshot directory whose GGUF link points at the very same blob. Unlinking
+/// that blob to reclaim one artifact would leave the other snapshot dangling,
+/// so the blob only goes when nothing but this deletion's own links names it.
+pub fn blob_linked_elsewhere(repo_dir: &Path, blob: &Path, ours: &[PathBuf]) -> bool {
+    let blob = canonical(blob);
+    let ours: Vec<PathBuf> = ours.iter().map(|path| name_identity(path)).collect();
+    walkdir::WalkDir::new(repo_dir.join("snapshots"))
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path_is_symlink())
+        .filter(|entry| !ours.contains(&name_identity(entry.path())))
+        .any(|entry| link_target(entry.path()).is_some_and(|target| canonical(&target) == blob))
+}
+
 fn materialize_snapshot_file(remote: &RemoteModel, file: &str, blob: &Path) -> Result<PathBuf> {
     let hub = hugging_face_cache().context("Hugging Face cache directory is unavailable")?;
     let revision = remote.revision.as_deref().unwrap_or("main");
@@ -1519,5 +1741,312 @@ mod tests {
         assert!(downloads.windows(2).all(|pair| pair[0] >= pair[1]));
         assert_eq!(cached_sort(&root), Sort::Downloads);
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// A Hugging Face cache holding `files` as `(name, oid, size)`: a blob per
+    /// entry, plus the snapshot link that names it — the layout llmctl and
+    /// `huggingface_hub` both produce.
+    fn fake_hub(hub: &Path, repo: &str, revision: &str, files: &[(&str, &str, usize)]) {
+        let repo_dir = hub.join(format!("models--{}", repo.replace('/', "--")));
+        let snapshot = repo_dir.join("snapshots").join(revision);
+        fs::create_dir_all(repo_dir.join("blobs")).unwrap();
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(repo_dir.join("refs")).unwrap();
+        fs::write(repo_dir.join("refs/main"), revision).unwrap();
+        for (name, oid, size) in files {
+            let blob = repo_dir.join("blobs").join(oid);
+            fs::write(&blob, vec![0_u8; *size]).unwrap();
+            let link = snapshot.join(name);
+            // A repo-relative name may nest (`Q4_K_M/model-00001-of-2.gguf`).
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&blob, link).unwrap();
+        }
+    }
+
+    /// A cached artifact of `repo`, listing `blobs` as `(file, oid, size)`.
+    fn artifact(hub: &Path, repo: &str, file: &str, blobs: &[(&str, &str, usize)]) -> Model {
+        let snapshot = hub
+            .join(format!("models--{}", repo.replace('/', "--")))
+            .join("snapshots/abc")
+            .join(file);
+        Model {
+            id: format!("hf:{repo}/{file}"),
+            name: file.into(),
+            path: snapshot.clone(),
+            shard_paths: vec![snapshot],
+            mtp_path: None,
+            dflash_path: None,
+            dflash_block_size: None,
+            projector_path: None,
+            has_mtp: false,
+            catalog_path: vec!["online".into(), "huggingface".into(), repo.into(), file.into()],
+            catalog_dir: PathBuf::new(),
+            size_bytes: 0,
+            quantization: None,
+            architecture: None,
+            context_length: None,
+            modified: None,
+            has_chat_template: false,
+            flm: None,
+            runtime: crate::runtime::llama_cpp::NAME.into(),
+            remote: Some(RemoteModel {
+                repo: repo.into(),
+                revision: Some("abc".into()),
+                file: Some(file.into()),
+                blobs: blobs
+                    .iter()
+                    .map(|(name, oid, size)| RemoteBlob {
+                        oid: (*oid).into(),
+                        size_bytes: *size as u64,
+                        file: (*name).into(),
+                    })
+                    .collect(),
+                mtp_file: None,
+                dflash_file: None,
+                projector_file: Some("mmproj.gguf".into()),
+                downloads: 0,
+                likes: 0,
+                gated: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn deleting_the_last_artifact_takes_its_blobs_and_the_repository_directory() {
+        let hub = std::env::temp_dir().join(format!("llmctl-delete-last-{}", now()));
+        let files =
+            [("model-Q4.gguf", &"aa".repeat(32)[..], 10), ("mmproj.gguf", &"ff".repeat(32)[..], 5)];
+        fake_hub(&hub, "owner/repo", "abc", &files);
+        let model = artifact(&hub, "owner/repo", "model-Q4.gguf", &files);
+
+        let plan = deletion_in(&hub, &model, std::slice::from_ref(&model)).expect("a cached plan");
+        // Links are symlinks and cost nothing; the blobs behind them are the bytes.
+        assert_eq!(plan.bytes, 15);
+        assert!(plan.husk.is_some(), "nothing else is cached in this repository");
+
+        plan.execute().unwrap();
+        assert!(!hub.join("models--owner--repo").exists(), "the repository cache should be gone");
+        let _ = fs::remove_dir_all(hub);
+    }
+
+    /// A repository that files its quantizations away in nested directories.
+    /// Pruning is one pass, so a directory left behind at any level keeps the
+    /// snapshot — and with it the repository and its stale `refs/main` — alive.
+    #[test]
+    fn a_nested_artifact_prunes_every_level_down_to_the_repository() {
+        let hub = std::env::temp_dir().join(format!("llmctl-delete-nested-{}", now()));
+        // The GGUF is two directories down and the companion sits at the top,
+        // so `UD` is reached only as an ancestor of the file — nothing else
+        // names it.
+        let deep = ("UD/Q4_K_XL/model.gguf", &"aa".repeat(32)[..], 10);
+        let root = ("mmproj.gguf", &"ff".repeat(32)[..], 5);
+        fake_hub(&hub, "owner/repo", "abc", &[deep, root]);
+        let model = artifact(&hub, "owner/repo", "UD/Q4_K_XL/model.gguf", &[deep, root]);
+
+        let plan = deletion_in(&hub, &model, std::slice::from_ref(&model)).expect("a cached plan");
+        let snapshot = hub.join("models--owner--repo/snapshots/abc");
+        assert!(plan.prune.contains(&snapshot.join("UD")), "{:?}", plan.prune);
+        assert!(plan.prune.contains(&snapshot.join("UD/Q4_K_XL")), "{:?}", plan.prune);
+        // Deepest first, whatever order the blobs were walked in: pruning is
+        // one pass and never comes back to a directory it could not take.
+        let depths: Vec<usize> = plan.prune.iter().map(|dir| dir.components().count()).collect();
+        assert!(depths.windows(2).all(|pair| pair[0] >= pair[1]), "{:?}", plan.prune);
+
+        plan.execute().unwrap();
+        assert!(
+            !hub.join("models--owner--repo").exists(),
+            "an intermediate directory kept the repository alive"
+        );
+        let _ = fs::remove_dir_all(hub);
+    }
+
+    #[test]
+    fn a_projector_another_cached_quantization_uses_is_left_alone() {
+        let hub = std::env::temp_dir().join(format!("llmctl-delete-shared-{}", now()));
+        let projector = ("mmproj.gguf", &"ff".repeat(32)[..], 5);
+        let q4 = ("model-Q4.gguf", &"aa".repeat(32)[..], 10);
+        let q8 = ("model-Q8.gguf", &"bb".repeat(32)[..], 20);
+        fake_hub(&hub, "owner/repo", "abc", &[q4, q8, projector]);
+        let target = artifact(&hub, "owner/repo", "model-Q4.gguf", &[q4, projector]);
+        let sibling = artifact(&hub, "owner/repo", "model-Q8.gguf", &[q8, projector]);
+
+        let plan = deletion_in(&hub, &target, &[target.clone(), sibling]).expect("a cached plan");
+        let projector = hub.join("models--owner--repo/blobs").join("ff".repeat(32));
+        assert!(
+            !plan.files.contains(&projector),
+            "the shared projector is not planned for removal"
+        );
+        assert_eq!(plan.bytes, 10, "only the Q4 blob is this artifact's to free");
+        assert!(plan.husk.is_none(), "the repository still holds a cached artifact");
+
+        plan.execute().unwrap();
+        let blobs = hub.join("models--owner--repo/blobs");
+        assert!(!blobs.join("aa".repeat(32)).exists());
+        assert!(blobs.join("ff".repeat(32)).exists(), "the shared projector must survive");
+        assert!(blobs.join("bb".repeat(32)).exists());
+        let _ = fs::remove_dir_all(hub);
+    }
+
+    /// Regression: "still cached" was read off `Model::path`, which is what the
+    /// last catalog refresh saw. A sibling fetched since — by a `-hf` launch or
+    /// by `huggingface-cli` — is on disk with an empty path, and taking that
+    /// for "not cached" freed the projector it now needs.
+    #[test]
+    fn a_sibling_cached_since_the_last_refresh_still_holds_its_projector() {
+        // `now()` is whole seconds, so the prefix has to be the unique part.
+        let hub = std::env::temp_dir().join(format!("llmctl-delete-fresh-sibling-{}", now()));
+        let projector = ("mmproj.gguf", &"ff".repeat(32)[..], 5);
+        let q4 = ("model-Q4.gguf", &"aa".repeat(32)[..], 10);
+        let q8 = ("model-Q8.gguf", &"bb".repeat(32)[..], 20);
+        // Everything is in the cache, including the Q8.
+        fake_hub(&hub, "owner/repo", "abc", &[q4, q8, projector]);
+        let target = artifact(&hub, "owner/repo", "model-Q4.gguf", &[q4, projector]);
+        let mut sibling = artifact(&hub, "owner/repo", "model-Q8.gguf", &[q8, projector]);
+        // The catalog, however, still lists the Q8 as not downloaded.
+        sibling.path = PathBuf::new();
+        sibling.shard_paths.clear();
+
+        let plan = deletion_in(&hub, &target, &[target.clone(), sibling]).expect("a cached plan");
+        assert_eq!(plan.bytes, 10, "only the Q4 blob is this artifact's to free");
+
+        plan.execute().unwrap();
+        let blobs = hub.join("models--owner--repo/blobs");
+        assert!(!blobs.join("aa".repeat(32)).exists(), "the Q4 is what was deleted");
+        assert!(
+            blobs.join("ff".repeat(32)).exists(),
+            "the projector the cached Q8 needs must survive"
+        );
+        assert!(blobs.join("bb".repeat(32)).exists());
+        let _ = fs::remove_dir_all(hub);
+    }
+
+    /// Blobs are content-addressed and shared between revisions: a repository
+    /// that changed only its README leaves two snapshots pointing at one GGUF.
+    /// Deleting through the current revision may take its link, but not the
+    /// blob the older snapshot still names.
+    #[test]
+    fn a_blob_an_older_snapshot_still_links_survives() {
+        let hub = std::env::temp_dir().join(format!("llmctl-delete-revisions-{}", now()));
+        let q4 = ("model-Q4.gguf", &"aa".repeat(32)[..], 10);
+        fake_hub(&hub, "owner/repo", "abc", &[q4]);
+        // An earlier revision whose copy of the file was byte-identical, so the
+        // Hub cache gave both snapshots the same blob.
+        let repo_dir = hub.join("models--owner--repo");
+        let older = repo_dir.join("snapshots/old");
+        fs::create_dir_all(&older).unwrap();
+        let blob = repo_dir.join("blobs").join("aa".repeat(32));
+        std::os::unix::fs::symlink(&blob, older.join("model-Q4.gguf")).unwrap();
+
+        let model = artifact(&hub, "owner/repo", "model-Q4.gguf", &[q4]);
+        let plan = deletion_in(&hub, &model, std::slice::from_ref(&model)).expect("a cached plan");
+        assert!(!plan.files.contains(&blob), "the shared blob is not this plan's to remove");
+        assert_eq!(plan.bytes, 0, "unlinking a name frees nothing while the file is still named");
+
+        plan.execute().unwrap();
+        assert!(blob.exists(), "the older snapshot must not be left dangling");
+        assert!(older.join("model-Q4.gguf").exists());
+        assert!(!repo_dir.join("snapshots/abc/model-Q4.gguf").exists(), "our own link goes");
+        let _ = fs::remove_dir_all(hub);
+    }
+
+    /// Regression: the plan used the revision the last catalog refresh
+    /// reported, while the cached file is the one `refs/main` names. After an
+    /// upstream update those diverge, and the plan either found nothing or
+    /// deleted the new revision's blob while leaving the cached one behind.
+    #[test]
+    fn a_stale_catalog_revision_still_plans_against_what_is_cached() {
+        let hub = std::env::temp_dir().join(format!("llmctl-delete-stale-{}", now()));
+        let on_disk = ("model-Q4.gguf", &"aa".repeat(32)[..], 10);
+        fake_hub(&hub, "owner/repo", "abc", &[on_disk]);
+        // Upstream moved on: a new revision, and a new oid for the same name.
+        let repo_dir = hub.join("models--owner--repo");
+        let fresh_blob = repo_dir.join("blobs").join("cc".repeat(32));
+        fs::write(&fresh_blob, vec![0_u8; 99]).unwrap();
+
+        let mut model = artifact(&hub, "owner/repo", "model-Q4.gguf", &[on_disk]);
+        let remote = model.remote.as_mut().unwrap();
+        remote.revision = Some("def".into());
+        remote.blobs[0].oid = "cc".repeat(32);
+
+        let plan = deletion_in(&hub, &model, std::slice::from_ref(&model)).expect("a cached plan");
+        assert_eq!(plan.bytes, 10, "the cached revision's blob, not the fresh one");
+        assert!(
+            plan.files.contains(&repo_dir.join("blobs").join("aa".repeat(32))),
+            "{:?}",
+            plan.files
+        );
+        assert!(!plan.files.contains(&fresh_blob), "another revision's blob is not ours");
+        let _ = fs::remove_dir_all(hub);
+    }
+
+    /// Regression: `refs/main` was the first source for the revision, and it
+    /// moves whenever anything pulls a newer one — `huggingface-cli`, or a
+    /// `-hf` launch — without the browser noticing. `D` on the artifact the
+    /// user is looking at then deleted the *new* revision's files and left the
+    /// selected one exactly where it was.
+    #[test]
+    fn deleting_takes_the_revision_the_selected_artifact_lives_in() {
+        let hub = std::env::temp_dir().join(format!("llmctl-delete-moved-ref-{}", now()));
+        let old = ("model-Q4.gguf", &"aa".repeat(32)[..], 10);
+        fake_hub(&hub, "owner/repo", "abc", &[old]);
+        // The model the catalog found, in the revision it found it in.
+        let model = artifact(&hub, "owner/repo", "model-Q4.gguf", &[old]);
+
+        // Something else then fetched a newer revision, moving `refs/main`.
+        let repo_dir = hub.join("models--owner--repo");
+        let fresh = ("model-Q4.gguf", &"cc".repeat(32)[..], 99);
+        fake_hub(&hub, "owner/repo", "def", &[fresh]);
+        assert_eq!(fs::read_to_string(repo_dir.join("refs/main")).unwrap(), "def");
+
+        let plan = deletion_in(&hub, &model, std::slice::from_ref(&model)).expect("a cached plan");
+        assert_eq!(plan.bytes, 10, "the selected revision's blob, not the newer one");
+        plan.execute().unwrap();
+
+        let blobs = repo_dir.join("blobs");
+        assert!(!blobs.join("aa".repeat(32)).exists(), "the selected artifact is what goes");
+        assert!(
+            repo_dir.join("snapshots/def/model-Q4.gguf").exists(),
+            "the revision fetched since must be untouched"
+        );
+        assert!(blobs.join("cc".repeat(32)).exists());
+        let _ = fs::remove_dir_all(hub);
+    }
+
+    /// Regression: `huggingface_hub` writes `../../blobs/<oid>` links, whose
+    /// lexical path differs from the recorded blob path even though both name
+    /// one file — so its bytes were counted twice and the prompt quoted double.
+    #[test]
+    fn a_relative_snapshot_link_and_its_blob_are_counted_once() {
+        let hub = std::env::temp_dir().join(format!("llmctl-delete-relative-{}", now()));
+        let oid = "aa".repeat(32);
+        let repo_dir = hub.join("models--owner--repo");
+        let snapshot = repo_dir.join("snapshots/abc");
+        fs::create_dir_all(repo_dir.join("blobs")).unwrap();
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(repo_dir.join("refs")).unwrap();
+        fs::write(repo_dir.join("refs/main"), "abc").unwrap();
+        fs::write(repo_dir.join("blobs").join(&oid), vec![0_u8; 1000]).unwrap();
+        std::os::unix::fs::symlink(
+            PathBuf::from("../../blobs").join(&oid),
+            snapshot.join("model-Q4.gguf"),
+        )
+        .unwrap();
+
+        let model = artifact(&hub, "owner/repo", "model-Q4.gguf", &[("model-Q4.gguf", &oid, 1000)]);
+        let plan = deletion_in(&hub, &model, std::slice::from_ref(&model)).expect("a cached plan");
+        assert_eq!(plan.bytes, 1000, "one file, counted once");
+        plan.execute().unwrap();
+        assert!(!hub.join("models--owner--repo").exists());
+        let _ = fs::remove_dir_all(hub);
+    }
+
+    #[test]
+    fn an_artifact_that_was_never_downloaded_has_nothing_to_delete() {
+        let hub = std::env::temp_dir().join(format!("llmctl-delete-absent-{}", now()));
+        let files = [("model-Q4.gguf", &"aa".repeat(32)[..], 10)];
+        fake_hub(&hub, "owner/repo", "abc", &files);
+        let other = artifact(&hub, "owner/other", "model-Q4.gguf", &files);
+        assert!(deletion_in(&hub, &other, std::slice::from_ref(&other)).is_none());
+        let _ = fs::remove_dir_all(hub);
     }
 }
