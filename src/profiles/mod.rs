@@ -71,6 +71,9 @@ pub fn resolve_options(
                 .unwrap_or_else(|| default.clone());
             let value = backend.clamp_to_model(spec.key, value, model);
             let value = backend.normalize_legacy(spec.key, value);
+            // Keep invalid saved values editable, but canonicalize valid enums
+            // and numbers exactly as interactive editing does.
+            let value = validate_value(backend, model, spec, &value).unwrap_or(value);
 
             OptionItem {
                 key: spec.key.to_string(),
@@ -82,6 +85,38 @@ pub fn resolve_options(
             }
         })
         .collect()
+}
+
+/// Validate resolved options at every launch boundary. Invalid saved values
+/// remain visible for correction rather than silently changing the user's run.
+pub fn validate_options(
+    backend: &dyn RuntimeBackend,
+    model: &Model,
+    options: &[OptionItem],
+) -> Result<(), String> {
+    for option in options {
+        let spec = backend
+            .schema()
+            .spec(&option.key)
+            .ok_or_else(|| format!("unknown option: {}", option.key))?;
+        validate_value(backend, model, spec, &option.value)
+            .map_err(|error| format!("{}: {error}", option.key))?;
+    }
+    Ok(())
+}
+
+fn validate_value(
+    backend: &dyn RuntimeBackend,
+    model: &Model,
+    spec: &registry::OptionSpec,
+    value: &str,
+) -> Result<String, String> {
+    if backend.schema().uses_sentinel(spec.key)
+        && value.trim().eq_ignore_ascii_case(registry::DEFAULT)
+    {
+        return Ok(registry::DEFAULT.into());
+    }
+    backend.effective_kind(spec, model).validate(value)
 }
 
 /// The fully-resolved current values for a (runtime, model, profile), including
@@ -177,6 +212,77 @@ mod tests {
 
     fn value_of(opts: &[OptionItem], key: &str) -> String {
         opts.iter().find(|o| o.key == key).unwrap().value.clone()
+    }
+
+    #[test]
+    fn invalid_saved_values_stay_editable_but_cannot_launch() {
+        let backend = backend();
+        let model = model();
+        for (key, value) in [
+            ("temperature", "NaN"),
+            ("port", "70000"),
+            ("top-k", "-2"),
+            ("flash-attn", "sometimes"),
+        ] {
+            let mut store = empty_store();
+            assert!(
+                store
+                    .create(
+                        "llama.cpp",
+                        &model.profile_key(),
+                        "Default",
+                        BTreeMap::from([(key.into(), value.into())]),
+                        false
+                    )
+                    .is_err()
+            );
+            let options = resolve_options(
+                &backend,
+                &model,
+                &profile("Default"),
+                &store,
+                &Defaults::default(),
+            );
+            assert_eq!(value_of(&options, key), value);
+            assert!(validate_options(&backend, &model, &options).unwrap_err().starts_with(key));
+        }
+    }
+
+    #[test]
+    fn saved_sentinels_and_legacy_enums_are_validated_after_normalization() {
+        let backend = backend();
+        let model = model();
+        let mut store = empty_store();
+        assert!(
+            store
+                .create(
+                    "llama.cpp",
+                    &model.profile_key(),
+                    "Default",
+                    BTreeMap::from([
+                        ("temperature".into(), " DEFAULT ".into()),
+                        ("flash-attn".into(), "true".into()),
+                        ("reasoning".into(), "OFF".into()),
+                    ]),
+                    false
+                )
+                .is_err()
+        );
+        let options =
+            resolve_options(&backend, &model, &profile("Default"), &store, &Defaults::default());
+        validate_options(&backend, &model, &options).unwrap();
+        assert_eq!(value_of(&options, "temperature"), "default");
+        assert_eq!(value_of(&options, "flash-attn"), "on");
+        assert_eq!(value_of(&options, "reasoning"), "off");
+    }
+
+    #[test]
+    fn model_context_does_not_wrap_into_a_negative_bound() {
+        let backend = backend();
+        let model = model_with_ctx(Some(u64::MAX));
+        let kind = backend.effective_kind(backend.schema().spec("ctx-size").unwrap(), &model);
+        assert!(kind.validate("4096").is_ok());
+        assert_eq!(backend.clamp_to_model("ctx-size", "4096".into(), &model), "4096");
     }
 
     #[test]

@@ -535,7 +535,9 @@ impl RuntimeBackend for LlamaCppBackend {
     /// unbounded value.
     fn effective_kind(&self, spec: &OptionSpec, model: &Model) -> OptionKind {
         match (spec.key, model.context_length) {
-            ("ctx-size", Some(ctx)) => OptionKind::Int { min: Some(0), max: Some(ctx as i64) },
+            ("ctx-size", Some(ctx)) => {
+                OptionKind::Int { min: Some(0), max: Some(i64::try_from(ctx).unwrap_or(i64::MAX)) }
+            }
             _ => spec.kind,
         }
     }
@@ -616,7 +618,7 @@ impl RuntimeBackend for LlamaCppBackend {
             return value;
         }
         match (model.context_length, value.parse::<i64>()) {
-            (Some(ctx), Ok(v)) if v > ctx as i64 => ctx.to_string(),
+            (Some(ctx), Ok(v)) if v > i64::try_from(ctx).unwrap_or(i64::MAX) => ctx.to_string(),
             _ => value,
         }
     }

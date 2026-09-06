@@ -371,7 +371,9 @@ impl RuntimeBackend for FlmBackend {
     /// `ctx-len` is bounded by the model's trained context.
     fn effective_kind(&self, spec: &OptionSpec, model: &Model) -> OptionKind {
         match (spec.key, model.context_length) {
-            ("ctx-len", Some(ctx)) => OptionKind::Int { min: Some(0), max: Some(ctx as i64) },
+            ("ctx-len", Some(ctx)) => {
+                OptionKind::Int { min: Some(0), max: Some(i64::try_from(ctx).unwrap_or(i64::MAX)) }
+            }
             _ => spec.kind,
         }
     }
@@ -404,7 +406,7 @@ impl RuntimeBackend for FlmBackend {
             return value;
         }
         match (model.context_length, value.parse::<i64>()) {
-            (Some(ctx), Ok(v)) if v > ctx as i64 => ctx.to_string(),
+            (Some(ctx), Ok(v)) if v > i64::try_from(ctx).unwrap_or(i64::MAX) => ctx.to_string(),
             _ => value,
         }
     }

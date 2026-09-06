@@ -303,7 +303,7 @@ Each step is implemented, tested, committed, and published as its own PR.
 Later branches build on the previous step; merge in this order.
 
 1. Persistence errors and atomic record writes — implemented on `bugfix/persistence-errors`.
-2. Numeric validation and persisted option validation — next.
+2. Numeric validation and persisted option validation — implemented on `bugfix/numeric-validation`.
 3. Runtime-owned catalog and download capabilities.
 4. Catalog entries and model-source types.
 5. Smaller application state owners and modal state.

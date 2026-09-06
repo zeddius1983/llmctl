@@ -1374,6 +1374,7 @@ impl App {
         let model = self.selected_model().ok_or("no model selected")?;
         let profile = self.profiles.selected().ok_or("no profile selected")?;
         let options = self.options.items.clone();
+        profiles::validate_options(backend.as_ref(), model, &options)?;
         let binary = backend
             .descriptor()
             .binary_path
@@ -1823,6 +1824,11 @@ impl App {
             return;
         };
         let binary = binary.display().to_string();
+        if let Err(error) = profiles::validate_options(backend.as_ref(), model, &self.options.items)
+        {
+            self.message = Some(Message { title: "Invalid profile".into(), lines: vec![error] });
+            return;
+        }
         let ctx = LaunchContext { binary: &binary, model, options: &self.options.items };
         match backend.chat_argv(&ctx) {
             Some(argv) => self.pending_chat = Some(argv),
@@ -1852,6 +1858,11 @@ impl App {
         }
         let Some(binary) = backend.descriptor().binary_path.as_ref() else { return };
         let binary = binary.display().to_string();
+        if let Err(error) = profiles::validate_options(backend.as_ref(), model, &self.options.items)
+        {
+            self.message = Some(Message { title: "Invalid profile".into(), lines: vec![error] });
+            return;
+        }
         let ctx = LaunchContext { binary: &binary, model, options: &self.options.items };
         self.pending_benchmark = backend.bench_argv(&ctx);
     }

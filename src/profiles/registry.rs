@@ -40,11 +40,14 @@ impl OptionKind {
         match self {
             OptionKind::Int { min, max } => {
                 let v: i64 = input.parse().map_err(|_| format!("'{input}' is not an integer"))?;
-                check_bound(v as f64, min.map(|m| m as f64), max.map(|m| m as f64))?;
+                check_bound(v, *min, *max)?;
                 Ok(v.to_string())
             }
             OptionKind::Float { min, max } => {
                 let v: f64 = input.parse().map_err(|_| format!("'{input}' is not a number"))?;
+                if !v.is_finite() {
+                    return Err("must be a finite number".into());
+                }
                 check_bound(v, *min, *max)?;
                 Ok(input.to_string())
             }
@@ -69,7 +72,8 @@ impl OptionKind {
         match self {
             OptionKind::Int { min, max } => {
                 let cur: i64 = current.parse().ok()?;
-                let mut v = cur + dir as i64 * (step.round() as i64).max(1);
+                let mut v =
+                    cur.saturating_add(i64::from(dir).saturating_mul((step.round() as i64).max(1)));
                 if let Some(lo) = min {
                     v = v.max(*lo);
                 }
@@ -81,6 +85,9 @@ impl OptionKind {
             OptionKind::Float { min, max } => {
                 let cur: f64 = current.parse().ok()?;
                 let mut v = cur + dir as f64 * step;
+                if !v.is_finite() {
+                    return None;
+                }
                 if let Some(lo) = min {
                     v = v.max(*lo);
                 }
@@ -90,6 +97,9 @@ impl OptionKind {
                 Some(fmt_float(v))
             }
             OptionKind::Enum(variants) => {
+                if variants.is_empty() {
+                    return None;
+                }
                 let idx = variants.iter().position(|v| *v == current).unwrap_or(0) as i32;
                 let n = variants.len() as i32;
                 let next = (idx + dir).rem_euclid(n) as usize;
@@ -186,7 +196,11 @@ impl OptionSchema {
     }
 }
 
-fn check_bound(v: f64, min: Option<f64>, max: Option<f64>) -> Result<(), String> {
+fn check_bound<T: PartialOrd + std::fmt::Display>(
+    v: T,
+    min: Option<T>,
+    max: Option<T>,
+) -> Result<(), String> {
     if let Some(lo) = min {
         if v < lo {
             return Err(format!("must be ≥ {lo}"));
@@ -223,4 +237,47 @@ fn fmt_float(v: f64) -> String {
     let s = format!("{v:.3}");
     let trimmed = s.trim_end_matches('0').trim_end_matches('.');
     trimmed.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn float_validation_rejects_nan_and_infinity_with_or_without_bounds() {
+        for kind in [
+            OptionKind::Float { min: None, max: None },
+            OptionKind::Float { min: Some(0.0), max: Some(2.0) },
+        ] {
+            for input in ["NaN", "nan", "inf", "-inf", "1e999"] {
+                assert!(kind.validate(input).is_err(), "{input}");
+            }
+            assert_eq!(kind.validate(" 0.7 ").unwrap(), "0.7");
+        }
+    }
+
+    #[test]
+    fn integer_bounds_remain_exact_above_float_precision() {
+        let limit = 9_007_199_254_740_992;
+        let kind = OptionKind::Int { min: Some(limit), max: Some(limit) };
+        assert!(kind.validate(&(limit - 1).to_string()).is_err());
+        assert!(kind.validate(&(limit + 1).to_string()).is_err());
+        assert!(kind.validate(&limit.to_string()).is_ok());
+    }
+
+    #[test]
+    fn integer_adjustment_saturates_before_clamping() {
+        let kind = OptionKind::Int { min: None, max: None };
+        assert_eq!(kind.adjust(&i64::MAX.to_string(), 1, 1.0).unwrap(), i64::MAX.to_string());
+        assert_eq!(kind.adjust(&i64::MIN.to_string(), -1, 1.0).unwrap(), i64::MIN.to_string());
+        let bounded = OptionKind::Int { min: Some(0), max: Some(10) };
+        assert_eq!(bounded.adjust("9", 1, 4.0).unwrap(), "10");
+        assert_eq!(bounded.adjust("1", -1, 4.0).unwrap(), "0");
+    }
+
+    #[test]
+    fn invalid_adjustments_do_not_panic_or_produce_nonfinite_values() {
+        assert!(OptionKind::Enum(&[]).adjust("", 1, 1.0).is_none());
+        assert!(OptionKind::Float { min: None, max: None }.adjust("NaN", 1, 1.0).is_none());
+    }
 }
