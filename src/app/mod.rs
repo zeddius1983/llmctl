@@ -544,6 +544,11 @@ impl App {
             self.poll_online_search();
             self.poll_model_download();
             self.poll_restarts();
+            let errors = self.sessions.take_persistence_errors();
+            if !errors.is_empty() {
+                self.message =
+                    Some(Message { title: "Session record not saved".into(), lines: errors });
+            }
             if self.last_tick.elapsed() >= Duration::from_secs(1) {
                 self.tick();
             }
@@ -2261,7 +2266,16 @@ impl App {
         let base = profiles::resolved_values(backend.as_ref(), &profile, m, &self.config.defaults);
 
         let cursor = self.options.state.selected();
-        self.store.set_value(&runtime, &model, &profile.name, key, value, &base);
+        if let Err(error) = self.store.set_value(&runtime, &model, &profile.name, key, value, &base)
+        {
+            self.message = Some(Message {
+                title: "Profile not saved".into(),
+                lines: vec![
+                    error.to_string(),
+                    "The edit remains in memory; retry saving before quitting.".into(),
+                ],
+            });
+        }
         self.rebuild_below(Pane::Profile);
         self.options.state.select(cursor);
     }
@@ -2282,7 +2296,12 @@ impl App {
         let base = profiles::resolved_values(backend.as_ref(), &profile, m, &self.config.defaults);
 
         let cursor = self.profiles.state.selected();
-        self.store.toggle_favorite(&runtime, &model, &profile.name, &base);
+        if let Err(error) = self.store.toggle_favorite(&runtime, &model, &profile.name, &base) {
+            self.message = Some(Message {
+                title: "Favorite not saved".into(),
+                lines: vec![error.to_string()],
+            });
+        }
         self.rebuild_below(Pane::Model);
         self.profiles.state.select(cursor);
     }
@@ -2351,7 +2370,12 @@ impl App {
         let name = p.name.clone();
 
         let cursor = self.profiles.state.selected().unwrap_or(0);
-        self.store.delete(&runtime, &model, &name);
+        if let Err(error) = self.store.delete(&runtime, &model, &name) {
+            self.message = Some(Message {
+                title: "Profile deletion failed".into(),
+                lines: vec![error.to_string()],
+            });
+        }
         self.rebuild_below(Pane::Model);
         let len = self.profiles.items.len();
         if len > 0 {
@@ -2369,7 +2393,9 @@ impl App {
         let default = Profile { name: "Default".into(), builtin: true, favorite: false };
         let values =
             profiles::resolved_values(backend.as_ref(), &default, m, &self.config.defaults);
-        self.store.create(&runtime, &model, name, values, true);
+        self.store
+            .create(&runtime, &model, name, values, true)
+            .map_err(|error| error.to_string())?;
         self.refresh_profiles(Some(name));
         Ok(())
     }
@@ -2380,7 +2406,7 @@ impl App {
         }
         self.validate_new_name(name)?;
         let (runtime, model) = self.current_runtime_model().ok_or("no model selected")?;
-        self.store.rename(&runtime, &model, old, name);
+        self.store.rename(&runtime, &model, old, name).map_err(|error| error.to_string())?;
         self.refresh_profiles(Some(name));
         Ok(())
     }
@@ -2405,7 +2431,9 @@ impl App {
             &self.store,
             &self.config.defaults,
         );
-        self.store.create(&runtime, &model, name, values, true);
+        self.store
+            .create(&runtime, &model, name, values, true)
+            .map_err(|error| error.to_string())?;
         self.refresh_profiles(Some(name));
         Ok(())
     }

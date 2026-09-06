@@ -368,7 +368,18 @@ mod tests {
         let m = model_with_ctx(Some(262144));
         let mut store = empty_store();
         let base = resolved_values(&backend(), &profile("Default"), &m, &Defaults::default());
-        store.set_value("llama.cpp", "/tmp/x.gguf", "Default", "temperature", "0.5".into(), &base);
+        assert!(
+            store
+                .set_value(
+                    "llama.cpp",
+                    "/tmp/x.gguf",
+                    "Default",
+                    "temperature",
+                    "0.5".into(),
+                    &base
+                )
+                .is_err()
+        );
         let opts =
             resolve_options(&backend(), &m, &profile("Default"), &store, &Defaults::default());
         assert_eq!(value_of(&opts, "temperature"), "0.5");

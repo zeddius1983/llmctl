@@ -1208,9 +1208,8 @@ fn sanitize(raw: &str) -> String {
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value)?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
+    crate::persistence::write_atomic(path, &bytes)
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {

@@ -315,11 +315,16 @@ pub struct SessionManager {
     log_dir: PathBuf,
     supervisor: Box<dyn SessionSupervisor>,
     pub sessions: Vec<Session>,
+    persistence_errors: Vec<String>,
 }
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 impl SessionManager {
+    pub fn take_persistence_errors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.persistence_errors)
+    }
+
     /// Construct the manager, then rediscover sessions left running by a
     /// previous llmctl run (pruning any that are no longer alive).
     pub fn new(dir: PathBuf, log_dir: PathBuf) -> Self {
@@ -328,6 +333,7 @@ impl SessionManager {
             log_dir,
             supervisor: Box::new(DetachedSupervisor::new()),
             sessions: Vec::new(),
+            persistence_errors: Vec::new(),
         };
         mgr.rediscover();
         mgr
@@ -355,8 +361,13 @@ impl SessionManager {
                 Ok(())
             }
         }
-        let mut mgr =
-            Self { dir, log_dir, supervisor: Box::new(NeverSpawns), sessions: Vec::new() };
+        let mut mgr = Self {
+            dir,
+            log_dir,
+            supervisor: Box::new(NeverSpawns),
+            sessions: Vec::new(),
+            persistence_errors: Vec::new(),
+        };
         mgr.rediscover();
         mgr
     }
@@ -415,7 +426,12 @@ impl SessionManager {
             download: req.download,
             started_unix: now_unix(),
         };
-        record.save(&self.dir);
+        if let Err(error) = record.save(&self.dir) {
+            self.persistence_errors.push(format!(
+                "{} (PID {}) is tracked in memory but its session record was not saved: {error}",
+                record.name, record.pid
+            ));
+        }
         let status = if download_percent(&record).is_some() {
             SessionStatus::Downloading
         } else {
@@ -528,7 +544,12 @@ impl SessionManager {
             if real != pid {
                 let s = &mut self.sessions[idx];
                 s.record.pid = real;
-                s.record.save(&self.dir);
+                if let Err(error) = s.record.save(&self.dir) {
+                    self.persistence_errors.push(format!(
+                        "Could not save PID {} for {}: {error}",
+                        s.record.pid, s.record.name
+                    ));
+                }
             }
             return Some(real);
         }
@@ -731,14 +752,20 @@ impl SessionManager {
         let spawned = self.supervisor.spawn(&spec)?;
 
         let session = &mut self.sessions[idx];
-        session.record.delete(&self.dir); // remove the old id's file
+        let old_record = session.record.clone();
         session.record.id = id;
         session.record.pid = spawned.pid;
         session.record.port = port;
         session.record.command = command;
         session.record.log_file = log_file;
         session.record.started_unix = now_unix();
-        session.record.save(&self.dir);
+        match session.record.save(&self.dir) {
+            Ok(()) => old_record.delete(&self.dir),
+            Err(error) => self.persistence_errors.push(format!(
+                "{} restarted (PID {}) but its session record was not saved: {error}",
+                session.record.name, session.record.pid
+            )),
+        }
         session.download_percent = download_percent(&session.record);
         session.status = if session.download_percent.is_some() {
             SessionStatus::Downloading
@@ -853,8 +880,47 @@ pub fn format_uptime(secs: u64) -> String {
 mod tests {
     use super::*;
 
-    /// The pane beside the session list reads this buffer, so what goes in is
-    /// what a terminal would have shown — and only the tail of it.
+    #[test]
+    fn a_failed_record_write_keeps_the_launched_session_manageable() {
+        struct FakeSpawner;
+        impl SessionSupervisor for FakeSpawner {
+            fn spawn(&self, _: &LaunchSpec) -> Result<supervisor::Spawned> {
+                Ok(supervisor::Spawned { pid: i32::MAX })
+            }
+            fn stop(&self, _: i32) -> Result<()> {
+                Ok(())
+            }
+            fn kill(&self, _: i32) -> Result<()> {
+                Ok(())
+            }
+        }
+        let root =
+            std::env::temp_dir().join(format!("llmctl-record-failure-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut manager = SessionManager::without_supervisor(root.join("missing"), root.clone());
+        manager.supervisor = Box::new(FakeSpawner);
+        let index = manager
+            .launch(LaunchRequest {
+                runtime: "llama.cpp".into(),
+                model: "model".into(),
+                model_path: "model".into(),
+                command: Command { argv: vec!["fake".into(), "--port".into(), "18934".into()] },
+                health_path: "/health".into(),
+                download: None,
+                profile: "Default".into(),
+                size_bytes: None,
+                device: None,
+                host: "127.0.0.1".into(),
+                port: 18934,
+            })
+            .unwrap();
+        assert_eq!(manager.sessions[index].record.pid, i32::MAX);
+        assert_eq!(manager.sessions[index].status, SessionStatus::Starting);
+        assert_eq!(manager.take_persistence_errors().len(), 1);
+        assert!(manager.take_persistence_errors().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn the_log_tail_keeps_the_last_lines_as_a_terminal_would_show_them() {
         let mut recent = VecDeque::new();

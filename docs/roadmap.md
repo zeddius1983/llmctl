@@ -297,6 +297,20 @@ takes the whole width and `l` opens the log full screen instead. Below
 80x24 the interface is replaced by the size it needs (ADR-018), which is where
 degrading stops being worth it.
 
+## Rust design refactoring series
+
+Each step is implemented, tested, committed, and published as its own PR.
+Later branches build on the previous step; merge in this order.
+
+1. Persistence errors and atomic record writes — implemented on `bugfix/persistence-errors`.
+2. Numeric validation and persisted option validation — next.
+3. Runtime-owned catalog and download capabilities.
+4. Catalog entries and model-source types.
+5. Smaller application state owners and modal state.
+6. Background readiness/scans and bounded log reads.
+7. Explicit child ownership instead of global SIGCHLD policy.
+8. Command/option API cleanup, Clippy, and documentation.
+
 ## Next (post-v0.3.1)
 
 ### Online Hugging Face follow-ups
