@@ -642,6 +642,8 @@ const MISSING: &str = "—";
 /// rather than as one run of text — the rate cells especially, which already
 /// carry a space inside them.
 const COL_GAP: usize = 4;
+/// Keep session metadata clear of the pane's right border.
+const ROW_RIGHT_PADDING: usize = 1;
 /// Below this much room for the model name, a column is not worth its space.
 const MIN_NAME: usize = 12;
 /// The most room the planner will reclaim from metadata for a long model name.
@@ -738,8 +740,9 @@ fn rate_cell(label: &str, session: &Session, phase: Phase) -> String {
 /// `width` holding names up to `longest` terminal columns wide.
 ///
 /// The name consumes every column left after the fixed-width metadata. That
-/// keeps the metadata block against the pane's right edge and gives every row
-/// the same column starts regardless of model-name length.
+/// keeps the metadata block at a consistent one-cell inset from the pane's
+/// right edge and gives every row the same column starts regardless of
+/// model-name length.
 fn row_plan(width: usize, longest: usize) -> (usize, Vec<Column>) {
     const ORDER: [Column; 7] = [
         Column::Profile,
@@ -754,7 +757,7 @@ fn row_plan(width: usize, longest: usize) -> (usize, Vec<Column>) {
         columns.iter().map(|column| column.width() + COL_GAP).sum()
     };
 
-    let room = width.saturating_sub(2); // status glyph and its space
+    let room = width.saturating_sub(2 + ROW_RIGHT_PADDING); // status glyph, its space, right inset
     let wanted = longest.clamp(MIN_NAME, MAX_NAME);
     let mut columns = ORDER.to_vec();
     for dropped in DROP_ORDER {
@@ -783,6 +786,7 @@ fn session_row(session: &Session, name_width: usize, columns: &[Column]) -> Line
             Style::default().fg(Color::DarkGray),
         ));
     }
+    spans.push(Span::raw(" ".repeat(ROW_RIGHT_PADDING)));
     Line::from(spans)
 }
 
@@ -1958,21 +1962,42 @@ mod tests {
     }
 
     /// Regression: the name column was capped at the longest visible name, so
-    /// the metadata block drifted left instead of staying against the pane's
-    /// right edge.
+    /// the metadata block drifted left instead of staying one cell in from the
+    /// pane's right edge.
     #[test]
-    fn session_metadata_stays_against_the_right_edge() {
+    fn session_metadata_keeps_right_edge_padding() {
         use unicode_width::UnicodeWidthStr;
 
         let sessions = [probe_session("muse-glimmer-30b-q8_0", true)];
         for width in [106, 120, 200] {
             let row = &rows_text(&sessions, width)[0];
-            assert_eq!(row.width(), width, "metadata did not reach the right edge: {row:?}");
+            assert_eq!(row.width(), width, "row did not reach the right edge: {row:?}");
+            assert_eq!(
+                row.trim_end().width(),
+                width - super::ROW_RIGHT_PADDING,
+                "metadata was not inset from the right border: {row:?}"
+            );
             assert!(
                 row.contains("muse-glimmer-30b-q8_0"),
                 "the name was cut unnecessarily: {row:?}"
             );
         }
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 4)).unwrap();
+        terminal
+            .draw(|frame| super::render_session_list(frame, frame.area(), &sessions, Some(0), true))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let session_row = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .find(|row| row.contains("2h 34m"))
+            .expect("rendered session row");
+        assert!(session_row.contains("2h 34m │"), "missing border padding: {session_row:?}");
 
         // Narrow panes still shed columns, and the name still gets `MIN_NAME`.
         let row = &rows_text(&sessions, 60)[0];
