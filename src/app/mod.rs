@@ -4,15 +4,30 @@
 //! parent's selection and only revealed one level ahead of focus (see
 //! `IMPLEMENTATION_PLAN.md` → Navigation model).
 
+mod browser;
+mod downloads;
+mod modals;
+mod session_view;
+use modals::Modals;
+
+use browser::BrowserState;
+use downloads::{DownloadManager, DownloadSource};
+pub use downloads::{ModelDownload, ModelDownloadStatus};
+#[cfg(test)]
+use downloads::{restore_model_downloads, transfer_percent};
+use session_view::SessionViewState;
+
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 use ratatui::widgets::ListState;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -106,57 +121,6 @@ pub struct ModelSearch {
     pub scope: Vec<String>,
 }
 
-#[derive(Debug)]
-pub enum ModelDownloadStatus {
-    Downloading,
-    Cancelling,
-    Downloaded(PathBuf),
-    Cancelled,
-    Interrupted,
-    Failed(String),
-}
-
-/// Where a tracked download's bytes come from, and how to fetch them.
-#[derive(Clone)]
-enum DownloadSource {
-    /// Hugging Face blobs that llmctl fetches into the Hub cache itself.
-    Hub(Box<crate::domain::RemoteModel>),
-    /// A transfer whose layout and implementation belong to its backend.
-    Backend(ModelTransfer),
-}
-
-pub struct ModelDownload {
-    id: u64,
-    pub model_id: String,
-    pub model: String,
-    pub downloaded_bytes: u64,
-    pub total_bytes: u64,
-    pub status: ModelDownloadStatus,
-    source: DownloadSource,
-    cancelled: Arc<AtomicBool>,
-}
-
-impl ModelDownload {
-    pub fn percent(&self) -> u8 {
-        transfer_percent(self.downloaded_bytes, self.total_bytes)
-    }
-
-    /// The paths this transfer is writing, so a deletion can tell whether it
-    /// would remove files still being fetched — whatever the model is called
-    /// in the catalog the user is deleting from.
-    fn targets(&self) -> Vec<PathBuf> {
-        match &self.source {
-            DownloadSource::Hub(remote) => remote
-                .blobs
-                .iter()
-                .filter_map(|blob| discovery::online::cache_blob_paths(&remote.repo, &blob.oid))
-                .flat_map(|(incomplete, complete)| [incomplete, complete])
-                .collect(),
-            DownloadSource::Backend(transfer) => transfer.targets.clone(),
-        }
-    }
-}
-
 /// Whether a keystroke agrees to a pending destructive action.
 ///
 /// The dialog promises that `y` or Enter deletes and every other key backs out,
@@ -176,55 +140,6 @@ fn is_assent(key: KeyEvent) -> bool {
         KeyCode::Enter => key.modifiers.is_empty(),
         _ => false,
     }
-}
-
-fn transfer_percent(downloaded_bytes: u64, total_bytes: u64) -> u8 {
-    if total_bytes == 0 {
-        return 0;
-    }
-    ((downloaded_bytes as u128 * 100 / total_bytes as u128).min(100)) as u8
-}
-
-fn restore_model_downloads(models_dir: &std::path::Path) -> (Vec<ModelDownload>, u64) {
-    let mut downloads = Vec::new();
-    let mut next_id = 1_u64;
-    for record in discovery::online::load_download_records(models_dir) {
-        let total_bytes = record.remote.blobs.iter().map(|blob| blob.size_bytes).sum();
-        let downloaded_bytes = discovery::online::cached_downloaded_bytes(&record.remote);
-        if total_bytes > 0
-            && downloaded_bytes >= total_bytes
-            && discovery::online::finalize_cached_download(&record.remote).is_ok()
-        {
-            if let Err(error) =
-                discovery::online::delete_download_record(models_dir, &record.model_id)
-            {
-                tracing::warn!(%error, model = %record.model_id, "failed to remove completed download record");
-            }
-            continue;
-        }
-        let status = if total_bytes == 0 {
-            ModelDownloadStatus::Failed("persisted download has no blob size metadata".into())
-        } else {
-            ModelDownloadStatus::Interrupted
-        };
-        downloads.push(ModelDownload {
-            id: next_id,
-            model_id: record.model_id,
-            model: record.model,
-            downloaded_bytes,
-            total_bytes,
-            status,
-            source: DownloadSource::Hub(Box::new(record.remote)),
-            cancelled: Arc::new(AtomicBool::new(false)),
-        });
-        next_id = next_id.wrapping_add(1).max(1);
-    }
-    (downloads, next_id)
-}
-
-enum ModelDownloadEvent {
-    Progress { id: u64, downloaded_bytes: u64, total_bytes: u64 },
-    Finished { id: u64, result: std::result::Result<discovery::online::DownloadResult, String> },
 }
 
 struct CatalogRoute {
@@ -371,45 +286,16 @@ impl<T> PaneList<T> {
 pub struct App {
     #[allow(dead_code)] // retained for Phase 2+ (profiles, defaults)
     pub config: Config,
-    pub focus: Pane,
-    pub runtimes: PaneList<Box<dyn RuntimeBackend>>,
-    pub models: PaneList<Model>,
-    /// Child nodes of the selected catalog directory (empty for a model leaf).
-    pub catalog_preview: Vec<Model>,
-    pub profiles: PaneList<Profile>,
-    pub options: PaneList<OptionItem>,
-    pub show_help: bool,
-    pub prompt: Option<Prompt>,
-    /// A modal enum-variant selector (combo box), if open.
-    pub selector: Option<Selector>,
-    pub model_search: Option<ModelSearch>,
-    /// A read-only modal message overlay, if any.
-    pub message: Option<Message>,
-    /// A destructive action waiting on a yes/no answer, if any.
-    pub confirm: Option<Confirm>,
+    pub browser: BrowserState,
+    pub modals: Modals,
     /// Which top-level screen is active.
     pub screen: Screen,
-    /// Which pane the Session Manager's right-hand column holds.
-    pub session_pane: SessionPane,
-    /// Whether the last frame had room for that column at all. Written by the
-    /// renderer, which is the only place the terminal's width is known.
-    pub detail_pane_visible: bool,
-    /// Running/known inference sessions.
+    pub session_view: SessionViewState,
     pub sessions: SessionManager,
-    /// Selection cursor in the Session Manager list.
-    pub session_sel: ListState,
-    /// Loaded log lines for the Logs screen.
-    pub log_lines: Vec<String>,
-    /// Whether the log view tails the bottom of the file.
-    pub log_follow: bool,
-    /// Scroll offset (lines from the top) for the log view when not following.
-    pub log_scroll: u16,
     should_quit: bool,
     /// Shared Hugging Face source metadata, separate from runtime catalogs.
     online_models: Vec<Model>,
     catalogs: HashMap<RuntimeId, Vec<Model>>,
-    catalog_prefix: Vec<String>,
-    catalog_history: Vec<(Vec<Model>, Option<usize>, Vec<String>)>,
     /// Expanded, absolute model search directories.
     model_sources: Vec<ModelSource>,
     model_cache: PathBuf,
@@ -435,10 +321,7 @@ pub struct App {
     online_reload_deferred: bool,
     online_restore_models: bool,
     online_search_results: Vec<String>,
-    download_tx: Sender<ModelDownloadEvent>,
-    download_rx: Receiver<ModelDownloadEvent>,
-    pub model_downloads: Vec<ModelDownload>,
-    next_download_id: u64,
+    pub downloads: DownloadManager,
 }
 
 impl App {
@@ -458,7 +341,7 @@ impl App {
         let model_sources = resolve_model_sources(&config.models.paths, &config.models.sources);
         let model_cache = paths.cache_dir.join("models.json");
         let online_sort = discovery::online::cached_sort(&paths.models_dir);
-        let (model_downloads, next_download_id) = restore_model_downloads(&paths.models_dir);
+        let downloads = DownloadManager::load(&paths.models_dir);
         let online_models = discovery::online::load_cached(&paths.models_dir);
 
         let catalog_ctx = CatalogCtx {
@@ -478,34 +361,16 @@ impl App {
         let sessions = sessions(&paths);
 
         let (online_tx, online_rx) = mpsc::channel();
-        let (download_tx, download_rx) = mpsc::channel();
         let mut app = Self {
             config,
-            focus: Pane::Runtime,
-            runtimes: PaneList::new(runtimes),
-            models: PaneList::new(Vec::new()),
-            catalog_preview: Vec::new(),
-            profiles: PaneList::new(Vec::new()),
-            options: PaneList::new(Vec::new()),
-            show_help: false,
-            prompt: None,
-            selector: None,
-            model_search: None,
-            message: None,
-            confirm: None,
+            browser: BrowserState::new(runtimes),
+            modals: Modals::default(),
             screen: Screen::Browser,
-            session_pane: SessionPane::Detail,
-            detail_pane_visible: true,
+            session_view: SessionViewState::default(),
             sessions,
-            session_sel: ListState::default(),
-            log_lines: Vec::new(),
-            log_follow: true,
-            log_scroll: 0,
             should_quit: false,
             online_models,
             catalogs,
-            catalog_prefix: Vec::new(),
-            catalog_history: Vec::new(),
             model_sources,
             model_cache,
             models_dir: paths.models_dir,
@@ -523,10 +388,7 @@ impl App {
             online_reload_deferred: false,
             online_restore_models: false,
             online_search_results: Vec::new(),
-            download_tx,
-            download_rx,
-            model_downloads,
-            next_download_id,
+            downloads,
         };
         app.sync_session_selection();
         // Derive the whole chain from the initially-selected runtime.
@@ -545,7 +407,7 @@ impl App {
             self.poll_restarts();
             let errors = self.sessions.take_persistence_errors();
             if !errors.is_empty() {
-                self.message =
+                self.modals.message =
                     Some(Message { title: "Session record not saved".into(), lines: errors });
             }
             if self.last_tick.elapsed() >= Duration::from_secs(1) {
@@ -575,7 +437,7 @@ impl App {
     fn poll_restarts(&mut self) {
         let errors = self.sessions.poll_restarts();
         if !errors.is_empty() {
-            self.message = Some(Message { title: "Restart failed".into(), lines: errors });
+            self.modals.message = Some(Message { title: "Restart failed".into(), lines: errors });
         }
     }
 
@@ -652,8 +514,8 @@ impl App {
                 Ok(models) if search_query.is_some() => {
                     let query = search_query.as_deref().unwrap_or_default();
                     let current = self
-                        .model_search
-                        .as_ref()
+                        .modals
+                        .search()
                         .is_some_and(|search| search.online && search.query == query);
                     if current {
                         self.replace_online_search_results(models);
@@ -675,13 +537,13 @@ impl App {
                 }
                 Err(error) => {
                     self.online_restore_models = false;
-                    self.message = Some(Message {
+                    self.modals.message = Some(Message {
                         title: "Hugging Face unavailable".into(),
                         lines: vec![error, "Cached entries remain available.".into()],
                     });
                 }
             }
-            if self.focus == Pane::Model {
+            if self.browser.focus == Pane::Model {
                 self.maybe_fetch_online(false);
             }
         }
@@ -754,10 +616,11 @@ impl App {
         // FastFlowLM names its remote group `online` too, and `request_for_path`
         // only inspects the path — without this, browsing its catalog would fire
         // Hugging Face requests for repositories that do not exist.
-        if !self.runtimes.selected().is_some_and(|backend| backend.supports_online_browse()) {
+        if !self.browser.runtimes.selected().is_some_and(|backend| backend.supports_online_browse())
+        {
             return;
         }
-        let Some(selected) = self.models.selected() else { return };
+        let Some(selected) = self.browser.models.selected() else { return };
         let Some(request) =
             discovery::online::request_for_path(&selected.catalog_path, self.online_sort)
         else {
@@ -797,10 +660,11 @@ impl App {
     /// `online`, but that is a fixed catalog rather than a live view of the Hub,
     /// so the runtime has to agree.
     pub fn online_view_active(&self) -> bool {
-        self.runtimes.selected().is_some_and(|backend| backend.supports_online_browse())
-            && self.focus >= Pane::Model
-            && (discovery::online::is_online_path(&self.catalog_prefix)
+        self.browser.runtimes.selected().is_some_and(|backend| backend.supports_online_browse())
+            && self.browser.focus >= Pane::Model
+            && (discovery::online::is_online_path(&self.browser.catalog_prefix)
                 || self
+                    .browser
                     .models
                     .selected()
                     .is_some_and(|model| discovery::online::is_online_path(&model.catalog_path)))
@@ -818,18 +682,19 @@ impl App {
     }
 
     pub fn model_pane_title(&self) -> String {
-        self.catalog_title(&self.catalog_prefix)
+        self.catalog_title(&self.browser.catalog_prefix)
     }
 
     pub fn catalog_parent_title(&self) -> String {
-        match self.catalog_history.last() {
+        match self.browser.catalog_history.last() {
             Some((_, _, prefix)) => self.catalog_title(prefix),
             None => "Model".into(),
         }
     }
 
     pub fn catalog_preview_title(&self) -> String {
-        self.models
+        self.browser
+            .models
             .selected()
             .filter(|model| model.is_catalog_dir())
             .map(|model| self.catalog_title(&model.catalog_path))
@@ -838,12 +703,12 @@ impl App {
 
     /// How many arrangements the selected runtime offers for its catalog.
     fn catalog_view_count(&self) -> usize {
-        self.runtimes.selected().map(|backend| backend.catalog_views().len()).unwrap_or(0)
+        self.browser.runtimes.selected().map(|backend| backend.catalog_views().len()).unwrap_or(0)
     }
 
     /// The name of the active arrangement, for the pane title.
     pub fn catalog_view_label(&self) -> Option<&'static str> {
-        let views = self.runtimes.selected()?.catalog_views();
+        let views = self.browser.runtimes.selected()?.catalog_views();
         if views.len() < 2 {
             return None;
         }
@@ -858,12 +723,12 @@ impl App {
         }
         // Remember where we are browsing, and what is selected if it is a
         // model, so the new arrangement can restore both.
-        let prefix = self.catalog_prefix.clone();
+        let prefix = self.browser.catalog_prefix.clone();
         let selection = self.selected_model().map(|model| model.id.clone());
 
         self.catalog_view = (self.catalog_view + 1) % count;
-        self.catalog_history.clear();
-        self.catalog_prefix.clear();
+        self.browser.catalog_history.clear();
+        self.browser.catalog_prefix.clear();
         // Same catalog, arranged differently — no reason to ask `flm` again.
         self.refresh_selected_catalog(false);
         self.rebuild_below(Pane::Runtime);
@@ -881,7 +746,7 @@ impl App {
 
     fn reload_online_layout(&mut self) {
         self.online_search_due = None;
-        self.model_search = None;
+        self.modals.set_search(None);
         self.clear_online_search_results();
         if self.online_pending.is_some() {
             // Let the sole writer finish, then clear what it wrote before
@@ -898,7 +763,7 @@ impl App {
         self.online_epoch = self.online_epoch.wrapping_add(1);
         self.online_pending = None;
         if let Err(error) = discovery::online::clear_cached_layout(&self.models_dir) {
-            self.message = Some(Message {
+            self.modals.message = Some(Message {
                 title: "Cannot reset online catalog".into(),
                 lines: vec![error.to_string()],
             });
@@ -916,9 +781,9 @@ impl App {
 
     fn show_online_models_root(&mut self) {
         if let Some(runtime) =
-            self.runtimes.items.iter().position(|backend| backend.supports_online_browse())
+            self.browser.runtimes.items.iter().position(|backend| backend.supports_online_browse())
         {
-            self.runtimes.state.select(Some(runtime));
+            self.browser.runtimes.state.select(Some(runtime));
         }
         let online = vec!["online".to_string()];
         let huggingface = vec!["online".to_string(), "huggingface".to_string()];
@@ -934,54 +799,56 @@ impl App {
         else {
             return;
         };
-        self.catalog_history = vec![
+        self.browser.catalog_history = vec![
             (root_items, Some(online_selected), Vec::new()),
             (online_items, Some(huggingface_selected), online),
         ];
-        self.catalog_prefix = huggingface.clone();
-        self.models.replace(self.catalog_children(&huggingface));
-        self.focus = Pane::Model;
+        self.browser.catalog_prefix = huggingface.clone();
+        self.browser.models.replace(self.catalog_children(&huggingface));
+        self.browser.focus = Pane::Model;
         self.rebuild_below(Pane::Model);
     }
 
     fn on_key(&mut self, key: KeyEvent) {
         // A read-only message overlay is dismissed by any key.
-        if self.message.is_some() {
-            self.message = None;
+        if self.modals.message.is_some() {
+            self.modals.message = None;
             return;
         }
         // A pending destructive action takes assent or nothing: `y`/Enter goes
         // ahead, every other key backs out. Deliberately not "any key
         // dismisses" like a message — that would make a stray keystroke an
         // answer.
-        if self.confirm.is_some() {
+        if self.modals.confirm().is_some() {
             if is_assent(key)
-                && let Some(confirm) = self.confirm.take()
+                && let Some(confirm) = self.modals.take_confirm()
             {
                 self.run_confirmed(confirm.action);
             } else {
-                self.confirm = None;
+                self.modals.set_confirm(None);
             }
             return;
         }
         // A text prompt is modal: it consumes all input until closed.
-        if self.prompt.is_some() {
+        if self.modals.prompt().is_some() {
             self.prompt_key(key);
             return;
         }
         // So is the enum-variant selector.
-        if self.selector.is_some() {
+        if self.modals.selector().is_some() {
             self.selector_key(key);
             return;
         }
-        if self.model_search.is_some() {
+        if self.modals.search().is_some() {
             self.model_search_key(key);
             return;
         }
         // Help overlay swallows input apart from its own dismissal keys.
-        if self.show_help {
+        if self.modals.help() {
             match key.code {
-                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => self.show_help = false,
+                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
+                    self.modals.set_help(false)
+                }
                 _ => {}
             }
             return;
@@ -998,36 +865,46 @@ impl App {
     fn on_key_browser(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('?') => self.modals.set_help(true),
             KeyCode::Char('/') => {
                 let selected_dir = self
+                    .browser
                     .models
                     .selected()
                     .filter(|model| model.is_catalog_dir())
                     .map(|model| model.catalog_path.as_slice());
                 let hub = self
+                    .browser
                     .runtimes
                     .selected()
                     .is_some_and(|backend| backend.supports_online_browse());
-                let scope =
-                    normalized_search_scope(self.focus, selected_dir, &self.catalog_prefix, hub);
+                let scope = normalized_search_scope(
+                    self.browser.focus,
+                    selected_dir,
+                    &self.browser.catalog_prefix,
+                    hub,
+                );
                 // FastFlowLM's `online` group is a local catalog, so `/` filters
                 // it in place rather than querying the Hub.
                 let online = hub && discovery::online::is_online_path(&scope);
-                self.model_search = Some(ModelSearch {
+                self.modals.set_search(Some(ModelSearch {
                     query: String::new(),
                     cursor: 0,
                     result_indices: self.ranked_model_indices("", &scope, online),
                     online,
                     scope,
-                })
+                }))
             }
             KeyCode::Char('t') => self.open_sessions(),
             KeyCode::Char('y') => self.yank_command(),
-            KeyCode::Char('s') if self.focus == Pane::Model && self.online_view_active() => {
+            KeyCode::Char('s')
+                if self.browser.focus == Pane::Model && self.online_view_active() =>
+            {
                 self.cycle_online_sort()
             }
-            KeyCode::Char('s') if self.focus == Pane::Model && self.catalog_view_count() > 1 => {
+            KeyCode::Char('s')
+                if self.browser.focus == Pane::Model && self.catalog_view_count() > 1 =>
+            {
                 self.cycle_catalog_view()
             }
             KeyCode::Char('s') => self.start_session(),
@@ -1035,7 +912,7 @@ impl App {
             KeyCode::Char('b') => self.start_benchmark(),
             // Move focus across panes. In Options (the leaf) Enter edits the
             // selected value instead; `l`/Right stay pure navigation.
-            KeyCode::Enter if self.focus == Pane::Options => self.open_editor(),
+            KeyCode::Enter if self.browser.focus == Pane::Options => self.open_editor(),
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => self.enter(),
             KeyCode::Char('h') | KeyCode::Left => self.go_back(),
 
@@ -1047,8 +924,8 @@ impl App {
 
             // In Options, Home/End jump an option to its min/max; elsewhere
             // they move to the first/last list item.
-            KeyCode::Home if self.focus == Pane::Options => self.set_option_extreme(-1),
-            KeyCode::End if self.focus == Pane::Options => self.set_option_extreme(1),
+            KeyCode::Home if self.browser.focus == Pane::Options => self.set_option_extreme(-1),
+            KeyCode::End if self.browser.focus == Pane::Options => self.set_option_extreme(1),
             KeyCode::Home => self.select_first(),
             KeyCode::End => self.select_last(),
 
@@ -1066,12 +943,16 @@ impl App {
             KeyCode::Char('r') => self.prompt_rename_profile(),
             // In the Model pane the pair is symmetric: `d` fetches the model,
             // `D` gives the disk space back. Elsewhere `D` duplicates a profile.
-            KeyCode::Char('D') if self.focus == Pane::Model => self.prompt_delete_model(),
+            KeyCode::Char('D') if self.browser.focus == Pane::Model => self.prompt_delete_model(),
             KeyCode::Char('D') => self.prompt_duplicate_profile(),
-            KeyCode::Char('d') if self.focus == Pane::Model && self.download_available() => {
+            KeyCode::Char('d')
+                if self.browser.focus == Pane::Model && self.download_available() =>
+            {
                 self.download_selected_model()
             }
-            KeyCode::Char('d') if self.focus == Pane::Options => self.reset_option_default(),
+            KeyCode::Char('d') if self.browser.focus == Pane::Options => {
+                self.reset_option_default()
+            }
             KeyCode::Char('d') => self.delete_profile(),
 
             // Re-scan model directories.
@@ -1084,26 +965,26 @@ impl App {
     fn model_search_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
-                self.model_search = None;
+                self.modals.set_search(None);
                 self.online_search_due = None;
                 self.clear_online_search_results();
             }
             KeyCode::Enter => {
                 let target = self
-                    .model_search
-                    .as_ref()
+                    .modals
+                    .search()
                     .and_then(|s| s.result_indices.get(s.cursor))
                     .and_then(|i| self.catalog_source().get(*i))
                     .cloned();
-                let promote = self.model_search.as_ref().is_some_and(|search| search.online)
+                let promote = self.modals.search().is_some_and(|search| search.online)
                     && target.as_ref().is_some_and(|model| {
                         model.remote().is_some_and(|remote| remote.file.is_none())
                     });
-                self.model_search = None;
+                self.modals.set_search(None);
                 self.online_search_due = None;
                 if let Some(target) = target {
                     if promote && let Err(error) = self.save_online_search_selection(&target) {
-                        self.message = Some(Message {
+                        self.modals.message = Some(Message {
                             title: "Cannot save Hugging Face model".into(),
                             lines: vec![error],
                         });
@@ -1116,18 +997,18 @@ impl App {
                 }
             }
             KeyCode::Up => {
-                if let Some(search) = self.model_search.as_mut() {
+                if let Some(search) = self.modals.search_mut() {
                     search.cursor = search.cursor.saturating_sub(1);
                 }
             }
             KeyCode::Down => {
-                if let Some(search) = self.model_search.as_mut() {
+                if let Some(search) = self.modals.search_mut() {
                     let max = search.result_indices.len().saturating_sub(1);
                     search.cursor = (search.cursor + 1).min(max);
                 }
             }
             KeyCode::Backspace => {
-                if let Some(search) = self.model_search.as_mut() {
+                if let Some(search) = self.modals.search_mut() {
                     search.query.pop();
                     search.cursor = 0;
                 }
@@ -1135,7 +1016,7 @@ impl App {
                 self.schedule_online_search();
             }
             KeyCode::Char(c) => {
-                if let Some(search) = self.model_search.as_mut() {
+                if let Some(search) = self.modals.search_mut() {
                     search.query.push(c);
                     search.cursor = 0;
                 }
@@ -1147,25 +1028,25 @@ impl App {
     }
 
     pub fn search_results(&self) -> Vec<&Model> {
-        let Some(search) = &self.model_search else { return Vec::new() };
+        let Some(search) = self.modals.search() else { return Vec::new() };
         search.result_indices.iter().filter_map(|i| self.catalog_source().get(*i)).collect()
     }
 
     fn refresh_model_search(&mut self) {
         let Some((query, scope, online)) =
-            self.model_search.as_ref().map(|s| (s.query.clone(), s.scope.clone(), s.online))
+            self.modals.search().map(|s| (s.query.clone(), s.scope.clone(), s.online))
         else {
             return;
         };
         let results = self.ranked_model_indices(&query, &scope, online);
-        if let Some(search) = self.model_search.as_mut() {
+        if let Some(search) = self.modals.search_mut() {
             search.result_indices = results;
             search.cursor = search.cursor.min(search.result_indices.len().saturating_sub(1));
         }
     }
 
     fn schedule_online_search(&mut self) {
-        let Some(search) = &self.model_search else { return };
+        let Some(search) = self.modals.search() else { return };
         if search.online && search.scope.len() <= 2 {
             self.online_search_due = Some((Instant::now(), search.query.clone()));
         }
@@ -1189,7 +1070,7 @@ impl App {
             return false;
         };
         let Some(route) = self.catalog_route(&path) else { return false };
-        self.focus = Pane::Model;
+        self.browser.focus = Pane::Model;
         self.apply_catalog_route(route);
         true
     }
@@ -1197,10 +1078,10 @@ impl App {
     /// Commit a resolved route — only ever called once the whole route exists,
     /// so the browser never lands half-way.
     fn apply_catalog_route(&mut self, route: CatalogRoute) {
-        self.catalog_prefix = route.prefix;
-        self.catalog_history = route.history;
-        self.models.items = route.items;
-        self.models.state.select(Some(route.selected));
+        self.browser.catalog_prefix = route.prefix;
+        self.browser.catalog_history = route.history;
+        self.browser.models.items = route.items;
+        self.browser.models.state.select(Some(route.selected));
         self.rebuild_below(Pane::Model);
         self.maybe_fetch_online(false);
     }
@@ -1233,7 +1114,7 @@ impl App {
             self.apply_catalog_route(route);
             // `catalog_route` lands *on* the directory; step into it so the
             // pane shows its contents.
-            if self.models.selected().is_some_and(|model| model.is_catalog_dir()) {
+            if self.browser.models.selected().is_some_and(|model| model.is_catalog_dir()) {
                 self.enter();
             }
             return;
@@ -1268,17 +1149,17 @@ impl App {
     fn on_key_sessions(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('?') => self.modals.set_help(true),
             KeyCode::Esc | KeyCode::Char('t') => self.screen = Screen::Browser,
             KeyCode::Char('j') | KeyCode::Down => self.move_session(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_session(-1),
             KeyCode::Char('g') | KeyCode::Home => {
                 let any = self.async_job_count() > 0;
-                self.session_sel.select(any.then_some(0));
+                self.session_view.selection.select(any.then_some(0));
             }
             KeyCode::Char('G') | KeyCode::End => {
                 let len = self.async_job_count();
-                self.session_sel.select((len > 0).then_some(len - 1));
+                self.session_view.selection.select((len > 0).then_some(len - 1));
             }
             KeyCode::Char('x') => self.stop_async_job(false),
             KeyCode::Char('K') => self.stop_async_job(true),
@@ -1287,7 +1168,7 @@ impl App {
             KeyCode::Char('c') => self.copy_endpoint(),
             KeyCode::Char('y') => self.yank_session_command(),
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => self.toggle_session_pane(),
-            KeyCode::Char('h') | KeyCode::Left => self.session_pane = SessionPane::Detail,
+            KeyCode::Char('h') | KeyCode::Left => self.session_view.pane = SessionPane::Detail,
             KeyCode::Char('L') => self.open_logs(),
             KeyCode::F(5) => {
                 self.sessions.rediscover();
@@ -1305,26 +1186,26 @@ impl App {
                 self.screen = Screen::Sessions
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                self.log_follow = false;
-                self.log_scroll = self.log_scroll.saturating_add(1);
+                self.session_view.log_follow = false;
+                self.session_view.log_scroll = self.session_view.log_scroll.saturating_add(1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.log_follow = false;
-                self.log_scroll = self.log_scroll.saturating_sub(1);
+                self.session_view.log_follow = false;
+                self.session_view.log_scroll = self.session_view.log_scroll.saturating_sub(1);
             }
             KeyCode::PageDown => {
-                self.log_follow = false;
-                self.log_scroll = self.log_scroll.saturating_add(10);
+                self.session_view.log_follow = false;
+                self.session_view.log_scroll = self.session_view.log_scroll.saturating_add(10);
             }
             KeyCode::PageUp => {
-                self.log_follow = false;
-                self.log_scroll = self.log_scroll.saturating_sub(10);
+                self.session_view.log_follow = false;
+                self.session_view.log_scroll = self.session_view.log_scroll.saturating_sub(10);
             }
             KeyCode::Char('g') | KeyCode::Home => {
-                self.log_follow = false;
-                self.log_scroll = 0;
+                self.session_view.log_follow = false;
+                self.session_view.log_scroll = 0;
             }
-            KeyCode::Char('G') | KeyCode::End => self.log_follow = true,
+            KeyCode::Char('G') | KeyCode::End => self.session_view.log_follow = true,
             KeyCode::F(5) => self.reload_logs(),
             _ => {}
         }
@@ -1341,23 +1222,11 @@ impl App {
 
     /// Keep the session selection cursor within the bounds of the session list.
     fn sync_session_selection(&mut self) {
-        let len = self.async_job_count();
-        if len == 0 {
-            self.session_sel.select(None);
-        } else {
-            let i = self.session_sel.selected().unwrap_or(0).min(len - 1);
-            self.session_sel.select(Some(i));
-        }
+        self.session_view.sync_selection(self.async_job_count());
     }
 
     fn move_session(&mut self, delta: isize) {
-        let len = self.async_job_count();
-        if len == 0 {
-            return;
-        }
-        let cur = self.session_sel.selected().unwrap_or(0) as isize;
-        let next = (cur + delta).clamp(0, len as isize - 1);
-        self.session_sel.select(Some(next as usize));
+        self.session_view.move_selection(delta, self.async_job_count());
     }
 
     /// Build a launch request from the current selection and resolved options.
@@ -1365,13 +1234,13 @@ impl App {
     /// Everything runtime-specific — the argv, the readiness path, the process
     /// token, any pre-flight capability check — comes from the backend.
     fn build_launch_request(&self) -> Result<LaunchRequest, String> {
-        let backend = self.runtimes.selected().ok_or("no runtime selected")?;
+        let backend = self.browser.runtimes.selected().ok_or("no runtime selected")?;
         if let Some(reason) = backend.unavailable_reason() {
             return Err(reason);
         }
         let model = self.selected_model().ok_or("no model selected")?;
-        let profile = self.profiles.selected().ok_or("no profile selected")?;
-        let options = self.options.items.clone();
+        let profile = self.browser.profiles.selected().ok_or("no profile selected")?;
+        let options = self.browser.options.items.clone();
         profiles::validate_options(backend.as_ref(), model, &options)?;
         let binary = backend
             .descriptor()
@@ -1415,7 +1284,8 @@ impl App {
     /// *starting* a model, not building its command, so `y` still previews and
     /// copies the launch line while a session holds the device.
     fn single_session_conflict(&self, runtime: &str) -> Option<Vec<String>> {
-        let backend = self.runtimes.items.iter().find(|b| b.descriptor().name == runtime)?;
+        let backend =
+            self.browser.runtimes.items.iter().find(|b| b.descriptor().name == runtime)?;
         if !backend.single_session() {
             return None;
         }
@@ -1429,19 +1299,19 @@ impl App {
 
     /// Preview the generated command and copy it to the clipboard (`y`).
     fn yank_command(&mut self) {
-        if self.focus != Pane::Profile && self.focus != Pane::Options {
+        if self.browser.focus != Pane::Profile && self.browser.focus != Pane::Options {
             return;
         }
         match self.build_launch_request() {
             Ok(req) => {
                 copy_to_clipboard(&req.command.display());
-                self.message = Some(Message {
+                self.modals.message = Some(Message {
                     title: "Launch command".into(),
                     lines: command_message_lines(&req.command),
                 });
             }
             Err(e) => {
-                self.message =
+                self.modals.message =
                     Some(Message { title: "Cannot build command".into(), lines: vec![e] })
             }
         }
@@ -1449,18 +1319,19 @@ impl App {
 
     /// Launch a server for the current selection and jump to the manager (`s`).
     fn start_session(&mut self) {
-        if self.focus != Pane::Profile && self.focus != Pane::Options {
+        if self.browser.focus != Pane::Profile && self.browser.focus != Pane::Options {
             return;
         }
         let req = match self.build_launch_request() {
             Ok(req) => req,
             Err(e) => {
-                self.message = Some(Message { title: "Cannot launch".into(), lines: vec![e] });
+                self.modals.message =
+                    Some(Message { title: "Cannot launch".into(), lines: vec![e] });
                 return;
             }
         };
         if let Some(lines) = self.single_session_conflict(&req.runtime) {
-            self.message = Some(Message { title: "Cannot launch".into(), lines });
+            self.modals.message = Some(Message { title: "Cannot launch".into(), lines });
             return;
         }
         match self.sessions.launch(req) {
@@ -1469,14 +1340,14 @@ impl App {
                 let name = self.sessions.sessions[idx].record.name.clone();
                 let status = self.sessions.sessions[idx].status_label();
                 self.screen = Screen::Sessions;
-                self.session_sel.select(Some(idx));
-                self.message = Some(Message {
+                self.session_view.selection.select(Some(idx));
+                self.modals.message = Some(Message {
                     title: "Launched".into(),
                     lines: vec![name, format!("{status} — {endpoint}")],
                 });
             }
             Err(e) => {
-                self.message =
+                self.modals.message =
                     Some(Message { title: "Launch failed".into(), lines: vec![e.to_string()] })
             }
         }
@@ -1486,7 +1357,7 @@ impl App {
     fn download_selected_model(&mut self) {
         let Some(model) = self.selected_model().cloned() else { return };
         if let Some(transfer) =
-            self.runtimes.selected().and_then(|backend| backend.model_transfer(&model))
+            self.browser.runtimes.selected().and_then(|backend| backend.model_transfer(&model))
         {
             self.download_backend_model(transfer);
             return;
@@ -1506,7 +1377,7 @@ impl App {
             match discovery::online::finalize_cached_download(&remote) {
                 Ok(_) => self.reload_catalog_in_place(),
                 Err(error) => {
-                    self.message = Some(Message {
+                    self.modals.message = Some(Message {
                         title: "Cannot download".into(),
                         lines: vec![format!("{error:#}")],
                     })
@@ -1515,14 +1386,14 @@ impl App {
             return;
         }
         if remote.gated && std::env::var_os("HF_TOKEN").is_none() {
-            self.message = Some(Message {
+            self.modals.message = Some(Message {
                 title: "Cannot download".into(),
                 lines: vec!["This gated model requires HF_TOKEN.".into()],
             });
             return;
         }
         if remote.blobs.is_empty() || total_bytes == 0 {
-            self.message = Some(Message {
+            self.modals.message = Some(Message {
                 title: "Cannot download".into(),
                 lines: vec![
                     "Download metadata is unavailable; press F5 in this repository and retry."
@@ -1533,10 +1404,10 @@ impl App {
         }
 
         if let Some(index) =
-            self.model_downloads.iter().position(|download| download.model_id == model.id)
+            self.downloads.jobs.iter().position(|download| download.model_id == model.id)
         {
             if matches!(
-                self.model_downloads[index].status,
+                self.downloads.jobs[index].status,
                 ModelDownloadStatus::Cancelled
                     | ModelDownloadStatus::Interrupted
                     | ModelDownloadStatus::Failed(_)
@@ -1544,11 +1415,11 @@ impl App {
                 self.resume_model_download(index);
             }
             self.screen = Screen::Sessions;
-            self.session_sel.select(Some(self.sessions.sessions.len() + index));
+            self.session_view.selection.select(Some(self.sessions.sessions.len() + index));
             return;
         }
 
-        let id = self.next_download_id();
+        let id = self.downloads.next_id();
         let cancelled = Arc::new(AtomicBool::new(false));
         let display =
             format!("{}/{}", remote.repo, remote.file.as_deref().unwrap_or(model.name.as_str()));
@@ -1558,13 +1429,13 @@ impl App {
             remote.clone(),
         );
         if let Err(error) = discovery::online::save_download_record(&self.models_dir, &record) {
-            self.message = Some(Message {
+            self.modals.message = Some(Message {
                 title: "Cannot download".into(),
                 lines: vec![format!("Cannot persist download state: {error}")],
             });
             return;
         }
-        self.model_downloads.push(ModelDownload {
+        self.downloads.jobs.push(ModelDownload {
             id,
             model_id: model.id,
             model: display,
@@ -1575,7 +1446,7 @@ impl App {
             cancelled: cancelled.clone(),
         });
         self.reveal_latest_download();
-        self.spawn_model_download(id, DownloadSource::Hub(Box::new(remote)), cancelled);
+        self.downloads.spawn(id, DownloadSource::Hub(Box::new(remote)), cancelled);
     }
 
     /// Start a transfer prepared by the selected runtime.
@@ -1583,33 +1454,33 @@ impl App {
         let model = &transfer.model;
         // Already tracked: jump to it rather than starting a second transfer.
         if let Some(index) =
-            self.model_downloads.iter().position(|download| download.model_id == model.id)
+            self.downloads.jobs.iter().position(|download| download.model_id == model.id)
         {
             let restartable = matches!(
-                self.model_downloads[index].status,
+                self.downloads.jobs[index].status,
                 ModelDownloadStatus::Cancelled
                     | ModelDownloadStatus::Interrupted
                     | ModelDownloadStatus::Failed(_)
             );
             if restartable {
-                let id = self.next_download_id();
+                let id = self.downloads.next_id();
                 let cancelled = Arc::new(AtomicBool::new(false));
-                let source = self.model_downloads[index].source.clone();
-                let download = &mut self.model_downloads[index];
+                let source = self.downloads.jobs[index].source.clone();
+                let download = &mut self.downloads.jobs[index];
                 download.id = id;
                 download.status = ModelDownloadStatus::Downloading;
                 download.cancelled = cancelled.clone();
-                self.spawn_model_download(id, source, cancelled);
+                self.downloads.spawn(id, source, cancelled);
             }
             self.screen = Screen::Sessions;
-            self.session_sel.select(Some(self.sessions.sessions.len() + index));
+            self.session_view.selection.select(Some(self.sessions.sessions.len() + index));
             return;
         }
 
-        let id = self.next_download_id();
+        let id = self.downloads.next_id();
         let cancelled = Arc::new(AtomicBool::new(false));
         let source = DownloadSource::Backend(transfer.clone());
-        self.model_downloads.push(ModelDownload {
+        self.downloads.jobs.push(ModelDownload {
             id,
             model_id: model.id.clone(),
             model: model.name.clone(),
@@ -1620,91 +1491,23 @@ impl App {
             cancelled: cancelled.clone(),
         });
         self.reveal_latest_download();
-        self.spawn_model_download(id, source, cancelled);
+        self.downloads.spawn(id, source, cancelled);
     }
 
     /// Switch to the Session Manager with the newest download selected.
     fn reveal_latest_download(&mut self) {
         self.screen = Screen::Sessions;
-        self.session_sel
-            .select(Some(self.sessions.sessions.len() + self.model_downloads.len() - 1));
-    }
-
-    fn next_download_id(&mut self) -> u64 {
-        let id = self.next_download_id;
-        self.next_download_id = self.next_download_id.wrapping_add(1).max(1);
-        id
-    }
-
-    fn spawn_model_download(&self, id: u64, source: DownloadSource, cancelled: Arc<AtomicBool>) {
-        let tx = self.download_tx.clone();
-        std::thread::spawn(move || {
-            let progress = |downloaded_bytes, total_bytes| {
-                let _ = tx.send(ModelDownloadEvent::Progress { id, downloaded_bytes, total_bytes });
-            };
-            let result = match source {
-                DownloadSource::Hub(remote) => {
-                    discovery::online::download_model(&remote, &cancelled, progress)
-                        .map_err(|error| error.to_string())
-                }
-                DownloadSource::Backend(transfer) => {
-                    (transfer.run)(&transfer.model, &cancelled, &mut { progress })
-                        .map_err(|error| error.to_string())
-                }
-            };
-            let _ = tx.send(ModelDownloadEvent::Finished { id, result });
-        });
+        self.session_view
+            .selection
+            .select(Some(self.sessions.sessions.len() + self.downloads.jobs.len() - 1));
     }
 
     fn poll_model_download(&mut self) {
-        let mut refresh_models = false;
-        let mut refresh_runtimes = HashSet::new();
-        let mut completed_records = Vec::new();
-        while let Ok(event) = self.download_rx.try_recv() {
-            match event {
-                ModelDownloadEvent::Progress { id, downloaded_bytes, total_bytes } => {
-                    let Some(download) =
-                        self.model_downloads.iter_mut().find(|download| download.id == id)
-                    else {
-                        continue;
-                    };
-                    if !matches!(download.status, ModelDownloadStatus::Downloading) {
-                        continue;
-                    }
-                    download.downloaded_bytes = downloaded_bytes.min(total_bytes);
-                    download.total_bytes = total_bytes;
-                }
-                ModelDownloadEvent::Finished { id, result } => {
-                    let Some(download) =
-                        self.model_downloads.iter_mut().find(|download| download.id == id)
-                    else {
-                        continue;
-                    };
-                    match result {
-                        Ok(discovery::online::DownloadResult::Downloaded(path)) => {
-                            download.downloaded_bytes = download.total_bytes;
-                            download.status = ModelDownloadStatus::Downloaded(path);
-                            match &download.source {
-                                DownloadSource::Backend(transfer) => {
-                                    refresh_runtimes.insert(transfer.runtime.clone());
-                                }
-                                DownloadSource::Hub(_) => {
-                                    completed_records.push(download.model_id.clone());
-                                    refresh_models = true;
-                                }
-                            }
-                        }
-                        Ok(discovery::online::DownloadResult::Cancelled) => {
-                            download.status = ModelDownloadStatus::Cancelled;
-                        }
-                        Err(_) if download.cancelled.load(Ordering::Relaxed) => {
-                            download.status = ModelDownloadStatus::Cancelled;
-                        }
-                        Err(error) => download.status = ModelDownloadStatus::Failed(error),
-                    }
-                }
-            }
-        }
+        let downloads::DownloadChanges {
+            online: refresh_models,
+            runtimes: refresh_runtimes,
+            records: completed_records,
+        } = self.downloads.poll();
         for model_id in completed_records {
             if let Err(error) =
                 discovery::online::delete_download_record(&self.models_dir, &model_id)
@@ -1723,36 +1526,40 @@ impl App {
 
     /// Rebuild the Model pane in place, keeping the cursor on the same entry.
     fn reselect_current_catalog(&mut self) {
-        let selected = self.models.selected().map(|model| model.id.clone());
-        let items = self.catalog_children(&self.catalog_prefix);
+        let selected = self.browser.models.selected().map(|model| model.id.clone());
+        let items = self.catalog_children(&self.browser.catalog_prefix);
         let index = selected
             .as_ref()
             .and_then(|id| items.iter().position(|model| &model.id == id))
             .unwrap_or(0);
-        self.models.items = items;
-        self.models.state.select((!self.models.items.is_empty()).then_some(index));
+        self.browser.models.items = items;
+        self.browser.models.state.select((!self.browser.models.items.is_empty()).then_some(index));
         self.rebuild_below(Pane::Model);
     }
 
     fn refresh_downloaded_online_models(&mut self) {
-        let selected = self.models.selected().map(|model| model.id.clone());
+        let selected = self.browser.models.selected().map(|model| model.id.clone());
         self.online_models.retain(|model| !discovery::online::is_online_path(&model.catalog_path));
         self.online_models.extend(discovery::online::load_cached(&self.models_dir));
         self.sync_online_catalogs();
-        if self.runtimes.selected().is_some_and(|backend| backend.supports_online_browse()) {
-            let items = self.catalog_children(&self.catalog_prefix);
+        if self.browser.runtimes.selected().is_some_and(|backend| backend.supports_online_browse())
+        {
+            let items = self.catalog_children(&self.browser.catalog_prefix);
             let index = selected
                 .as_ref()
                 .and_then(|id| items.iter().position(|model| &model.id == id))
                 .unwrap_or(0);
-            self.models.items = items;
-            self.models.state.select((!self.models.items.is_empty()).then_some(index));
+            self.browser.models.items = items;
+            self.browser
+                .models
+                .state
+                .select((!self.browser.models.items.is_empty()).then_some(index));
             self.rebuild_below(Pane::Model);
         }
     }
 
     fn resume_model_download(&mut self, index: usize) {
-        let Some(download) = self.model_downloads.get(index) else { return };
+        let Some(download) = self.downloads.jobs.get(index) else { return };
         if matches!(
             download.status,
             ModelDownloadStatus::Downloading
@@ -1761,48 +1568,49 @@ impl App {
         ) {
             return;
         }
-        let id = self.next_download_id();
+        let id = self.downloads.next_id();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let source = self.model_downloads[index].source.clone();
+        let source = self.downloads.jobs[index].source.clone();
         // Hub transfers persist job records; backend transfers resume via their backend.
         if let DownloadSource::Hub(remote) = &source {
             let record = discovery::online::DownloadJobRecord::new(
-                self.model_downloads[index].model_id.clone(),
-                self.model_downloads[index].model.clone(),
+                self.downloads.jobs[index].model_id.clone(),
+                self.downloads.jobs[index].model.clone(),
                 (**remote).clone(),
             );
             if let Err(error) = discovery::online::save_download_record(&self.models_dir, &record) {
-                self.message = Some(Message {
+                self.modals.message = Some(Message {
                     title: "Cannot resume".into(),
                     lines: vec![format!("Cannot persist download state: {error}")],
                 });
                 return;
             }
         }
-        let download = &mut self.model_downloads[index];
+        let download = &mut self.downloads.jobs[index];
         download.id = id;
         download.status = ModelDownloadStatus::Downloading;
         download.cancelled = cancelled.clone();
-        self.spawn_model_download(id, source, cancelled);
+        self.downloads.spawn(id, source, cancelled);
     }
 
     /// Run the runtime's interactive client in the foreground (`C`), suspending
     /// the TUI while it owns the terminal. Server-only flags are dropped by the
     /// backend.
     fn start_chat(&mut self) {
-        if self.focus != Pane::Profile && self.focus != Pane::Options {
+        if self.browser.focus != Pane::Profile && self.browser.focus != Pane::Options {
             return;
         }
-        let Some(backend) = self.runtimes.selected() else { return };
+        let Some(backend) = self.browser.runtimes.selected() else { return };
         if let Some(reason) = backend.unavailable_reason() {
-            self.message = Some(Message { title: "Cannot start chat".into(), lines: vec![reason] });
+            self.modals.message =
+                Some(Message { title: "Cannot start chat".into(), lines: vec![reason] });
             return;
         }
         // An interactive client loads the model too, so it collides with a live
         // server on a single-session runtime exactly as a second launch would.
         let runtime = backend.descriptor().name.clone();
         if let Some(lines) = self.single_session_conflict(&runtime) {
-            self.message = Some(Message { title: "Cannot start chat".into(), lines });
+            self.modals.message = Some(Message { title: "Cannot start chat".into(), lines });
             return;
         }
         let (Some(model), Some(binary)) =
@@ -1811,16 +1619,20 @@ impl App {
             return;
         };
         let binary = binary.display().to_string();
-        if let Err(error) = profiles::validate_options(backend.as_ref(), model, &self.options.items)
+        if let Err(error) =
+            profiles::validate_options(backend.as_ref(), model, &self.browser.options.items)
         {
-            self.message = Some(Message { title: "Invalid profile".into(), lines: vec![error] });
+            self.modals.message =
+                Some(Message { title: "Invalid profile".into(), lines: vec![error] });
             return;
         }
-        let Ok(ctx) = LaunchContext::new(&binary, model, &self.options.items) else { return };
+        let Ok(ctx) = LaunchContext::new(&binary, model, &self.browser.options.items) else {
+            return;
+        };
         match backend.chat_argv(&ctx) {
             Some(argv) => self.pending_chat = Some(argv),
             None => {
-                self.message = Some(Message {
+                self.modals.message = Some(Message {
                     title: "Chat unavailable".into(),
                     lines: vec![format!("{runtime} has no interactive client on this system.")],
                 });
@@ -1831,7 +1643,9 @@ impl App {
     /// Run the runtime's benchmark tool in the foreground (`b`). Runtimes
     /// without one leave `pending_benchmark` unset, so the key is inert.
     fn start_benchmark(&mut self) {
-        let (Some(backend), Some(model)) = (self.runtimes.selected(), self.selected_model()) else {
+        let (Some(backend), Some(model)) =
+            (self.browser.runtimes.selected(), self.selected_model())
+        else {
             return;
         };
         // A benchmark loads the model just as a server or an interactive client
@@ -1840,33 +1654,38 @@ impl App {
         // belongs to a runtime that is happy to run several at once.
         let runtime = backend.descriptor().name.clone();
         if let Some(lines) = self.single_session_conflict(&runtime) {
-            self.message = Some(Message { title: "Cannot start benchmark".into(), lines });
+            self.modals.message = Some(Message { title: "Cannot start benchmark".into(), lines });
             return;
         }
         let Some(binary) = backend.descriptor().binary_path.as_ref() else { return };
         let binary = binary.display().to_string();
-        if let Err(error) = profiles::validate_options(backend.as_ref(), model, &self.options.items)
+        if let Err(error) =
+            profiles::validate_options(backend.as_ref(), model, &self.browser.options.items)
         {
-            self.message = Some(Message { title: "Invalid profile".into(), lines: vec![error] });
+            self.modals.message =
+                Some(Message { title: "Invalid profile".into(), lines: vec![error] });
             return;
         }
-        let Ok(ctx) = LaunchContext::new(&binary, model, &self.options.items) else { return };
+        let Ok(ctx) = LaunchContext::new(&binary, model, &self.browser.options.items) else {
+            return;
+        };
         self.pending_benchmark = backend.bench_argv(&ctx);
     }
 
     pub fn async_job_count(&self) -> usize {
-        self.sessions.sessions.len() + self.model_downloads.len()
+        self.sessions.sessions.len() + self.downloads.jobs.len()
     }
 
     fn selected_server_index(&self) -> Option<usize> {
-        self.session_sel.selected().filter(|index| *index < self.sessions.sessions.len())
+        self.session_view.selection.selected().filter(|index| *index < self.sessions.sessions.len())
     }
 
     fn selected_download_index(&self) -> Option<usize> {
-        self.session_sel
+        self.session_view
+            .selection
             .selected()?
             .checked_sub(self.sessions.sessions.len())
-            .filter(|index| *index < self.model_downloads.len())
+            .filter(|index| *index < self.downloads.jobs.len())
     }
 
     pub fn selected_server_session(&self) -> Option<&session::Session> {
@@ -1874,25 +1693,21 @@ impl App {
     }
 
     pub fn selected_model_download(&self) -> Option<&ModelDownload> {
-        self.selected_download_index().and_then(|index| self.model_downloads.get(index))
+        self.selected_download_index().and_then(|index| self.downloads.jobs.get(index))
     }
 
     /// Apply a fallible supervisor action to the selected server session.
     fn session_action(&mut self, f: impl Fn(&mut SessionManager, usize) -> Result<()>, verb: &str) {
         let Some(i) = self.selected_server_index() else { return };
         if let Err(e) = f(&mut self.sessions, i) {
-            self.message =
+            self.modals.message =
                 Some(Message { title: format!("Failed to {verb}"), lines: vec![e.to_string()] });
         }
     }
 
     fn stop_async_job(&mut self, force: bool) {
         if let Some(index) = self.selected_download_index() {
-            let download = &mut self.model_downloads[index];
-            if matches!(download.status, ModelDownloadStatus::Downloading) {
-                download.cancelled.store(true, Ordering::Relaxed);
-                download.status = ModelDownloadStatus::Cancelling;
-            }
+            self.downloads.cancel(index);
             return;
         }
         if force {
@@ -1914,26 +1729,26 @@ impl App {
     fn remove_async_job(&mut self) {
         if let Some(index) = self.selected_download_index() {
             if matches!(
-                self.model_downloads[index].status,
+                self.downloads.jobs[index].status,
                 ModelDownloadStatus::Downloading | ModelDownloadStatus::Cancelling
             ) {
-                self.message = Some(Message {
+                self.modals.message = Some(Message {
                     title: "Cannot remove".into(),
                     lines: vec!["Cancel the download before removing it.".into()],
                 });
                 return;
             }
-            let model_id = self.model_downloads[index].model_id.clone();
+            let model_id = self.downloads.jobs[index].model_id.clone();
             if let Err(error) =
                 discovery::online::delete_download_record(&self.models_dir, &model_id)
             {
-                self.message = Some(Message {
+                self.modals.message = Some(Message {
                     title: "Cannot remove".into(),
                     lines: vec![format!("Cannot remove persisted download state: {error}")],
                 });
                 return;
             }
-            self.model_downloads.remove(index);
+            self.downloads.jobs.remove(index);
             self.sync_session_selection();
             return;
         }
@@ -1941,7 +1756,7 @@ impl App {
         if self.sessions.remove(i) {
             self.sync_session_selection();
         } else {
-            self.message = Some(Message {
+            self.modals.message = Some(Message {
                 title: "Cannot remove".into(),
                 lines: vec![
                     "Only Stopped or Crashed sessions can be removed; stop it first.".into(),
@@ -1955,7 +1770,8 @@ impl App {
         let Some(i) = self.selected_server_index() else { return };
         let endpoint = self.sessions.sessions[i].record.endpoint();
         copy_to_clipboard(&endpoint);
-        self.message = Some(Message { title: "Endpoint copied".into(), lines: vec![endpoint] });
+        self.modals.message =
+            Some(Message { title: "Endpoint copied".into(), lines: vec![endpoint] });
     }
 
     /// Show + copy the selected session's stored launch command (`y`).
@@ -1964,7 +1780,7 @@ impl App {
         let argv = self.sessions.sessions[i].record.command.clone();
         let cmd = session::command::Command { argv };
         copy_to_clipboard(&cmd.display());
-        self.message =
+        self.modals.message =
             Some(Message { title: "Session command".into(), lines: command_message_lines(&cmd) });
     }
 
@@ -1983,11 +1799,11 @@ impl App {
         // On a terminal too narrow for the column, the log has nowhere to go
         // but over the whole screen — which is better than the key doing
         // nothing at all.
-        if !self.detail_pane_visible {
+        if !self.session_view.detail_pane_visible {
             self.open_logs();
             return;
         }
-        self.session_pane = match self.session_pane {
+        self.session_view.pane = match self.session_view.pane {
             SessionPane::Detail => SessionPane::Log,
             SessionPane::Log => SessionPane::Detail,
         };
@@ -1999,35 +1815,36 @@ impl App {
             return;
         }
         self.screen = Screen::Logs;
-        self.log_follow = true;
-        self.log_scroll = 0;
+        self.session_view.log_follow = true;
+        self.session_view.log_scroll = 0;
         self.reload_logs();
     }
 
     /// Reload the tail of the selected session's log file.
     fn reload_logs(&mut self) {
         let lines = self
-            .session_sel
+            .session_view
+            .selection
             .selected()
             .and_then(|i| self.sessions.sessions.get(i))
             .map(|s| read_log_tail(&s.record.log_file, 1000))
             .unwrap_or_default();
-        self.log_lines = lines;
+        self.session_view.log_lines = lines;
     }
 
     /// Handle a keystroke while a modal text prompt is open.
     fn prompt_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => self.prompt = None,
+            KeyCode::Esc => self.modals.set_prompt(None),
             KeyCode::Enter => self.commit_prompt(),
             KeyCode::Backspace => {
-                if let Some(p) = self.prompt.as_mut() {
+                if let Some(p) = self.modals.prompt_mut() {
                     p.buffer.pop();
                     p.error = None;
                 }
             }
             KeyCode::Char(c) => {
-                if let Some(p) = self.prompt.as_mut() {
+                if let Some(p) = self.modals.prompt_mut() {
                     p.buffer.push(c);
                     p.error = None;
                 }
@@ -2040,16 +1857,16 @@ impl App {
     /// keys narrow the filter, arrows/Home/End move, Enter picks, Esc cancels.
     fn selector_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => self.selector = None,
+            KeyCode::Esc => self.modals.set_selector(None),
             KeyCode::Enter => {
-                if let Some(sel) = self.selector.take() {
+                if let Some(sel) = self.modals.take_selector() {
                     if let Some(value) = sel.selected().map(str::to_string) {
                         self.apply_option_value(&sel.key, value);
                     }
                 }
             }
             _ => {
-                let Some(sel) = self.selector.as_mut() else {
+                let Some(sel) = self.modals.selector_mut() else {
                     return;
                 };
                 match key.code {
@@ -2077,10 +1894,10 @@ impl App {
     /// ([`SELECTOR_THRESHOLD`]) open the filterable selector popup; numeric/
     /// string open a text prompt. Applies only to real (non-stub) runtimes.
     fn open_editor(&mut self) {
-        if self.focus != Pane::Options {
+        if self.browser.focus != Pane::Options {
             return;
         }
-        let Some(option) = self.options.selected() else {
+        let Some(option) = self.browser.options.selected() else {
             return;
         };
         let key = option.key.clone();
@@ -2088,32 +1905,32 @@ impl App {
 
         if key == "device" {
             let mut variants = vec![profiles::registry::DEFAULT.to_string()];
-            if let Some(runtime) = self.runtimes.selected() {
+            if let Some(runtime) = self.browser.runtimes.selected() {
                 variants.extend(runtime.descriptor().devices.iter().cloned());
             }
-            self.selector = Some(Selector {
+            self.modals.set_selector(Some(Selector {
                 title: "Select device".into(),
                 key,
                 cursor: variants.iter().position(|v| *v == current).unwrap_or(0),
                 variants,
                 filter: String::new(),
-            });
+            }));
             return;
         }
 
-        let Some(backend) = self.runtimes.selected() else { return };
+        let Some(backend) = self.browser.runtimes.selected() else { return };
         if let Some(spec) = backend.schema().spec(&key) {
             use profiles::registry::OptionKind;
             if let OptionKind::Enum(variants) = spec.kind {
                 if variants.len() > SELECTOR_THRESHOLD {
-                    self.selector = Some(Selector {
+                    self.modals.set_selector(Some(Selector {
                         title: format!("Select {key}"),
                         key,
                         variants: variants.iter().map(|v| (*v).to_string()).collect(),
                         filter: String::new(),
                         // Start on the current value.
                         cursor: variants.iter().position(|v| *v == current).unwrap_or(0),
-                    });
+                    }));
                     return;
                 }
                 // Small enums don't need a popup — `e` advances to the next
@@ -2129,22 +1946,22 @@ impl App {
         } else {
             format!("Edit {key}")
         };
-        self.prompt = Some(Prompt {
+        self.modals.set_prompt(Some(Prompt {
             kind: PromptKind::EditOption { key: key.clone() },
             title,
             buffer: current,
             error: None,
-        });
+        }));
     }
 
     /// Reset the selected option to its resolved default (`d` in Options).
     /// Unlike `Home`, this restores the *resolved* default — the omit token for
     /// omittable options, but e.g. ctx/8 for ctx-size or the config host/port.
     fn reset_option_default(&mut self) {
-        if self.focus != Pane::Options {
+        if self.browser.focus != Pane::Options {
             return;
         }
-        let Some(option) = self.options.selected() else {
+        let Some(option) = self.browser.options.selected() else {
             return;
         };
         let key = option.key.clone();
@@ -2154,19 +1971,19 @@ impl App {
 
     /// Increment/decrement the selected option in place (auto-saves).
     fn adjust_option(&mut self, dir: i32) {
-        if let Some(option) = self.options.selected() {
+        if let Some(option) = self.browser.options.selected() {
             if option.key == "device" {
-                let next = self
-                    .runtimes
-                    .selected()
-                    .map(|runtime| cycle_device(&runtime.descriptor().devices, &option.value, dir));
+                let next =
+                    self.browser.runtimes.selected().map(|runtime| {
+                        cycle_device(&runtime.descriptor().devices, &option.value, dir)
+                    });
                 if let Some(next) = next {
                     self.apply_option_value("device", next);
                 }
                 return;
             }
         }
-        let schema = self.runtimes.selected().map(|b| b.schema());
+        let schema = self.browser.runtimes.selected().map(|b| b.schema());
         self.transform_option(move |spec, kind, current| {
             schema.and_then(|schema| schema.bump(spec, kind, current, dir))
         });
@@ -2186,15 +2003,15 @@ impl App {
             &str,
         ) -> Option<String>,
     ) {
-        if self.focus != Pane::Options {
+        if self.browser.focus != Pane::Options {
             return;
         }
-        let Some(option) = self.options.selected() else {
+        let Some(option) = self.browser.options.selected() else {
             return;
         };
         let key = option.key.clone();
         let current = option.value.clone();
-        let Some(backend) = self.runtimes.selected() else { return };
+        let Some(backend) = self.browser.runtimes.selected() else { return };
         let Some(spec) = backend.schema().spec(&key) else {
             return;
         };
@@ -2210,7 +2027,7 @@ impl App {
 
     /// Validate and commit the open prompt; dispatch by its kind.
     fn commit_prompt(&mut self) {
-        let Some(prompt) = self.prompt.as_ref() else {
+        let Some(prompt) = self.modals.prompt() else {
             return;
         };
         let input = prompt.buffer.trim().to_string();
@@ -2222,9 +2039,9 @@ impl App {
             PromptKind::DuplicateProfile { src } => self.commit_duplicate_profile(&src, &input),
         };
         match result {
-            Ok(()) => self.prompt = None,
+            Ok(()) => self.modals.set_prompt(None),
             Err(message) => {
-                if let Some(p) = self.prompt.as_mut() {
+                if let Some(p) = self.modals.prompt_mut() {
                     p.error = Some(message);
                 }
             }
@@ -2232,7 +2049,7 @@ impl App {
     }
 
     fn commit_option_edit(&mut self, key: &str, input: &str) -> Result<(), String> {
-        let backend = self.runtimes.selected().ok_or("no runtime selected")?;
+        let backend = self.browser.runtimes.selected().ok_or("no runtime selected")?;
         let spec = backend.schema().spec(key).ok_or("unknown option")?;
         // Sentinel options accept "default" (or an empty entry) to drop the flag.
         if backend.schema().uses_sentinel(key)
@@ -2253,9 +2070,11 @@ impl App {
     /// Persist an option value to the model-scoped instance (auto-saves) and
     /// refresh the Options pane while preserving the cursor position.
     fn apply_option_value(&mut self, key: &str, value: String) {
-        let (Some(backend), Some(m), Some(p)) =
-            (self.runtimes.selected(), self.selected_model(), self.profiles.selected())
-        else {
+        let (Some(backend), Some(m), Some(p)) = (
+            self.browser.runtimes.selected(),
+            self.selected_model(),
+            self.browser.profiles.selected(),
+        ) else {
             return;
         };
         let runtime = backend.descriptor().name.clone();
@@ -2263,10 +2082,10 @@ impl App {
         let profile = p.clone();
         let base = profiles::resolved_values(backend.as_ref(), &profile, m, &self.config.defaults);
 
-        let cursor = self.options.state.selected();
+        let cursor = self.browser.options.state.selected();
         if let Err(error) = self.store.set_value(&runtime, &model, &profile.name, key, value, &base)
         {
-            self.message = Some(Message {
+            self.modals.message = Some(Message {
                 title: "Profile not saved".into(),
                 lines: vec![
                     error.to_string(),
@@ -2275,17 +2094,19 @@ impl App {
             });
         }
         self.rebuild_below(Pane::Profile);
-        self.options.state.select(cursor);
+        self.browser.options.state.select(cursor);
     }
 
     /// Toggle the favorite flag on the selected profile (real runtimes only).
     fn toggle_favorite(&mut self) {
-        if self.focus != Pane::Profile {
+        if self.browser.focus != Pane::Profile {
             return;
         }
-        let (Some(backend), Some(m), Some(p)) =
-            (self.runtimes.selected(), self.selected_model(), self.profiles.selected())
-        else {
+        let (Some(backend), Some(m), Some(p)) = (
+            self.browser.runtimes.selected(),
+            self.selected_model(),
+            self.browser.profiles.selected(),
+        ) else {
             return;
         };
         let runtime = backend.descriptor().name.clone();
@@ -2293,91 +2114,93 @@ impl App {
         let profile = p.clone();
         let base = profiles::resolved_values(backend.as_ref(), &profile, m, &self.config.defaults);
 
-        let cursor = self.profiles.state.selected();
+        let cursor = self.browser.profiles.state.selected();
         if let Err(error) = self.store.toggle_favorite(&runtime, &model, &profile.name, &base) {
-            self.message = Some(Message {
+            self.modals.message = Some(Message {
                 title: "Favorite not saved".into(),
                 lines: vec![error.to_string()],
             });
         }
         self.rebuild_below(Pane::Model);
-        self.profiles.state.select(cursor);
+        self.browser.profiles.state.select(cursor);
     }
 
     // --- profile management (Profile pane) ---------------------------------
 
     fn prompt_new_profile(&mut self) {
-        if self.focus != Pane::Profile {
+        if self.browser.focus != Pane::Profile {
             return;
         }
-        self.prompt = Some(Prompt {
+        self.modals.set_prompt(Some(Prompt {
             kind: PromptKind::NewProfile,
             title: "New profile".into(),
             buffer: String::new(),
             error: None,
-        });
+        }));
     }
 
     fn prompt_rename_profile(&mut self) {
-        if self.focus != Pane::Profile {
+        if self.browser.focus != Pane::Profile {
             return;
         }
-        let Some(p) = self.profiles.selected() else {
+        let Some(p) = self.browser.profiles.selected() else {
             return;
         };
         if p.builtin {
             return; // built-in templates are read-only
         }
         let old = p.name.clone();
-        self.prompt = Some(Prompt {
+        self.modals.set_prompt(Some(Prompt {
             kind: PromptKind::RenameProfile { old: old.clone() },
             title: format!("Rename {old}"),
             buffer: old,
             error: None,
-        });
+        }));
     }
 
     fn prompt_duplicate_profile(&mut self) {
-        if self.focus != Pane::Profile {
+        if self.browser.focus != Pane::Profile {
             return;
         }
-        let Some(p) = self.profiles.selected() else {
+        let Some(p) = self.browser.profiles.selected() else {
             return;
         };
         let src = p.name.clone();
-        self.prompt = Some(Prompt {
+        self.modals.set_prompt(Some(Prompt {
             kind: PromptKind::DuplicateProfile { src: src.clone() },
             title: format!("Duplicate {src}"),
             buffer: format!("{src} copy"),
             error: None,
-        });
+        }));
     }
 
     /// Delete a custom profile, or reset a built-in to its template defaults.
     fn delete_profile(&mut self) {
-        if self.focus != Pane::Profile {
+        if self.browser.focus != Pane::Profile {
             return;
         }
-        let (Some(backend), Some(m), Some(p)) =
-            (self.runtimes.selected(), self.selected_model(), self.profiles.selected())
-        else {
+        let (Some(backend), Some(m), Some(p)) = (
+            self.browser.runtimes.selected(),
+            self.selected_model(),
+            self.browser.profiles.selected(),
+        ) else {
             return;
         };
         let runtime = backend.descriptor().name.clone();
         let model = m.profile_key();
         let name = p.name.clone();
 
-        let cursor = self.profiles.state.selected().unwrap_or(0);
+        let cursor = self.browser.profiles.state.selected().unwrap_or(0);
         if let Err(error) = self.store.delete(&runtime, &model, &name) {
-            self.message = Some(Message {
+            self.modals.message = Some(Message {
                 title: "Profile deletion failed".into(),
                 lines: vec![error.to_string()],
             });
         }
         self.rebuild_below(Pane::Model);
-        let len = self.profiles.items.len();
+        let len = self.browser.profiles.items.len();
         if len > 0 {
-            self.profiles.state.select(Some(cursor.min(len - 1)));
+            self.browser.profiles.state.select(Some(cursor.min(len - 1)));
             self.rebuild_below(Pane::Profile);
         }
     }
@@ -2385,7 +2208,7 @@ impl App {
     fn commit_new_profile(&mut self, name: &str) -> Result<(), String> {
         self.validate_new_name(name)?;
         let (runtime, model) = self.current_runtime_model().ok_or("no model selected")?;
-        let backend = self.runtimes.selected().ok_or("no runtime selected")?;
+        let backend = self.browser.runtimes.selected().ok_or("no runtime selected")?;
         let m = self.selected_model().ok_or("no model selected")?;
         // Seed from the Default template's resolved values for this model.
         let default = Profile { name: "Default".into(), builtin: true, favorite: false };
@@ -2411,7 +2234,8 @@ impl App {
 
     fn commit_duplicate_profile(&mut self, src: &str, name: &str) -> Result<(), String> {
         self.validate_new_name(name)?;
-        let (Some(backend), Some(m)) = (self.runtimes.selected(), self.selected_model()) else {
+        let (Some(backend), Some(m)) = (self.browser.runtimes.selected(), self.selected_model())
+        else {
             return Err("no model selected".into());
         };
         let runtime = backend.descriptor().name.clone();
@@ -2440,14 +2264,14 @@ impl App {
         if name.is_empty() {
             return Err("name cannot be empty".into());
         }
-        if self.profiles.items.iter().any(|p| p.name.eq_ignore_ascii_case(name)) {
+        if self.browser.profiles.items.iter().any(|p| p.name.eq_ignore_ascii_case(name)) {
             return Err(format!("'{name}' already exists"));
         }
         Ok(())
     }
 
     fn current_runtime_model(&self) -> Option<(String, String)> {
-        let backend = self.runtimes.selected()?;
+        let backend = self.browser.runtimes.selected()?;
         let m = self.selected_model()?;
         Some((backend.descriptor().name.clone(), m.profile_key()))
     }
@@ -2457,8 +2281,8 @@ impl App {
     fn refresh_profiles(&mut self, select: Option<&str>) {
         self.rebuild_below(Pane::Model);
         if let Some(name) = select {
-            if let Some(i) = self.profiles.items.iter().position(|p| p.name == name) {
-                self.profiles.state.select(Some(i));
+            if let Some(i) = self.browser.profiles.items.iter().position(|p| p.name == name) {
+                self.browser.profiles.state.select(Some(i));
                 self.rebuild_below(Pane::Profile);
             }
         }
@@ -2466,14 +2290,15 @@ impl App {
 
     /// The selected catalog leaf. Directory nodes intentionally have no path.
     pub fn selected_model(&self) -> Option<&Model> {
-        self.models.selected().filter(|m| m.is_model())
+        self.browser.models.selected().filter(|m| m.is_model())
     }
 
     /// Whether `d` can start a download for the selection: an online GGUF that
     /// is not cached yet, or a FastFlowLM catalog entry that is not installed.
     pub fn download_available(&self) -> bool {
-        self.focus == Pane::Model
+        self.browser.focus == Pane::Model
             && self
+                .browser
                 .runtimes
                 .selected()
                 .zip(self.selected_model())
@@ -2487,7 +2312,7 @@ impl App {
     /// FastFlowLM tag alike. The footer asks this on every 250 ms redraw, so
     /// the plan itself (which stats every blob) waits until `D` is pressed.
     pub fn delete_available(&self) -> bool {
-        self.focus == Pane::Model
+        self.browser.focus == Pane::Model
             && self.selected_model().is_some_and(|model| !model.path.as_os_str().is_empty())
     }
 
@@ -2495,7 +2320,7 @@ impl App {
     /// stores nothing for it.
     fn deletion_plan(&self) -> Option<Deletion> {
         let model = self.selected_model()?;
-        let backend = self.runtimes.selected()?;
+        let backend = self.browser.runtimes.selected()?;
         backend.deletion(model, self.catalog_source()).filter(|plan| !plan.is_empty())
     }
 
@@ -2505,7 +2330,7 @@ impl App {
     fn prompt_delete_model(&mut self) {
         let Some(model) = self.selected_model().cloned() else { return };
         let Some(plan) = self.deletion_plan() else {
-            self.message = Some(Message {
+            self.modals.message = Some(Message {
                 title: "Nothing to delete".into(),
                 lines: vec![format!("{} is not stored locally.", model.name)],
             });
@@ -2514,24 +2339,25 @@ impl App {
         // Checked against the plan rather than the selection: the same files
         // reach the catalog under more than one identity.
         if let Some(blocker) = self.deletion_blocker(&model, &plan) {
-            self.message = Some(Message { title: "Cannot delete".into(), lines: vec![blocker] });
+            self.modals.message =
+                Some(Message { title: "Cannot delete".into(), lines: vec![blocker] });
             return;
         }
 
         // One line: the model, and what removing it buys back. The paths are
         // llmctl's business, and the size is the only part the user weighs.
         let lines = vec![format!("Remove {} ({}) from disk?", model.name, human_size(plan.bytes))];
-        self.confirm = Some(Confirm {
+        self.modals.set_confirm(Some(Confirm {
             title: "Delete model".into(),
             lines,
             action: ConfirmAction::DeleteModel { model: model.name.clone(), plan },
-        });
+        }));
     }
 
     /// Why the selected model must not be deleted right now: something is using
     /// the very files the deletion would pull out from under it.
     fn deletion_blocker(&self, model: &Model, plan: &Deletion) -> Option<String> {
-        let runtime = self.runtimes.selected()?.descriptor().name.clone();
+        let runtime = self.browser.runtimes.selected()?.descriptor().name.clone();
         // By file wherever a file was recorded: a session stores the catalog
         // name it was launched under, so deleting the same GGUF through its
         // other entry would sail past a name-only check and unlink a model
@@ -2549,7 +2375,7 @@ impl App {
         // materialized files again under a `models:*` one. Deleting through
         // that twin would pull completed shards out from under the transfer,
         // so ask what each is writing instead of what it is called.
-        let live = self.model_downloads.iter().filter(|download| {
+        let live = self.downloads.jobs.iter().filter(|download| {
             matches!(
                 download.status,
                 ModelDownloadStatus::Downloading | ModelDownloadStatus::Cancelling
@@ -2576,7 +2402,8 @@ impl App {
         // would make `d` on the model jump to it and do nothing instead of
         // downloading it again.
         let stale: Vec<(u64, String)> = self
-            .model_downloads
+            .downloads
+            .jobs
             .iter()
             .filter(|download| matches!(download.status, ModelDownloadStatus::Downloaded(_)))
             .filter(|download| plan.overlaps(&download.targets()))
@@ -2588,12 +2415,12 @@ impl App {
                 // Best-effort: a record left behind reappears as a resumable
                 // job, which is a nuisance rather than a hazard.
                 let _ = discovery::online::delete_download_record(&self.models_dir, model_id);
-                self.model_downloads.retain(|download| download.id != *id);
+                self.downloads.jobs.retain(|download| download.id != *id);
             }
             self.sync_session_selection();
         }
         self.reload_catalog_in_place();
-        self.message = Some(match result {
+        self.modals.message = Some(match result {
             Ok(()) => Message {
                 title: "Model removed".into(),
                 lines: vec![format!("{model} deleted from disk, freeing {freed}.")],
@@ -2613,21 +2440,21 @@ impl App {
         self.refresh_selected_catalog(true);
 
         let prefixes: Vec<Vec<String>> =
-            self.catalog_history.iter().map(|(_, _, prefix)| prefix.clone()).collect();
+            self.browser.catalog_history.iter().map(|(_, _, prefix)| prefix.clone()).collect();
         let rebuilt: Vec<Vec<Model>> =
             prefixes.iter().map(|prefix| self.catalog_children(prefix)).collect();
-        for (level, items) in self.catalog_history.iter_mut().zip(rebuilt) {
+        for (level, items) in self.browser.catalog_history.iter_mut().zip(rebuilt) {
             level.0 = items;
         }
 
         let selected = self.selected_model().map(|model| model.id.clone());
-        let cursor = self.models.state.selected().unwrap_or(0);
-        self.models.replace(self.catalog_children(&self.catalog_prefix.clone()));
+        let cursor = self.browser.models.state.selected().unwrap_or(0);
+        self.browser.models.replace(self.catalog_children(&self.browser.catalog_prefix.clone()));
         let restored = selected
-            .and_then(|id| self.models.items.iter().position(|model| model.id == id))
-            .unwrap_or_else(|| cursor.min(self.models.items.len().saturating_sub(1)));
-        if !self.models.items.is_empty() {
-            self.models.state.select(Some(restored));
+            .and_then(|id| self.browser.models.items.iter().position(|model| model.id == id))
+            .unwrap_or_else(|| cursor.min(self.browser.models.items.len().saturating_sub(1)));
+        if !self.browser.models.items.is_empty() {
+            self.browser.models.state.select(Some(restored));
         }
         self.rebuild_below(Pane::Model);
     }
@@ -2639,18 +2466,23 @@ impl App {
     pub fn benchmark_available(&self) -> bool {
         self.selected_model().is_some_and(|model| !model.path.as_os_str().is_empty())
             && self
+                .browser
                 .runtimes
                 .selected()
                 .is_some_and(|backend| backend.descriptor().bench_path.is_some())
     }
 
     pub fn catalog_parent(&self) -> Option<(&[Model], Option<usize>)> {
-        self.catalog_history.last().map(|(items, selected, _)| (items.as_slice(), *selected))
+        self.browser
+            .catalog_history
+            .last()
+            .map(|(items, selected, _)| (items.as_slice(), *selected))
     }
 
     /// The selected runtime always owns its catalog, regardless of capabilities.
     fn catalog_source(&self) -> &[Model] {
-        self.runtimes
+        self.browser
+            .runtimes
             .selected()
             .and_then(|backend| self.catalogs.get(&backend.id()))
             .map(Vec::as_slice)
@@ -2659,7 +2491,7 @@ impl App {
 
     fn sync_online_catalogs(&mut self) {
         self.rebuild_online_catalogs();
-        for backend in &self.runtimes.items {
+        for backend in &self.browser.runtimes.items {
             if backend.supports_online_browse() {
                 if let Some(models) = self.catalogs.get(&backend.id()) {
                     self.store.sync_models(models);
@@ -2669,7 +2501,7 @@ impl App {
     }
 
     fn rebuild_online_catalogs(&mut self) {
-        for backend in &self.runtimes.items {
+        for backend in &self.browser.runtimes.items {
             if !backend.supports_online_browse() {
                 continue;
             }
@@ -2694,7 +2526,8 @@ impl App {
     }
 
     fn refresh_runtime_models(&mut self, id: &RuntimeId, reload: bool) {
-        let Some(backend) = self.runtimes.items.iter().find(|backend| &backend.id() == id) else {
+        let Some(backend) = self.browser.runtimes.items.iter().find(|backend| &backend.id() == id)
+        else {
             return;
         };
         let ctx = CatalogCtx {
@@ -2717,7 +2550,7 @@ impl App {
     }
 
     fn refresh_selected_catalog(&mut self, reload: bool) {
-        if let Some(id) = self.runtimes.selected().map(|backend| backend.id()) {
+        if let Some(id) = self.browser.runtimes.selected().map(|backend| backend.id()) {
             self.refresh_runtime_models(&id, reload);
         }
     }
@@ -2729,107 +2562,81 @@ impl App {
             return;
         }
         self.refresh_selected_catalog(true);
-        self.catalog_history.clear();
-        self.catalog_prefix.clear();
+        self.browser.catalog_history.clear();
+        self.browser.catalog_prefix.clear();
         // Models or anything downstream may have changed; rebuild from runtime.
         self.rebuild_below(Pane::Runtime);
     }
 
     /// Drill into the preview pane, but only if it actually has items.
     fn enter(&mut self) {
-        if self.focus == Pane::Model {
-            let Some(selected) = self.models.selected() else { return };
+        if self.browser.focus == Pane::Model {
+            let Some(selected) = self.browser.models.selected() else { return };
             if selected.is_catalog_dir() {
-                if self.catalog_preview.is_empty() {
+                if !self.browser.enter_directory() {
                     return;
                 }
-                let previous = (
-                    self.models.items.clone(),
-                    self.models.state.selected(),
-                    self.catalog_prefix.clone(),
-                );
-                self.catalog_history.push(previous);
-                self.catalog_prefix = selected.catalog_path.clone();
-                self.models.replace(self.catalog_preview.clone());
                 self.rebuild_below(Pane::Model);
                 self.maybe_fetch_online(false);
-            } else if !self.profiles.is_empty() {
-                self.focus = Pane::Profile;
+            } else if !self.browser.profiles.is_empty() {
+                self.browser.focus = Pane::Profile;
             }
-        } else if self.focus != Pane::Options && !self.preview_is_empty() {
-            self.focus = self.focus.next();
-            if self.focus == Pane::Model {
+        } else if self.browser.focus != Pane::Options && !self.preview_is_empty() {
+            self.browser.focus = self.browser.focus.next();
+            if self.browser.focus == Pane::Model {
                 self.maybe_fetch_online(false);
             }
         }
     }
 
     fn go_back(&mut self) {
-        if self.focus == Pane::Model {
-            if let Some((items, selected, prefix)) = self.catalog_history.pop() {
-                self.catalog_prefix = prefix;
-                self.models.items = items;
-                self.models.state.select(selected);
+        if self.browser.focus == Pane::Model {
+            if self.browser.back_directory() {
                 self.rebuild_below(Pane::Model);
             } else {
-                self.focus = Pane::Runtime;
+                self.browser.focus = Pane::Runtime;
             }
         } else {
-            self.focus = self.focus.prev();
+            self.browser.focus = self.browser.focus.prev();
         }
     }
 
     /// Is the pane immediately right of focus (the preview) empty?
     fn preview_is_empty(&self) -> bool {
-        match self.focus {
-            Pane::Runtime => self.models.is_empty(),
+        match self.browser.focus {
+            Pane::Runtime => self.browser.models.is_empty(),
             Pane::Model => {
                 if self.selected_model().is_some() {
-                    self.profiles.is_empty()
+                    self.browser.profiles.is_empty()
                 } else {
-                    self.catalog_preview.is_empty()
+                    self.browser.catalog_preview.is_empty()
                 }
             }
-            Pane::Profile => self.options.is_empty(),
+            Pane::Profile => self.browser.options.is_empty(),
             Pane::Options => true,
         }
     }
 
     fn move_selection(&mut self, delta: isize) {
-        match self.focus {
-            Pane::Runtime => self.runtimes.move_by(delta),
-            Pane::Model => self.models.move_by(delta),
-            Pane::Profile => self.profiles.move_by(delta),
-            Pane::Options => self.options.move_by(delta),
-        }
-        self.rebuild_below(self.focus);
-        if self.focus == Pane::Model {
+        self.browser.move_selection(delta);
+        self.rebuild_below(self.browser.focus);
+        if self.browser.focus == Pane::Model {
             self.maybe_fetch_online(false);
         }
     }
 
     fn select_first(&mut self) {
-        match self.focus {
-            Pane::Runtime => self.runtimes.select_first(),
-            Pane::Model => self.models.select_first(),
-            Pane::Profile => self.profiles.select_first(),
-            Pane::Options => self.options.select_first(),
-        }
-        self.rebuild_below(self.focus);
-        if self.focus == Pane::Model {
+        self.browser.select_first();
+        self.rebuild_below(self.browser.focus);
+        if self.browser.focus == Pane::Model {
             self.maybe_fetch_online(false);
         }
     }
 
     fn select_last(&mut self) {
-        match self.focus {
-            Pane::Runtime => self.runtimes.select_last(),
-            Pane::Model => self.models.select_last(),
-            Pane::Profile => self.profiles.select_last(),
-            Pane::Options => self.options.select_last(),
-        }
-        self.rebuild_below(self.focus);
-        if self.focus == Pane::Model {
+        self.browser.select_last();
+        self.rebuild_below(self.browser.focus);
+        if self.browser.focus == Pane::Model {
             self.maybe_fetch_online(false);
         }
     }
@@ -2839,49 +2646,52 @@ impl App {
     fn rebuild_below(&mut self, changed: Pane) {
         let level = changed.index();
         if level < Pane::Model.index() {
-            self.catalog_history.clear();
-            self.catalog_prefix.clear();
-            let models = if self.runtimes.selected().is_some() {
+            self.browser.catalog_history.clear();
+            self.browser.catalog_prefix.clear();
+            let models = if self.browser.runtimes.selected().is_some() {
                 self.catalog_children(&[])
             } else {
                 vec![]
             };
-            self.models.replace(models);
+            self.browser.models.replace(models);
         }
         if level < Pane::Profile.index() {
-            self.catalog_preview = match self.models.selected() {
+            self.browser.catalog_preview = match self.browser.models.selected() {
                 Some(m) if m.is_catalog_dir() => self.catalog_children(&m.catalog_path),
                 _ => Vec::new(),
             };
-            let profiles = match (self.runtimes.selected(), self.selected_model()) {
+            let profiles = match (self.browser.runtimes.selected(), self.selected_model()) {
                 (Some(backend), Some(m)) => {
                     profiles::list_profiles(backend.as_ref(), m, &self.store)
                 }
                 _ => Vec::new(),
             };
-            self.profiles.replace(profiles);
+            self.browser.profiles.replace(profiles);
         }
         if level < Pane::Options.index() {
-            let options =
-                match (self.runtimes.selected(), self.selected_model(), self.profiles.selected()) {
-                    (Some(backend), Some(m), Some(p)) => profiles::resolve_options(
-                        backend.as_ref(),
-                        m,
-                        p,
-                        &self.store,
-                        &self.config.defaults,
-                    ),
-                    _ => Vec::new(),
-                };
-            self.options.replace(options);
+            let options = match (
+                self.browser.runtimes.selected(),
+                self.selected_model(),
+                self.browser.profiles.selected(),
+            ) {
+                (Some(backend), Some(m), Some(p)) => profiles::resolve_options(
+                    backend.as_ref(),
+                    m,
+                    p,
+                    &self.store,
+                    &self.config.defaults,
+                ),
+                _ => Vec::new(),
+            };
+            self.browser.options.replace(options);
         }
     }
 
     /// Two-line status bar content for the hovered item: a primary locator
     /// (line 1 — a path) and a secondary metadata summary (line 2).
     pub fn status(&self) -> (String, String) {
-        match self.focus {
-            Pane::Runtime => self.runtimes.selected().map(|backend| {
+        match self.browser.focus {
+            Pane::Runtime => self.browser.runtimes.selected().map(|backend| {
                 let runtime = backend.descriptor();
                 let primary = runtime
                     .binary_path
@@ -2902,7 +2712,7 @@ impl App {
                 }
                 (primary, meta.join(" · "))
             }),
-            Pane::Model => self.models.selected().map(|m| {
+            Pane::Model => self.browser.models.selected().map(|m| {
                 if let Some(remote) = m.remote() {
                     let primary = match &remote.file {
                         Some(file) => format!("hf://{}/{file}", remote.repo),
@@ -2982,12 +2792,12 @@ impl App {
                 }
                 (primary, meta.join(" · "))
             }),
-            Pane::Profile => self.profiles.selected().map(|p| {
+            Pane::Profile => self.browser.profiles.selected().map(|p| {
                 let kind = if p.builtin { "built-in template" } else { "custom profile" };
                 let fav = if p.favorite { " · ★" } else { "" };
                 (p.name.clone(), format!("{kind}{fav}"))
             }),
-            Pane::Options => self.options.selected().map(|o| {
+            Pane::Options => self.browser.options.selected().map(|o| {
                 (o.key.clone(), format!("current {} · default {} · {}", o.value, o.default, o.cli))
             }),
         }
@@ -2998,24 +2808,24 @@ impl App {
     /// for the footer breadcrumb.
     pub fn breadcrumb(&self) -> Vec<String> {
         let mut crumbs = Vec::new();
-        if let Some(r) = self.runtimes.selected() {
+        if let Some(r) = self.browser.runtimes.selected() {
             crumbs.push(r.descriptor().name.clone());
         }
-        if self.focus >= Pane::Model {
-            crumbs.extend(self.catalog_prefix.iter().cloned());
-            if let Some(m) = self.models.selected()
+        if self.browser.focus >= Pane::Model {
+            crumbs.extend(self.browser.catalog_prefix.iter().cloned());
+            if let Some(m) = self.browser.models.selected()
                 && let Some(name) = m.catalog_path.last()
             {
                 crumbs.push(name.clone());
             }
         }
-        if self.focus >= Pane::Profile {
-            if let Some(p) = self.profiles.selected() {
+        if self.browser.focus >= Pane::Profile {
+            if let Some(p) = self.browser.profiles.selected() {
                 crumbs.push(p.name.clone());
             }
         }
-        if self.focus >= Pane::Options {
-            if let Some(o) = self.options.selected() {
+        if self.browser.focus >= Pane::Options {
+            if let Some(o) = self.browser.options.selected() {
                 crumbs.push(o.key.clone());
             }
         }
@@ -3456,7 +3266,7 @@ mod tests {
             SessionManager::without_supervisor(paths.sessions_dir.clone(), paths.log_dir.clone())
         });
         for i in 0..3 {
-            app.runtimes.state.select(Some(i));
+            app.browser.runtimes.state.select(Some(i));
             assert_eq!(app.catalog_source()[0].runtime, format!("runtime-{i}"));
         }
         app.refresh_selected_catalog(true);
@@ -3468,7 +3278,7 @@ mod tests {
         transient.catalog_path = vec!["online".into(), "huggingface".into(), "org/repo".into()];
         app.replace_online_search_results(vec![transient]);
         assert_eq!(app.catalog_source().len(), 1, "online source must not alter a non-Hub catalog");
-        app.runtimes.state.select(Some(0));
+        app.browser.runtimes.state.select(Some(0));
         assert_eq!(app.catalog_source().len(), 2);
         app.clear_online_search_results();
         assert_eq!(app.catalog_source().len(), 1);
@@ -3672,47 +3482,51 @@ mod tests {
 
         let mut app = App::new(Config::default(), paths);
         let flm = app
+            .browser
             .runtimes
             .items
             .iter()
             .position(|b| !b.supports_online_browse())
             .expect("FastFlowLM backend");
-        app.runtimes.state.select(Some(flm));
+        app.browser.runtimes.state.select(Some(flm));
         app.rebuild_below(Pane::Runtime);
-        app.focus = Pane::Model;
+        app.browser.focus = Pane::Model;
 
         assert_eq!(app.catalog_view_label(), Some("Categories"));
-        let categories = app.models.items.len();
+        let categories = app.browser.models.items.len();
         assert!(categories > 0, "Categories view showed nothing");
 
         app.on_key(KeyEvent::from(KeyCode::Char('s')));
 
         assert_eq!(app.catalog_view_label(), Some("Flat"));
-        assert!(!app.models.items.is_empty(), "Flat view showed nothing");
+        assert!(!app.browser.models.items.is_empty(), "Flat view showed nothing");
         // Both arrangements start at the same local/online groups.
-        assert_eq!(app.models.items.len(), categories);
+        assert_eq!(app.browser.models.items.len(), categories);
 
         // And drilling into a group reaches the models themselves.
         app.enter();
-        assert!(app.models.items.iter().any(|m| m.is_model()), "no models under the group");
+        assert!(app.browser.models.items.iter().any(|m| m.is_model()), "no models under the group");
 
         // Select a model, then switch arrangement: the browser must stay on it
         // rather than dropping back to the group list.
-        let index = app.models.items.iter().position(|m| m.is_model()).unwrap();
-        app.models.state.select(Some(index));
+        let index = app.browser.models.items.iter().position(|m| m.is_model()).unwrap();
+        app.browser.models.state.select(Some(index));
         app.rebuild_below(Pane::Model);
         let tag = app.selected_model().unwrap().flm().unwrap().tag.clone();
 
         app.on_key(KeyEvent::from(KeyCode::Char('s')));
         assert_eq!(app.catalog_view_label(), Some("Categories"));
-        assert_eq!(app.focus, Pane::Model, "arrangement switch moved the focus");
+        assert_eq!(app.browser.focus, Pane::Model, "arrangement switch moved the focus");
         assert_eq!(
             app.selected_model().and_then(|m| m.flm()).map(|f| f.tag.clone()),
             Some(tag.clone()),
             "arrangement switch lost the selected model"
         );
         // Still inside a group, not back at the top of the tree.
-        assert!(!app.catalog_prefix.is_empty(), "arrangement switch reset to the group list");
+        assert!(
+            !app.browser.catalog_prefix.is_empty(),
+            "arrangement switch reset to the group list"
+        );
 
         // And back again, from the deeper arrangement to the flatter one.
         app.on_key(KeyEvent::from(KeyCode::Char('s')));
@@ -3727,7 +3541,7 @@ mod tests {
         // the same way if the SIGCHLD disposition is not handled.
         app.refresh_models();
         assert!(!app.catalog_source().is_empty(), "F5 emptied the FastFlowLM catalog");
-        assert!(!app.models.items.is_empty(), "F5 emptied the model pane");
+        assert!(!app.browser.models.items.is_empty(), "F5 emptied the model pane");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3751,25 +3565,26 @@ mod tests {
         paths.ensure_dirs().unwrap();
 
         let mut app = App::new(Config::default(), paths);
-        let flm = app.runtimes.items.iter().position(|b| !b.supports_online_browse()).unwrap();
-        app.runtimes.state.select(Some(flm));
+        let flm =
+            app.browser.runtimes.items.iter().position(|b| !b.supports_online_browse()).unwrap();
+        app.browser.runtimes.state.select(Some(flm));
         app.rebuild_below(Pane::Runtime);
-        app.focus = Pane::Model;
+        app.browser.focus = Pane::Model;
         assert_eq!(app.catalog_view_label(), Some("Categories"));
 
         // Enter `online`, then the `chat` capability folder inside it.
-        let online = app.models.items.iter().position(|m| m.name == "online").unwrap();
-        app.models.state.select(Some(online));
+        let online = app.browser.models.items.iter().position(|m| m.name == "online").unwrap();
+        app.browser.models.state.select(Some(online));
         app.rebuild_below(Pane::Model);
         app.enter();
-        let chat = app.models.items.iter().position(|m| m.name == "chat").unwrap();
-        app.models.state.select(Some(chat));
+        let chat = app.browser.models.items.iter().position(|m| m.name == "chat").unwrap();
+        app.browser.models.state.select(Some(chat));
         app.rebuild_below(Pane::Model);
         app.enter();
-        assert_eq!(app.catalog_prefix, ["online", "chat"]);
+        assert_eq!(app.browser.catalog_prefix, ["online", "chat"]);
 
         // Deselect, so the anchor is the directory rather than a model.
-        app.models.state.select(None);
+        app.browser.models.state.select(None);
         app.rebuild_below(Pane::Model);
         assert!(app.selected_model().is_none());
 
@@ -3777,12 +3592,12 @@ mod tests {
 
         assert_eq!(app.catalog_view_label(), Some("Flat"));
         // Inside `online`, showing models — not back at the group list.
-        assert_eq!(app.catalog_prefix, ["online"]);
+        assert_eq!(app.browser.catalog_prefix, ["online"]);
         assert!(
-            app.models.items.iter().all(|m| m.is_model()),
+            app.browser.models.items.iter().all(|m| m.is_model()),
             "expected the flat model list, got folders"
         );
-        assert!(app.models.items.len() > 1);
+        assert!(app.browser.models.items.len() > 1);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3878,16 +3693,17 @@ mod tests {
         config.models.paths = vec![source.clone()];
         let mut app = App::new(config, paths);
         let llama = app
+            .browser
             .runtimes
             .items
             .iter()
             .position(|backend| backend.supports_online_browse())
             .expect("llama.cpp backend");
-        app.runtimes.state.select(Some(llama));
+        app.browser.runtimes.state.select(Some(llama));
         app.rebuild_below(Pane::Runtime);
-        app.focus = Pane::Model;
+        app.browser.focus = Pane::Model;
         // Walk down to the GGUF leaf, wherever the scan filed it.
-        while app.selected_model().is_none() && !app.models.is_empty() {
+        while app.selected_model().is_none() && !app.browser.models.is_empty() {
             app.on_key(KeyEvent::from(KeyCode::Char('l')));
         }
         assert_eq!(app.selected_model().map(|m| m.name.clone()), Some("test-model.gguf".into()));
@@ -3895,16 +3711,16 @@ mod tests {
 
         // Asked, answered with a stray key: the file stays.
         app.on_key(KeyEvent::from(KeyCode::Char('D')));
-        assert!(app.confirm.is_some(), "D must open a confirmation");
+        assert!(app.modals.confirm().is_some(), "D must open a confirmation");
         app.on_key(KeyEvent::from(KeyCode::Char('x')));
-        assert!(app.confirm.is_none());
+        assert!(app.modals.confirm().is_none());
         assert!(gguf.is_file(), "a stray key must not delete anything");
 
         // Asked, answered yes.
         app.on_key(KeyEvent::from(KeyCode::Char('D')));
         app.on_key(KeyEvent::from(KeyCode::Char('y')));
         assert!(!gguf.exists(), "y must delete the file");
-        assert!(app.message.is_some(), "the outcome is reported");
+        assert!(app.modals.message.is_some(), "the outcome is reported");
 
         let _ = std::fs::remove_dir_all(&root);
     }

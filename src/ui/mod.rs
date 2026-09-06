@@ -81,22 +81,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Screen::Logs => draw_logs(frame, app),
     }
 
-    if app.show_help {
+    if app.modals.help() {
         render_help(frame, frame.area());
     }
-    if let Some(prompt) = &app.prompt {
+    if let Some(prompt) = app.modals.prompt() {
         render_prompt(frame, frame.area(), prompt);
     }
-    if let Some(selector) = &app.selector {
+    if let Some(selector) = app.modals.selector() {
         render_selector(frame, frame.area(), selector);
     }
-    if let Some(search) = &app.model_search {
+    if let Some(search) = app.modals.search() {
         render_model_search(frame, frame.area(), app, search);
     }
-    if let Some(confirm) = &app.confirm {
+    if let Some(confirm) = app.modals.confirm() {
         render_confirm(frame, frame.area(), confirm);
     }
-    if let Some(message) = &app.message {
+    if let Some(message) = &app.modals.message {
         render_message(frame, frame.area(), message);
     }
 }
@@ -144,17 +144,17 @@ fn draw_browser(frame: &mut Frame, app: &mut App) {
     render_header(frame, header, app);
 
     // Parent column: the level above the current one (root is virtual).
-    match app.focus {
+    match app.browser.focus {
         Pane::Runtime => render_root(frame, parent),
         Pane::Model if app.catalog_parent().is_some() => render_catalog_parent(frame, parent, app),
         other => render_list(frame, parent, app, other.prev(), Role::Parent),
     }
 
     // Current column: the focused level.
-    render_list(frame, current, app, app.focus, Role::Current);
+    render_list(frame, current, app, app.browser.focus, Role::Current);
 
     // Preview column: children of the hovered item, or the leaf detail.
-    match app.focus {
+    match app.browser.focus {
         Pane::Runtime => render_list(frame, preview, app, Pane::Model, Role::Preview),
         Pane::Model if app.selected_model().is_none() => {
             render_catalog_preview(frame, preview, app)
@@ -178,12 +178,14 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
     let icon = level_icon(level);
     let items: Vec<ListItem> = match level {
         Pane::Runtime => app
+            .browser
             .runtimes
             .items
             .iter()
             .map(|r| ListItem::new(format!("{icon}  {}", r.descriptor().name)))
             .collect(),
         Pane::Model => app
+            .browser
             .models
             .items
             .iter()
@@ -215,6 +217,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
             })
             .collect(),
         Pane::Profile => app
+            .browser
             .profiles
             .items
             .iter()
@@ -224,6 +227,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
             })
             .collect(),
         Pane::Options => app
+            .browser
             .options
             .items
             .iter()
@@ -257,10 +261,10 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
     let symbol = if focused { "▌ " } else { "  " };
 
     let state = match level {
-        Pane::Runtime => &mut app.runtimes.state,
-        Pane::Model => &mut app.models.state,
-        Pane::Profile => &mut app.profiles.state,
-        Pane::Options => &mut app.options.state,
+        Pane::Runtime => &mut app.browser.runtimes.state,
+        Pane::Model => &mut app.browser.models.state,
+        Pane::Profile => &mut app.browser.profiles.state,
+        Pane::Options => &mut app.browser.options.state,
     };
 
     let list = List::new(items).block(block).highlight_style(highlight).highlight_symbol(symbol);
@@ -288,6 +292,7 @@ fn render_catalog_parent(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_catalog_preview(frame: &mut Frame, area: Rect, app: &App) {
     let items: Vec<ListItem> = app
+        .browser
         .catalog_preview
         .iter()
         .map(|m| {
@@ -322,6 +327,7 @@ fn render_root(frame: &mut Frame, area: Rect) {
 fn render_option_detail(frame: &mut Frame, area: Rect, app: &App) {
     let block = pane_block("Detail", false);
     let text = app
+        .browser
         .options
         .selected()
         .map(|o| {
@@ -377,7 +383,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 /// The hotkeys relevant to the current focus, shown in the footer.
 fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
     let mut keys: Vec<(&str, &str)> = vec![("j/k", "move")];
-    match app.focus {
+    match app.browser.focus {
         Pane::Runtime => {
             keys.push(("l", "enter"));
             keys.push(("/", "search models"));
@@ -404,7 +410,7 @@ fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
         Pane::Profile => {
             // Built-ins are read-only templates: no rename, and `d` resets
             // (drops model-scoped edits) rather than deleting.
-            let builtin = app.profiles.selected().map(|p| p.builtin).unwrap_or(false);
+            let builtin = app.browser.profiles.selected().map(|p| p.builtin).unwrap_or(false);
             keys.push(("h/l", "back/enter"));
             keys.push(("a", "new"));
             if !builtin {
@@ -556,7 +562,7 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
     let (jobs, detail) = session_panes(body);
     // The key handler reads this: with no pane to swap, `l` opens the log full
     // screen rather than doing nothing.
-    app.detail_pane_visible = detail.is_some();
+    app.session_view.detail_pane_visible = detail.is_some();
     let [sessions, downloads] =
         Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(jobs);
     let focused = app.selected_server_session().is_some() || app.async_job_count() == 0;
@@ -564,12 +570,12 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
         frame,
         sessions,
         &app.sessions.sessions,
-        app.session_sel.selected(),
+        app.session_view.selection.selected(),
         focused,
     );
     render_download_list(frame, downloads, app);
     if let Some(detail) = detail {
-        match app.session_pane {
+        match app.session_view.pane {
             // A download has no log, so its facts hold the column either way.
             SessionPane::Log if app.selected_server_session().is_some() => {
                 render_session_log(frame, detail, app.selected_server_session())
@@ -594,7 +600,7 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
             }
         }
     } else {
-        let pane = match app.session_pane {
+        let pane = match app.session_view.pane {
             SessionPane::Detail => ("l", "log"),
             SessionPane::Log => ("l", "detail"),
         };
@@ -916,7 +922,7 @@ fn render_download_list(frame: &mut Frame, area: Rect, app: &App) {
     // Borders consume two columns and the selected-row marker consumes two
     // more. Reserve the progress suffix, then retain the filename tail.
     let row_width = area.width.saturating_sub(4) as usize;
-    let items = app.model_downloads.iter().map(|download| {
+    let items = app.downloads.jobs.iter().map(|download| {
         let suffix = match &download.status {
             ModelDownloadStatus::Downloading => "",
             ModelDownloadStatus::Cancelling => "  cancelling",
@@ -937,10 +943,11 @@ fn render_download_list(frame: &mut Frame, area: Rect, app: &App) {
     });
 
     let selected = app
-        .session_sel
+        .session_view
+        .selection
         .selected()
         .and_then(|index| index.checked_sub(app.sessions.sessions.len()))
-        .filter(|index| *index < app.model_downloads.len());
+        .filter(|index| *index < app.downloads.jobs.len());
     let mut state = ListState::default();
     state.select(selected);
     let list = List::new(items)
@@ -1137,12 +1144,13 @@ fn draw_logs(frame: &mut Frame, app: &mut App) {
             .areas(frame.area());
 
     let name = app
-        .session_sel
+        .session_view
+        .selection
         .selected()
         .and_then(|i| app.sessions.sessions.get(i))
         .map(|s| s.record.name.clone())
         .unwrap_or_default();
-    let follow = if app.log_follow { "  [tailing]" } else { "" };
+    let follow = if app.session_view.log_follow { "  [tailing]" } else { "" };
     let title = Line::from(vec![
         Span::styled(format!(" {ICON_LOG}  Logs — {name}"), Style::default().fg(ACCENT).bold()),
         Span::styled(follow.to_string(), Style::default().fg(Color::Green)),
@@ -1151,15 +1159,21 @@ fn draw_logs(frame: &mut Frame, app: &mut App) {
 
     let block = pane_block("Output", true);
     let inner_height = body.height.saturating_sub(2); // borders
-    let total = app.log_lines.len() as u16;
+    let total = app.session_view.log_lines.len() as u16;
     let max_scroll = total.saturating_sub(inner_height);
-    let scroll = if app.log_follow { max_scroll } else { app.log_scroll.min(max_scroll) };
-    app.log_scroll = scroll; // keep state clamped/in-sync
+    let scroll = if app.session_view.log_follow {
+        max_scroll
+    } else {
+        app.session_view.log_scroll.min(max_scroll)
+    };
+    app.session_view.log_scroll = scroll; // keep state clamped/in-sync
 
-    let text = if app.log_lines.is_empty() {
+    let text = if app.session_view.log_lines.is_empty() {
         Text::from(Line::from("(log is empty)".dim()))
     } else {
-        Text::from(app.log_lines.iter().map(|l| Line::raw(l.clone())).collect::<Vec<_>>())
+        Text::from(
+            app.session_view.log_lines.iter().map(|l| Line::raw(l.clone())).collect::<Vec<_>>(),
+        )
     };
     frame.render_widget(Paragraph::new(text).block(block).scroll((scroll, 0)), body);
 

@@ -191,3 +191,12 @@ a `ModelSource` (GGUF with optional remote identity, or FastFlowLM). Only the
 compatibility DTO in `domain/wire.rs` interprets legacy empty paths and optional
 identity fields. `LaunchContext::new` rejects directory entries. Serialized
 scan caches retain their original flat format and profile keys are unchanged.
+
+## Application state owners
+
+`App` coordinates effects across `BrowserState` (lists, selection, directory
+history), `DownloadManager` (jobs, cancellation, attempt IDs, worker events),
+`SessionViewState` (jobs cursor and log presentation), and `Modals` (one active
+input dialog plus an independent notification). These live under `app/` in
+separate modules. Navigation and transfer transitions are tested without a TUI,
+network requests, real inference binaries, or process-wide signal changes.
