@@ -359,8 +359,7 @@ impl App {
             runtimes.iter().map(|backend| (backend.id(), backend.models(&catalog_ctx))).collect();
         let all_models: Vec<_> = catalogs.values().flatten().cloned().collect();
         let store = ProfileStore::load(paths.state_dir.join("profiles.json"), &all_models);
-        // Built after discovery's one-shot `Command`s: the supervisor ignores
-        // SIGCHLD, which would otherwise prevent reaping those probe processes.
+        // Runtime discovery completes before the first frame is drawn.
         let sessions = sessions(&paths);
 
         let (online_tx, online_rx) = mpsc::channel();
@@ -3128,9 +3127,7 @@ fn option_value(options: &[OptionItem], key: &str) -> Option<String> {
     options.iter().find(|o| o.key == key).map(|o| o.value.clone())
 }
 
-/// Hand the terminal to a foreground tool, then re-enter the TUI. The detached
-/// session supervisor sets `SIGCHLD` to `SIG_IGN`, which would make `wait()`
-/// fail, so default disposition is restored while the tool runs.
+/// Hand the terminal to a foreground tool, then re-enter the TUI.
 fn run_foreground(terminal: &mut DefaultTerminal, argv: &[String], label: &str) -> Result<()> {
     use std::process::Command as StdCommand;
     let Some((prog, args)) = argv.split_first() else {
@@ -3138,10 +3135,7 @@ fn run_foreground(terminal: &mut DefaultTerminal, argv: &[String], label: &str) 
     };
 
     ratatui::restore(); // leave the alternate screen + raw mode
-    // SAFETY: setting a signal disposition is async-signal-safe and unconditional.
-    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
     let status = StdCommand::new(prog).args(args).status();
-    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
 
     if let Err(e) = &status {
         eprintln!("\n[llmctl] failed to start {label}: {e}");
@@ -3626,8 +3620,7 @@ mod tests {
             "switching back lost the selected model"
         );
 
-        // F5 re-reads the catalog through the same subprocess path, so it fails
-        // the same way if the SIGCHLD disposition is not handled.
+        // F5 also refreshes the catalog through a background subprocess.
         app.refresh_models();
         finish_catalogs(&mut app);
         assert!(!app.catalog_source().is_empty(), "F5 emptied the FastFlowLM catalog");

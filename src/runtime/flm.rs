@@ -27,7 +27,6 @@ use crate::profiles::templates::Template;
 use crate::runtime::{CatalogCtx, Deletion, LaunchContext, RuntimeBackend, tree_bytes};
 use crate::session::command::Command;
 use crate::session::record::{DownloadBlob, DownloadRecord};
-use crate::session::supervisor;
 use crate::session::throughput::{Phase, Sample};
 
 pub const NAME: &str = "FastFlowLM";
@@ -605,13 +604,8 @@ fn strip_preamble(output: &str) -> &str {
 }
 
 /// Run `flm <args…>` and return stdout with the banner stripped.
-///
-/// Goes through [`supervisor::output`] because the catalog is re-read while
-/// llmctl is running — after the session supervisor has set `SIGCHLD` to
-/// `SIG_IGN`, which would otherwise make every one of these calls fail to reap
-/// and come back empty.
 fn run(binary: &Path, args: &[&str]) -> Option<String> {
-    let output = supervisor::output(ProcCommand::new(binary).args(args)).ok()?;
+    let output = ProcCommand::new(binary).args(args).output().ok()?;
     if !output.status.success() {
         debug!(?args, status = ?output.status, "flm invocation failed");
         return None;
@@ -1453,12 +1447,7 @@ mod tests {
     /// wait for `/v1/models` to answer, confirm llmctl tracked the *server*
     /// process rather than any launcher wrapper in front of it, then stop it and
     /// confirm the process is really gone.
-    ///
-    /// Must run single-threaded: constructing a `SessionManager` sets `SIGCHLD`
-    /// to `SIG_IGN` process-wide (see `DetachedSupervisor::new`), which makes
-    /// any concurrent `Command::output()` — and therefore any concurrent
-    /// discovery — fail to reap its child. `App::new` respects the same ordering
-    /// by discovering runtimes before it builds the manager.
+    /// Run single-threaded because the NPU admits only one client.
     #[test]
     #[ignore = "launches a real NPU server; run with --ignored --test-threads=1"]
     fn launch_lifecycle_on_the_npu() {
@@ -1653,12 +1642,7 @@ mod tests {
         // The scratch file is gone and flm accepts the model.
         assert!(!partial.exists(), "the partial file outlived the download");
         let binary = backend.descriptor().binary_path.clone().unwrap();
-        // Via the supervisor helper: an earlier test in the same (single-threaded)
-        // run may have set SIGCHLD to SIG_IGN, which makes a bare `output()` fail
-        // to reap. See `session::supervisor::with_default_sigchld`.
-        let check =
-            crate::session::supervisor::output(ProcCommand::new(&binary).args(["check", &tag]))
-                .unwrap();
+        let check = ProcCommand::new(&binary).args(["check", &tag]).output().unwrap();
         assert!(check.status.success(), "flm check rejected the downloaded model");
         assert!(
             backend.catalog().iter().any(|e| e.name == tag && e.installed),

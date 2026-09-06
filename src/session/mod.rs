@@ -342,18 +342,11 @@ impl SessionManager {
     }
 
     /// A manager whose supervisor never spawns, for tests about bookkeeping.
-    ///
-    /// Constructing a [`DetachedSupervisor`] sets `SIGCHLD` to `SIG_IGN` for the
-    /// whole process, so any test that merely wants a `SessionManager` struct
-    /// breaks child reaping for whatever else `cargo test` is running in
-    /// parallel at that moment — `Command::output` fails, `Command::spawn`
-    /// panics. Tests that do need real processes are `#[ignore]`d and run
-    /// single-threaded; these take a supervisor that touches no signals.
     #[cfg(test)]
     pub(crate) fn without_supervisor(dir: PathBuf, log_dir: PathBuf) -> Self {
         struct NeverSpawns;
         impl SessionSupervisor for NeverSpawns {
-            fn spawn(&self, _spec: &LaunchSpec) -> Result<supervisor::Spawned> {
+            fn spawn(&mut self, _spec: &LaunchSpec) -> Result<supervisor::Spawned> {
                 Err(anyhow!("this test's supervisor does not spawn"))
             }
             fn stop(&self, _pid: i32) -> Result<()> {
@@ -563,6 +556,7 @@ impl SessionManager {
     }
 
     pub fn poll_health(&mut self) {
+        self.supervisor.reap();
         for (key, health) in self.health_checks.poll() {
             if health != Health::Ready {
                 continue;
@@ -719,6 +713,7 @@ impl SessionManager {
     /// A session that stays `Restarting` is one whose old process will not die;
     /// that is reported by showing it, not by inventing an outcome.
     pub fn poll_restarts(&mut self) -> Vec<String> {
+        self.supervisor.reap();
         let mut errors = Vec::new();
         for idx in 0..self.sessions.len() {
             let Some((old_pid, kill_at, escalated)) = self.sessions[idx]
@@ -914,7 +909,7 @@ mod tests {
     fn a_failed_record_write_keeps_the_launched_session_manageable() {
         struct FakeSpawner;
         impl SessionSupervisor for FakeSpawner {
-            fn spawn(&self, _: &LaunchSpec) -> Result<supervisor::Spawned> {
+            fn spawn(&mut self, _: &LaunchSpec) -> Result<supervisor::Spawned> {
                 Ok(supervisor::Spawned { pid: i32::MAX })
             }
             fn stop(&self, _: i32) -> Result<()> {
@@ -1114,9 +1109,8 @@ mod tests {
 
     /// Full pipeline against a real HTTP server that answers `/health` with 200:
     /// launch → Starting/Running → rediscover (new manager) → stop → Stopped →
-    /// remove. Ignored by default (spawns processes); run with `--ignored`.
+    /// remove. Uses a local Python HTTP server.
     #[test]
-    #[ignore = "spawns real processes; run with --ignored"]
     fn launch_lifecycle_with_fake_server() {
         use std::thread::sleep;
         use std::time::Duration;
@@ -1228,7 +1222,6 @@ mod tests {
     /// alive: on the AMD NPU the second process loses the race for the hardware
     /// context, and on any runtime it can be pushed off its own port.
     #[test]
-    #[ignore = "spawns real processes; run with --ignored --test-threads=1"]
     fn restart_waits_for_the_old_process_before_respawning() {
         use std::thread::sleep;
         use std::time::Duration;
@@ -1291,7 +1284,6 @@ mod tests {
 
     /// With nothing left alive to wait for, the first poll respawns immediately.
     #[test]
-    #[ignore = "spawns real processes; run with --ignored --test-threads=1"]
     fn restarting_a_dead_session_respawns_on_the_first_poll() {
         use std::thread::sleep;
         use std::time::Duration;
@@ -1345,8 +1337,7 @@ mod tests {
     /// A replacement that cannot be spawned at all reports the failure instead
     /// of leaving the session stuck in `Restarting`. The refusal comes from the
     /// supervisor here rather than from a real failed exec — that path is
-    /// covered by the `#[ignore]`d restart tests, which get a process to
-    /// themselves.
+    /// covered by the supervisor tests.
     #[test]
     fn a_replacement_that_cannot_spawn_is_reported() {
         let base = std::env::temp_dir().join(format!("llmctl-restart-bad-{}", std::process::id()));

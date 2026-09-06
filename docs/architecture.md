@@ -84,7 +84,7 @@ state.
     bool flags emitted only when on, local model via `-m`, remote model via
     `--hf-repo` and `--hf-file`).
   - `supervisor.rs` — `SessionSupervisor` trait + `DetachedSupervisor` (`setsid`
-    pre-exec, stdio→log file, `SIGCHLD` auto-reap, `kill(-pgid, …)`); plus the
+    pre-exec, stdio→log file, owned `Child` handles and nonblocking reaping, `kill(-pgid, …)`); plus the
     OSC 52 base64 helper used for clipboard yank.
   - `record.rs` — `SessionRecord` persisted as `session-<id>.json`; load/prune.
   - `proc.rs` — `/proc` liveness, cmdline match (PID-reuse guard), RSS, CPU%.
@@ -148,7 +148,10 @@ a default never exceeds what the model supports.
 Lifecycle is hidden behind a `SessionSupervisor` trait. The MVP
 `DetachedSupervisor` spawns `llama-server` via `setsid()` in its own session/
 process group (survives TUI exit, ignores tty signals), redirects stdio to a
-per-session log file, and ignores `SIGCHLD` so detached children are auto-reaped.
+per-session log file. It retains each `Child` and reaps exited children with
+`try_wait` during session polling, without changing signal dispositions.
+Dropping a manager transfers outstanding waits to background threads; it never
+kills detached servers, and process exit reparents servers still running.
 Each launch writes `session-<id>.json` (id, name, pid, host, port, full argv,
 model/profile, log path, optional Hub download blobs, start time). On startup `SessionManager::rediscover`
 keeps sessions whose PID is alive *and* whose `/proc/<pid>/cmdline` still
@@ -167,10 +170,11 @@ can implement the same trait. See ADR-005 and ADR-007.
 - **Unit tests** for pure logic: option resolution, validation, adjust/clamp/
   cycle, extremes, model-aware ctx-size, command building, session
   naming/uptime, port resolution, OSC 52 base64.
-- **`#[ignore]` integration tests** in `session/` that spawn real processes
-  (a `sleep`, and a fake `/health` server) to exercise the actual spawn →
-  liveness → signal path and the full launch → Running → rediscover → stop
-  lifecycle. Run with `cargo test -- --ignored`.
+- **Local integration tests** in `session/` use `sleep`, `sh`, and a Python
+  HTTP server to exercise spawn, reaping, concurrent output capture, and the
+  full launch → Running → rediscover → stop lifecycle in the default suite.
+  Installed inference binaries, hardware, and downloads remain opt-in tests:
+  run with `cargo test -- --ignored --test-threads=1`.
 - **PTY smoke tests** for the TUI via a Python driver (per-key delays; the pty
   must be given a window size via `TIOCSWINSZ` or crossterm renders blank).
   Multi-byte escape sequences (Home/End/arrows) are split by the driver, so
@@ -213,6 +217,6 @@ Startup discovery still runs before the event loop.
 
 Log tails enforce a 256 KiB read budget at the reader, buffer partial lines up
 to 64 KiB, and discard oversized lines through their next newline. Device/inode
-identity detects replacements even when the new log is larger. Until explicit
-child ownership lands, subprocess capture and detached spawning serialize the
-legacy SIGCHLD disposition changes with a mutex and unwind-safe restoration.
+identity detects replacements even when the new log is larger. Catalog workers
+use standard subprocess output capture; child ownership keeps these independent
+of detached server lifecycle management.

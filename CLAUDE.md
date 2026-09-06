@@ -105,26 +105,16 @@ legacy profile migration), `~/.cache/llmctl/` (models.json, llama-server.help.tx
   via a PTY driver (`$CLAUDE_JOB_DIR/tmp/drive.py`); per-key delays matter, and
   escape sequences (Home/End/arrows) get split by the driver — rely on unit tests
   for those.
-- Tests needing real binaries, hardware, or spawned processes are `#[ignore]`d
-  with a reason and run via `cargo test -- --ignored --test-threads=1` (see the
-  FastFlowLM discovery and launch-lifecycle tests in `src/runtime/flm.rs`).
-  **Single-threaded is required:** building a `SessionManager` sets `SIGCHLD` to
-  `SIG_IGN` process-wide, which makes any concurrent `Command::output()` fail to
-  reap its child. The same ordering constraint is why `App::new` discovers
-  runtimes before constructing the manager — and why a test that only needs the
-  struct takes `SessionManager::without_supervisor`, which touches no signals.
-  Never construct the real supervisor from a test that runs in the default
-  (parallel) suite.
-- Reading a subprocess's output at runtime must go through
-  `session::supervisor::output`. The supervisor sets `SIGCHLD` to `SIG_IGN` so
-  detached servers self-reap, which makes a plain `Command::output()` fail to
-  `wait()` — silently, if the caller treats an error as "no output". The same
-  trap bites `Command::spawn()`, which *panics* when exec fails because it reaps
-  the failed child to read its errno; `DetachedSupervisor::spawn` wraps it in
-  `supervisor::with_default_sigchld` for that reason. Anything in std that waits
-  on a child belongs inside that helper. This applies to tests too — a
-  single-threaded `--ignored` run inherits the disposition from whichever test
-  built a `SessionManager` first.
+- Tests needing installed inference binaries, hardware, or downloads are
+  `#[ignore]`d with a reason and run via
+  `cargo test -- --ignored --test-threads=1`. The NPU admits one client at a time.
+  Local process lifecycle tests using `sleep` and a Python HTTP server run in
+  the default suite. Bookkeeping tests use `SessionManager::without_supervisor`.
+- The supervisor owns its `Child` handles and reaps only those children through
+  `try_wait`; it never changes the process-wide SIGCHLD disposition. Subprocess
+  discovery and foreground commands use standard `Command::output`/`status`.
+  Dropping a supervisor transfers remaining waits to background threads without
+  killing servers; exiting llmctl leaves detached servers running.
 - Logs go to a **file** under the state dir, never stderr (it corrupts the TUI).
 - Keep `domain/` IO-free. Discovery/process/IO lives in `discovery/`, `runtime/`,
   `profiles/`, and `session/`.

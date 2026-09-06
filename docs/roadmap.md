@@ -308,7 +308,7 @@ Later branches build on the previous step; merge in this order.
 4. Catalog entries and model-source types — implemented on `feature/model-states`.
 5. Smaller application state owners and modal state — implemented on `feature/app-state`.
 6. Background readiness/scans and bounded log reads — implemented on `feature/background-refresh`.
-7. Explicit child ownership instead of global SIGCHLD policy.
+7. Explicit child ownership instead of global SIGCHLD policy — implemented on `feature/child-ownership`.
 8. Command/option API cleanup, Clippy, and documentation.
 
 ## Next (post-v0.3.1)
