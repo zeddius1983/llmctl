@@ -4,6 +4,7 @@ mod app;
 mod config;
 mod discovery;
 mod domain;
+mod persistence;
 mod profiles;
 mod runtime;
 mod session;

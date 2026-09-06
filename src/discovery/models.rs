@@ -89,32 +89,31 @@ pub fn scan(sources: &[ModelSource], cache_path: &Path) -> Vec<Model> {
             model.shard_paths = shard_paths(path);
             model.id = format!("{}:{}", source.name, catalog::short_hash(path));
             model.catalog_path = catalog::catalog_path(source, path, &model.name);
-            if let Some(existing) = catalog_paths.get(&model.catalog_path) {
-                if existing != path {
-                    if catalog::resolved_layout(source, path)
-                        == crate::config::ModelLayout::HuggingFace
-                    {
-                        let old_modified = models
-                            .iter()
-                            .find(|m| m.catalog_path == model.catalog_path)
-                            .and_then(|m| m.modified)
-                            .unwrap_or(0);
-                        if !prefer_huggingface_candidate(
-                            source,
-                            path,
-                            modified,
-                            existing,
-                            Some(old_modified),
-                        ) {
-                            fresh.insert(key, model);
-                            continue;
-                        }
-                        models.retain(|m| m.catalog_path != model.catalog_path);
-                    } else {
-                        if let Some(last) = model.catalog_path.last_mut() {
-                            last.push('-');
-                            last.push_str(&catalog::short_hash(path));
-                        }
+            if let Some(existing) = catalog_paths.get(&model.catalog_path)
+                && existing != path
+            {
+                if catalog::resolved_layout(source, path) == crate::config::ModelLayout::HuggingFace
+                {
+                    let old_modified = models
+                        .iter()
+                        .find(|m| m.catalog_path == model.catalog_path)
+                        .and_then(|m| m.modified)
+                        .unwrap_or(0);
+                    if !prefer_huggingface_candidate(
+                        source,
+                        path,
+                        modified,
+                        existing,
+                        Some(old_modified),
+                    ) {
+                        fresh.insert(key, model);
+                        continue;
+                    }
+                    models.retain(|m| m.catalog_path != model.catalog_path);
+                } else {
+                    if let Some(last) = model.catalog_path.last_mut() {
+                        last.push('-');
+                        last.push_str(&catalog::short_hash(path));
                     }
                 }
             }
@@ -161,7 +160,7 @@ pub fn scan(sources: &[ModelSource], cache_path: &Path) -> Vec<Model> {
 
     resolve_prefix_collisions(&mut models);
     save_cache(cache_path, &Cache { schema: CACHE_SCHEMA, models: fresh });
-    models.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    models.sort_by_cached_key(|model| model.name.to_lowercase());
     models
 }
 
@@ -244,6 +243,9 @@ fn build_model(path: &Path, size: u64, modified: Option<u64>) -> Model {
         .or_else(|| info.as_ref().and_then(|i| i.file_type_label.clone()));
 
     Model {
+        entry: crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf {
+            remote: None,
+        }),
         id: String::new(),
         name,
         path: path.to_path_buf(),
@@ -261,9 +263,7 @@ fn build_model(path: &Path, size: u64, modified: Option<u64>) -> Model {
         context_length: info.as_ref().and_then(|i| i.context_length),
         modified,
         has_chat_template: info.as_ref().map(|i| i.has_chat_template).unwrap_or(false),
-        flm: None,
         runtime: crate::runtime::llama_cpp::NAME.into(),
-        remote: None,
     }
 }
 
@@ -513,6 +513,9 @@ mod tests {
 
     fn model(id: &str, path: &str, catalog_path: &[&str]) -> Model {
         Model {
+            entry: crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf {
+                remote: None,
+            }),
             id: id.into(),
             name: Path::new(path).file_name().unwrap().to_string_lossy().into_owned(),
             path: path.into(),
@@ -530,9 +533,7 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
-            flm: None,
             runtime: crate::runtime::llama_cpp::NAME.into(),
-            remote: None,
         }
     }
 

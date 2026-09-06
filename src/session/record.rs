@@ -65,25 +65,18 @@ impl SessionRecord {
     }
 
     /// Write (or overwrite) the record's JSON file under `dir`.
-    pub fn save(&self, dir: &Path) {
-        let path = self.file_in(dir);
-        match serde_json::to_vec_pretty(self) {
-            Ok(bytes) => {
-                if let Err(err) = std::fs::write(&path, bytes) {
-                    warn!(path = %path.display(), %err, "failed to write session record");
-                }
-            }
-            Err(err) => warn!(%err, "failed to serialize session record"),
-        }
+    pub fn save(&self, dir: &Path) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        crate::persistence::write_atomic(&self.file_in(dir), &bytes)
     }
 
     /// Remove the record's JSON file (session ended / pruned).
     pub fn delete(&self, dir: &Path) {
         let path = self.file_in(dir);
-        if let Err(err) = std::fs::remove_file(&path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                warn!(path = %path.display(), %err, "failed to remove session record");
-            }
+        if let Err(err) = std::fs::remove_file(&path)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %path.display(), %err, "failed to remove session record");
         }
     }
 

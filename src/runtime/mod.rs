@@ -15,6 +15,7 @@ pub mod llama_cpp;
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
@@ -28,6 +29,26 @@ use crate::session::record::DownloadRecord;
 
 pub use flm::FlmBackend;
 pub use llama_cpp::LlamaCppBackend;
+
+/// Stable persistence/catalog identity, independent of selection and ordering.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RuntimeId(pub String);
+
+/// Worker entry point for a backend-owned model transfer.
+pub type TransferWorker = fn(
+    &Model,
+    &std::sync::atomic::AtomicBool,
+    &mut dyn FnMut(u64, u64),
+) -> Result<crate::discovery::online::DownloadResult>;
+
+/// A backend-owned transfer that can run on a worker without borrowing App.
+#[derive(Clone)]
+pub struct ModelTransfer {
+    pub runtime: RuntimeId,
+    pub model: Box<Model>,
+    pub targets: Vec<PathBuf>,
+    pub run: TransferWorker,
+}
 
 /// The filesystem context a backend needs to enumerate its models.
 pub struct CatalogCtx<'a> {
@@ -58,8 +79,25 @@ pub struct CatalogCtx<'a> {
 /// their own model metadata (`Model::flm`, `Model::remote`, …) for the rest.
 pub struct LaunchContext<'a> {
     pub binary: &'a str,
-    pub model: &'a Model,
+    model: &'a Model,
     pub options: &'a [OptionItem],
+}
+
+impl<'a> LaunchContext<'a> {
+    pub fn new(
+        binary: &'a str,
+        model: &'a Model,
+        options: &'a [OptionItem],
+    ) -> std::result::Result<Self, String> {
+        if model.is_catalog_dir() {
+            return Err("select a model rather than a catalog directory".into());
+        }
+        Ok(Self { binary, model, options })
+    }
+
+    pub fn model(&self) -> &'a Model {
+        self.model
+    }
 }
 
 /// A directory that is worth nothing once the directories it depends on are
@@ -234,6 +272,18 @@ pub(crate) fn tree_bytes(dir: &Path) -> u64 {
 
 /// One inference runtime: discovery result plus its dialect and behavior.
 pub trait RuntimeBackend: Send + Sync {
+    /// Stable identifier used for catalogs and persisted profiles.
+    fn id(&self) -> RuntimeId;
+
+    /// A transfer managed by this backend, if the model is not installed.
+    fn model_transfer(&self, _model: &Model) -> Option<ModelTransfer> {
+        None
+    }
+
+    fn download_available(&self, model: &Model) -> bool {
+        self.model_transfer(model).is_some()
+    }
+
     /// Identity and probe result, rendered in the Runtime column.
     fn descriptor(&self) -> &Runtime;
 
@@ -390,7 +440,8 @@ pub trait RuntimeBackend: Send + Sync {
 pub fn templates_for(runtime: &str) -> &'static [Template] {
     match runtime {
         flm::NAME => flm::TEMPLATES,
-        _ => llama_cpp::TEMPLATES,
+        llama_cpp::NAME => llama_cpp::TEMPLATES,
+        _ => &[],
     }
 }
 
@@ -404,7 +455,8 @@ pub fn templates_for(runtime: &str) -> &'static [Template] {
 pub fn throughput_parser(runtime: &str) -> fn(&str) -> Vec<crate::session::throughput::Sample> {
     match runtime {
         flm::NAME => flm::parse_throughput,
-        _ => llama_cpp::parse_throughput,
+        llama_cpp::NAME => llama_cpp::parse_throughput,
+        _ => |_| Vec::new(),
     }
 }
 
@@ -420,10 +472,10 @@ pub(crate) fn resolve_binary(binary: &str) -> Option<std::path::PathBuf> {
 }
 
 /// Probe every known runtime, in display order.
-pub fn discover(config: &Config, paths: &Paths) -> Vec<Box<dyn RuntimeBackend>> {
+pub fn discover(config: &Config, paths: &Paths) -> Vec<Arc<dyn RuntimeBackend>> {
     vec![
-        Box::new(LlamaCppBackend::discover(&config.runtime.llama_cpp, &paths.cache_dir)),
-        Box::new(FlmBackend::discover(&config.runtime.fastflowlm)),
+        Arc::new(LlamaCppBackend::discover(&config.runtime.llama_cpp, &paths.cache_dir)),
+        Arc::new(FlmBackend::discover(&config.runtime.fastflowlm)),
     ]
 }
 
@@ -453,7 +505,7 @@ mod tests {
             trees: vec![tree.clone()],
             ..Deletion::default()
         };
-        assert!(plan.overlaps(&[blob.clone()]));
+        assert!(plan.overlaps(std::slice::from_ref(&blob)));
         // The same blob spelled with a traversal is the same file.
         assert!(plan.overlaps(&[blobs.join("..").join("blobs").join("aa")]));
         // Anything inside a tree the plan removes counts too.
@@ -478,7 +530,11 @@ mod tests {
 
         let plain = root.join("plain.gguf");
         std::fs::write(&plain, vec![0u8; 100]).unwrap();
-        assert_eq!(freed_bytes(&[plain.clone()]), 100, "a file with one name frees its length");
+        assert_eq!(
+            freed_bytes(std::slice::from_ref(&plain)),
+            100,
+            "a file with one name frees its length"
+        );
         // Spelling it twice does not free it twice.
         assert_eq!(freed_bytes(&[plain.clone(), root.join(".").join("plain.gguf")]), 100);
 
@@ -486,7 +542,11 @@ mod tests {
         let other_name = root.join("also-shared.gguf");
         std::fs::write(&shared, vec![0u8; 400]).unwrap();
         std::fs::hard_link(&shared, &other_name).unwrap();
-        assert_eq!(freed_bytes(&[shared.clone()]), 0, "the contents survive under the other name");
+        assert_eq!(
+            freed_bytes(std::slice::from_ref(&shared)),
+            0,
+            "the contents survive under the other name"
+        );
         assert_eq!(
             freed_bytes(&[shared.clone(), other_name.clone()]),
             400,

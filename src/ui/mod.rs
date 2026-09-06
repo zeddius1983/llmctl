@@ -81,22 +81,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Screen::Logs => draw_logs(frame, app),
     }
 
-    if app.show_help {
+    if app.modals.help() {
         render_help(frame, frame.area());
     }
-    if let Some(prompt) = &app.prompt {
+    if let Some(prompt) = app.modals.prompt() {
         render_prompt(frame, frame.area(), prompt);
     }
-    if let Some(selector) = &app.selector {
+    if let Some(selector) = app.modals.selector() {
         render_selector(frame, frame.area(), selector);
     }
-    if let Some(search) = &app.model_search {
+    if let Some(search) = app.modals.search() {
         render_model_search(frame, frame.area(), app, search);
     }
-    if let Some(confirm) = &app.confirm {
+    if let Some(confirm) = app.modals.confirm() {
         render_confirm(frame, frame.area(), confirm);
     }
-    if let Some(message) = &app.message {
+    if let Some(message) = &app.modals.message {
         render_message(frame, frame.area(), message);
     }
 }
@@ -144,17 +144,17 @@ fn draw_browser(frame: &mut Frame, app: &mut App) {
     render_header(frame, header, app);
 
     // Parent column: the level above the current one (root is virtual).
-    match app.focus {
+    match app.browser.focus {
         Pane::Runtime => render_root(frame, parent),
         Pane::Model if app.catalog_parent().is_some() => render_catalog_parent(frame, parent, app),
         other => render_list(frame, parent, app, other.prev(), Role::Parent),
     }
 
     // Current column: the focused level.
-    render_list(frame, current, app, app.focus, Role::Current);
+    render_list(frame, current, app, app.browser.focus, Role::Current);
 
     // Preview column: children of the hovered item, or the leaf detail.
-    match app.focus {
+    match app.browser.focus {
         Pane::Runtime => render_list(frame, preview, app, Pane::Model, Role::Preview),
         Pane::Model if app.selected_model().is_none() => {
             render_catalog_preview(frame, preview, app)
@@ -178,18 +178,20 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
     let icon = level_icon(level);
     let items: Vec<ListItem> = match level {
         Pane::Runtime => app
+            .browser
             .runtimes
             .items
             .iter()
             .map(|r| ListItem::new(format!("{icon}  {}", r.descriptor().name)))
             .collect(),
         Pane::Model => app
+            .browser
             .models
             .items
             .iter()
             .map(|m| {
                 let label = m.display_label();
-                if let Some(remote) = &m.remote
+                if let Some(remote) = m.remote()
                     && remote.file.is_none()
                 {
                     return ListItem::new(Line::from(vec![
@@ -215,6 +217,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
             })
             .collect(),
         Pane::Profile => app
+            .browser
             .profiles
             .items
             .iter()
@@ -224,12 +227,13 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
             })
             .collect(),
         Pane::Options => app
+            .browser
             .options
             .items
             .iter()
             .map(|o| {
                 ListItem::new(Line::from(vec![
-                    Span::raw(format!("{icon}  {}: ", o.key)),
+                    Span::raw(format!("{icon}  {}: ", o.spec.key)),
                     Span::styled(o.value.clone(), Style::default().fg(ACCENT)),
                 ]))
             })
@@ -257,10 +261,10 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
     let symbol = if focused { "▌ " } else { "  " };
 
     let state = match level {
-        Pane::Runtime => &mut app.runtimes.state,
-        Pane::Model => &mut app.models.state,
-        Pane::Profile => &mut app.profiles.state,
-        Pane::Options => &mut app.options.state,
+        Pane::Runtime => &mut app.browser.runtimes.state,
+        Pane::Model => &mut app.browser.models.state,
+        Pane::Profile => &mut app.browser.profiles.state,
+        Pane::Options => &mut app.browser.options.state,
     };
 
     let list = List::new(items).block(block).highlight_style(highlight).highlight_symbol(symbol);
@@ -288,6 +292,7 @@ fn render_catalog_parent(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_catalog_preview(frame: &mut Frame, area: Rect, app: &App) {
     let items: Vec<ListItem> = app
+        .browser
         .catalog_preview
         .iter()
         .map(|m| {
@@ -322,20 +327,21 @@ fn render_root(frame: &mut Frame, area: Rect) {
 fn render_option_detail(frame: &mut Frame, area: Rect, app: &App) {
     let block = pane_block("Detail", false);
     let text = app
+        .browser
         .options
         .selected()
         .map(|o| {
             Text::from(vec![
-                Line::from(o.key.clone().bold().fg(ACCENT)),
+                Line::from(o.spec.key.bold().fg(ACCENT)),
                 Line::raw(""),
                 kv("Current", &o.value),
                 kv("Default", &o.default),
                 kv("Range", o.range.as_deref().unwrap_or("free-form")),
                 Line::raw(""),
                 Line::from("CLI".bold()),
-                Line::from(o.cli.clone()),
+                Line::from(o.spec.cli),
                 Line::raw(""),
-                Line::from(o.description.clone()),
+                Line::from(o.spec.description),
             ])
         })
         .unwrap_or_else(|| Text::from(Line::from("(no option selected)".dim())));
@@ -377,7 +383,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 /// The hotkeys relevant to the current focus, shown in the footer.
 fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
     let mut keys: Vec<(&str, &str)> = vec![("j/k", "move")];
-    match app.focus {
+    match app.browser.focus {
         Pane::Runtime => {
             keys.push(("l", "enter"));
             keys.push(("/", "search models"));
@@ -404,7 +410,7 @@ fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
         Pane::Profile => {
             // Built-ins are read-only templates: no rename, and `d` resets
             // (drops model-scoped edits) rather than deleting.
-            let builtin = app.profiles.selected().map(|p| p.builtin).unwrap_or(false);
+            let builtin = app.browser.profiles.selected().map(|p| p.builtin).unwrap_or(false);
             keys.push(("h/l", "back/enter"));
             keys.push(("a", "new"));
             if !builtin {
@@ -556,7 +562,7 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
     let (jobs, detail) = session_panes(body);
     // The key handler reads this: with no pane to swap, `l` opens the log full
     // screen rather than doing nothing.
-    app.detail_pane_visible = detail.is_some();
+    app.session_view.detail_pane_visible = detail.is_some();
     let [sessions, downloads] =
         Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(jobs);
     let focused = app.selected_server_session().is_some() || app.async_job_count() == 0;
@@ -564,12 +570,12 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
         frame,
         sessions,
         &app.sessions.sessions,
-        app.session_sel.selected(),
+        app.session_view.selection.selected(),
         focused,
     );
     render_download_list(frame, downloads, app);
     if let Some(detail) = detail {
-        match app.session_pane {
+        match app.session_view.pane {
             // A download has no log, so its facts hold the column either way.
             SessionPane::Log if app.selected_server_session().is_some() => {
                 render_session_log(frame, detail, app.selected_server_session())
@@ -594,7 +600,7 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
             }
         }
     } else {
-        let pane = match app.session_pane {
+        let pane = match app.session_view.pane {
             SessionPane::Detail => ("l", "log"),
             SessionPane::Log => ("l", "detail"),
         };
@@ -636,13 +642,11 @@ const MISSING: &str = "—";
 /// rather than as one run of text — the rate cells especially, which already
 /// carry a space inside them.
 const COL_GAP: usize = 4;
+/// Keep session metadata clear of the pane's right border.
+const ROW_RIGHT_PADDING: usize = 1;
 /// Below this much room for the model name, a column is not worth its space.
 const MIN_NAME: usize = 12;
-/// The widest the name column grows to.
-///
-/// Names are what the rows are about, so they get columns dropped for them —
-/// but only up to here. Past it the surplus stops seating a name and starts
-/// opening a gulf between the name and everything that describes it.
+/// The most room the planner will reclaim from metadata for a long model name.
 const MAX_NAME: usize = 32;
 
 /// Which column to give up first when the pane cannot hold them all.
@@ -735,8 +739,10 @@ fn rate_cell(label: &str, session: &Session, phase: Phase) -> String {
 /// How wide the name column is, and which columns follow it, in a pane of
 /// `width` holding names up to `longest` terminal columns wide.
 ///
-/// One answer for the whole list rather than one per row: rows that sized their
-/// own names would stop lining up, and the alignment is the point.
+/// The name consumes every column left after the fixed-width metadata. That
+/// keeps the metadata block at a consistent one-cell inset from the pane's
+/// right edge and gives every row the same column starts regardless of
+/// model-name length.
 fn row_plan(width: usize, longest: usize) -> (usize, Vec<Column>) {
     const ORDER: [Column; 7] = [
         Column::Profile,
@@ -751,23 +757,17 @@ fn row_plan(width: usize, longest: usize) -> (usize, Vec<Column>) {
         columns.iter().map(|column| column.width() + COL_GAP).sum()
     };
 
-    let room = width.saturating_sub(2); // status glyph and its space
-    // What the names in this pane actually need, within reason: giving up a
-    // column to seat a name whole is worth it, and `MAX_NAME` is where it stops
-    // being worth it.
+    let room = width.saturating_sub(2 + ROW_RIGHT_PADDING); // status glyph, its space, right inset
     let wanted = longest.clamp(MIN_NAME, MAX_NAME);
     let mut columns = ORDER.to_vec();
     for dropped in DROP_ORDER {
-        if room >= cost(&columns) + wanted + COL_GAP {
+        if room >= cost(&columns) + wanted {
             break;
         }
         columns.retain(|column| *column != dropped);
     }
 
-    // Capped at what the names need. The leftover used to go here, which on a
-    // wide pane put sixty blank columns between the name and the profile and
-    // left the row reading as two unrelated halves.
-    let name = room.saturating_sub(cost(&columns) + COL_GAP).clamp(1, wanted.max(1));
+    let name = room.saturating_sub(cost(&columns)).max(1);
     (name, columns)
 }
 
@@ -786,6 +786,7 @@ fn session_row(session: &Session, name_width: usize, columns: &[Column]) -> Line
             Style::default().fg(Color::DarkGray),
         ));
     }
+    spans.push(Span::raw(" ".repeat(ROW_RIGHT_PADDING)));
     Line::from(spans)
 }
 
@@ -916,7 +917,7 @@ fn render_download_list(frame: &mut Frame, area: Rect, app: &App) {
     // Borders consume two columns and the selected-row marker consumes two
     // more. Reserve the progress suffix, then retain the filename tail.
     let row_width = area.width.saturating_sub(4) as usize;
-    let items = app.model_downloads.iter().map(|download| {
+    let items = app.downloads.jobs.iter().map(|download| {
         let suffix = match &download.status {
             ModelDownloadStatus::Downloading => "",
             ModelDownloadStatus::Cancelling => "  cancelling",
@@ -937,10 +938,11 @@ fn render_download_list(frame: &mut Frame, area: Rect, app: &App) {
     });
 
     let selected = app
-        .session_sel
+        .session_view
+        .selection
         .selected()
         .and_then(|index| index.checked_sub(app.sessions.sessions.len()))
-        .filter(|index| *index < app.model_downloads.len());
+        .filter(|index| *index < app.downloads.jobs.len());
     let mut state = ListState::default();
     state.select(selected);
     let list = List::new(items)
@@ -1137,12 +1139,13 @@ fn draw_logs(frame: &mut Frame, app: &mut App) {
             .areas(frame.area());
 
     let name = app
-        .session_sel
+        .session_view
+        .selection
         .selected()
         .and_then(|i| app.sessions.sessions.get(i))
         .map(|s| s.record.name.clone())
         .unwrap_or_default();
-    let follow = if app.log_follow { "  [tailing]" } else { "" };
+    let follow = if app.session_view.log_follow { "  [tailing]" } else { "" };
     let title = Line::from(vec![
         Span::styled(format!(" {ICON_LOG}  Logs — {name}"), Style::default().fg(ACCENT).bold()),
         Span::styled(follow.to_string(), Style::default().fg(Color::Green)),
@@ -1151,15 +1154,21 @@ fn draw_logs(frame: &mut Frame, app: &mut App) {
 
     let block = pane_block("Output", true);
     let inner_height = body.height.saturating_sub(2); // borders
-    let total = app.log_lines.len() as u16;
+    let total = app.session_view.log_lines.len() as u16;
     let max_scroll = total.saturating_sub(inner_height);
-    let scroll = if app.log_follow { max_scroll } else { app.log_scroll.min(max_scroll) };
-    app.log_scroll = scroll; // keep state clamped/in-sync
+    let scroll = if app.session_view.log_follow {
+        max_scroll
+    } else {
+        app.session_view.log_scroll.min(max_scroll)
+    };
+    app.session_view.log_scroll = scroll; // keep state clamped/in-sync
 
-    let text = if app.log_lines.is_empty() {
+    let text = if app.session_view.log_lines.is_empty() {
         Text::from(Line::from("(log is empty)".dim()))
     } else {
-        Text::from(app.log_lines.iter().map(|l| Line::raw(l.clone())).collect::<Vec<_>>())
+        Text::from(
+            app.session_view.log_lines.iter().map(|l| Line::raw(l.clone())).collect::<Vec<_>>(),
+        )
     };
     frame.render_widget(Paragraph::new(text).block(block).scroll((scroll, 0)), body);
 
@@ -1467,9 +1476,9 @@ fn center(area: Rect, horizontal: Constraint, vertical: Constraint) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::{
-        COL_GAP, ICON_CLOUD, ICON_DIRECTORY, MAX_NAME, MIN_COLS, MIN_ROWS, compact_count,
-        download_progress, model_artifact_columns, model_icon, render_confirm, render_help,
-        render_session_log, render_too_small, session_panes, truncate_download_name, wrap_hard,
+        ICON_CLOUD, ICON_DIRECTORY, MIN_COLS, MIN_ROWS, compact_count, download_progress,
+        model_artifact_columns, model_icon, render_confirm, render_help, render_session_log,
+        render_too_small, session_panes, truncate_download_name, wrap_hard,
     };
     use crate::app::Confirm;
 
@@ -1577,6 +1586,9 @@ mod tests {
     /// A minimal local model leaf that tests reshape as they need.
     fn sample_model() -> crate::domain::Model {
         crate::domain::Model {
+            entry: crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf {
+                remote: None,
+            }),
             id: String::new(),
             name: String::new(),
             // Non-empty so this reads as a model leaf, not a catalog folder.
@@ -1595,8 +1607,6 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
-            remote: None,
-            flm: None,
             runtime: crate::runtime::llama_cpp::NAME.into(),
         }
     }
@@ -1608,17 +1618,19 @@ mod tests {
         model.catalog_path = vec![model.name.clone()];
         model.size_bytes = 20_600_000_000;
         model.quantization = Some("Q4_K_M".into());
-        model.remote = Some(crate::domain::RemoteModel {
-            repo: "owner/repo".into(),
-            revision: None,
-            file: Some(model.name.clone()),
-            blobs: Vec::new(),
-            mtp_file: None,
-            dflash_file: None,
-            projector_file: None,
-            downloads: 0,
-            likes: 0,
-            gated: false,
+        model.entry = crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf {
+            remote: Some(crate::domain::RemoteModel {
+                repo: "owner/repo".into(),
+                revision: None,
+                file: Some(model.name.clone()),
+                blobs: Vec::new(),
+                mtp_file: None,
+                dflash_file: None,
+                projector_file: None,
+                downloads: 0,
+                likes: 0,
+                gated: false,
+            }),
         });
 
         assert_eq!(
@@ -1626,7 +1638,8 @@ mod tests {
             ("Q4_K_M       20.6 GB  ".into(), "Qwen-AgentWorld-35B-A3B-UD-Q4_K_M.gguf".into())
         );
 
-        model.remote = None;
+        model.entry =
+            crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf { remote: None });
         assert_eq!(
             model_artifact_columns(&model).unwrap(),
             ("Q4_K_M       20.6 GB  ".into(), "Qwen-AgentWorld-35B-A3B-UD-Q4_K_M.gguf".into())
@@ -1665,6 +1678,7 @@ mod tests {
     fn online_catalog_nodes_use_cloud_icons() {
         let mut model = sample_model();
         model.path = std::path::PathBuf::new();
+        model.entry = crate::domain::CatalogEntry::Directory { repository: None };
 
         model.catalog_path = vec!["online".into()];
         assert_eq!(model_icon(&model), ICON_CLOUD);
@@ -1947,37 +1961,43 @@ mod tests {
         assert!(screen.contains("sort online models / switch catalog grouping"), "{screen}");
     }
 
-    /// Regression: the name column took every column the row had left over, so
-    /// a wide pane put sixty blanks between the name and the profile — and a
-    /// middling one truncated a name it had columns to spare for, because the
-    /// drop rule only ever asked for `MIN_NAME`.
+    /// Regression: the name column was capped at the longest visible name, so
+    /// the metadata block drifted left instead of staying one cell in from the
+    /// pane's right edge.
     #[test]
-    fn the_name_column_takes_what_the_names_need_and_no_more() {
+    fn session_metadata_keeps_right_edge_padding() {
         use unicode_width::UnicodeWidthStr;
 
         let sessions = [probe_session("muse-glimmer-30b-q8_0", true)];
-        let name = "muse-glimmer-30b-q8_0";
+        for width in [106, 120, 200] {
+            let row = &rows_text(&sessions, width)[0];
+            assert_eq!(row.width(), width, "row did not reach the right edge: {row:?}");
+            assert_eq!(
+                row.trim_end().width(),
+                width - super::ROW_RIGHT_PADDING,
+                "metadata was not inset from the right border: {row:?}"
+            );
+            assert!(
+                row.contains("muse-glimmer-30b-q8_0"),
+                "the name was cut unnecessarily: {row:?}"
+            );
+        }
 
-        // Wide pane: the name is whole and the columns follow it directly,
-        // rather than after a run of padding.
-        let row = &rows_text(&sessions, 200)[0];
-        let gap = row.find("[inquisitor]").expect("the profile column") - row.find(name).unwrap();
-        assert_eq!(gap, name.width() + COL_GAP, "a gulf opened up: {row:?}");
-
-        // Middling pane: a column is given up to seat the name whole. It used
-        // to keep every column and cut the name to twenty.
-        let row = &rows_text(&sessions, 106)[0];
-        assert!(row.contains(name), "the name was cut with columns to spare: {row:?}");
-
-        // The cap holds: a name past `MAX_NAME` is truncated rather than
-        // pushing every column off the row.
-        let long = "a-very-long-model-name-that-keeps-going-and-going";
-        let row = &rows_text(&[probe_session(long, true)], 200)[0];
-        assert!(row.contains('…'), "{row:?}");
-        // In columns, not bytes: the status glyph and the ellipsis are both
-        // multibyte and neither is more than one column wide.
-        let at = row[..row.find("[inquisitor]").expect("the profile column")].width();
-        assert_eq!(at, 2 + MAX_NAME + COL_GAP, "the name column outgrew its cap: {row:?}");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 4)).unwrap();
+        terminal
+            .draw(|frame| super::render_session_list(frame, frame.area(), &sessions, Some(0), true))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let session_row = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .find(|row| row.contains("2h 34m"))
+            .expect("rendered session row");
+        assert!(session_row.contains("2h 34m │"), "missing border padding: {session_row:?}");
 
         // Narrow panes still shed columns, and the name still gets `MIN_NAME`.
         let row = &rows_text(&sessions, 60)[0];

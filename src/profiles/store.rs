@@ -3,15 +3,17 @@
 //! A profile is identified by (runtime, model, profile-name). Built-in
 //! templates are global and read-only; the first time the user edits an option
 //! (or favorites/creates a profile) for a given model, an *instance* is
-//! materialized here and auto-saved. Stored as JSON under the state dir.
+//! materialized here and auto-saved. Stored as per-model YAML, with a legacy JSON fallback.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::domain::Model;
+use crate::persistence::write_if_changed;
 
 /// (runtime, model, profile) — uniquely identifies an instance.
 type Key = (String, String, String);
@@ -61,7 +63,8 @@ pub struct ProfileStore {
     instances: BTreeMap<Key, Instance>,
     /// Absolute source model key -> managed catalog leaf.
     model_dirs: BTreeMap<String, PathBuf>,
-    /// Instances that could not be persisted to their per-model YAML file.
+    /// Instances whose legacy record remains authoritative, either because the
+    /// YAML write failed or because the legacy record could not be removed.
     fallback: BTreeSet<Key>,
 }
 
@@ -95,7 +98,8 @@ impl ProfileStore {
             .map(|m| (m.profile_key(), m.catalog_dir.clone()))
             .collect();
 
-        // YAML is authoritative when both formats contain the same profile.
+        // A fallback records a failed YAML write and is newer than that YAML.
+        let pending = instances.clone();
         for model in models {
             for loaded in load_model_profiles(model, &mut instances) {
                 fallback.remove(&loaded);
@@ -105,6 +109,8 @@ impl ProfileStore {
             }
         }
 
+        instances.extend(pending.iter().map(|(key, value)| (key.clone(), value.clone())));
+        fallback.extend(pending.into_keys());
         let mut store = Self { legacy_path, instances, model_dirs, fallback };
         store.back_up_legacy();
         store.persist_registered();
@@ -113,6 +119,11 @@ impl ProfileStore {
 
     /// Register models found by a later F5 scan and load/create their files.
     pub fn sync_models(&mut self, models: &[Model]) {
+        let pending: Vec<_> = self
+            .fallback
+            .iter()
+            .filter_map(|key| self.instances.get(key).map(|value| (key.clone(), value.clone())))
+            .collect();
         for model in models {
             if !valid_catalog_dir(&model.catalog_dir) {
                 continue;
@@ -126,6 +137,10 @@ impl ProfileStore {
                     .entry(key(&model.runtime, &model.profile_key(), profile))
                     .or_default();
             }
+        }
+        for (key, value) in pending {
+            self.instances.insert(key.clone(), value);
+            self.fallback.insert(key);
         }
         self.persist_registered();
     }
@@ -147,31 +162,70 @@ impl ProfileStore {
         profile: &str,
         values: BTreeMap<String, String>,
         custom: bool,
-    ) {
+    ) -> io::Result<()> {
         let entry = key(runtime, model, profile);
+        if self.instances.contains_key(&entry) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "profile already exists"));
+        }
         self.instances.insert(entry.clone(), Instance { values, favorite: false, custom });
-        self.persist_one(&entry);
+        if let Err(error) = self.persist_one(&entry) {
+            return Err(self.rollback_new_profile(&entry, error));
+        }
+        Ok(())
     }
 
     /// Rename a profile instance, preserving its values/flags.
-    pub fn rename(&mut self, runtime: &str, model: &str, old: &str, new: &str) {
-        if let Some(inst) = self.instances.remove(&key(runtime, model, old)) {
-            self.fallback.remove(&key(runtime, model, old));
-            self.remove_profile_file(model, old);
-            let entry = key(runtime, model, new);
-            self.instances.insert(entry.clone(), inst);
-            self.persist_one(&entry);
+    pub fn rename(&mut self, runtime: &str, model: &str, old: &str, new: &str) -> io::Result<()> {
+        let old_key = key(runtime, model, old);
+        let new_key = key(runtime, model, new);
+        if old == new {
+            return Ok(());
         }
+        if self.instances.contains_key(&new_key) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "profile already exists"));
+        }
+        let inst = self
+            .instances
+            .get(&old_key)
+            .cloned()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "profile not found"))?;
+        self.instances.insert(new_key.clone(), inst);
+        if let Err(error) = self.persist_one(&new_key) {
+            return Err(self.rollback_new_profile(&new_key, error));
+        }
+        // The replacement is durable before the original is removed. If removal
+        // fails, both names survive and the caller reports the failure.
+        self.delete(runtime, model, old)
     }
 
-    /// Remove a profile instance. For a built-in this resets it to the template
-    /// defaults; for a custom profile this deletes it entirely.
-    pub fn delete(&mut self, runtime: &str, model: &str, profile: &str) {
-        if self.instances.remove(&key(runtime, model, profile)).is_some() {
-            self.fallback.remove(&key(runtime, model, profile));
-            self.remove_profile_file(model, profile);
-            self.save_legacy();
+    /// Remove the persisted record only after the fallback store has accepted
+    /// the in-memory deletion, so either failure leaves a recoverable profile.
+    pub fn delete(&mut self, runtime: &str, model: &str, profile: &str) -> io::Result<()> {
+        let entry = key(runtime, model, profile);
+        let previous = self.instances.remove(&entry);
+        let was_fallback = self.fallback.remove(&entry);
+        if let Err(error) = self.save_legacy() {
+            if let Some(previous) = previous.clone() {
+                self.instances.insert(entry.clone(), previous);
+            }
+            if was_fallback {
+                self.fallback.insert(entry.clone());
+            }
+            return Err(error);
         }
+        if let Err(error) = self.remove_profile_file(model, profile) {
+            if let Some(previous) = previous {
+                self.instances.insert(entry.clone(), previous);
+            }
+            if was_fallback {
+                self.fallback.insert(entry);
+            }
+            return match self.save_legacy() {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback_failure(error, rollback)),
+            };
+        }
+        Ok(())
     }
 
     /// Custom (user-created) profile names for a given model.
@@ -192,10 +246,10 @@ impl ProfileStore {
         option: &str,
         value: String,
         base: &BTreeMap<String, String>,
-    ) {
+    ) -> io::Result<()> {
         let inst = self.materialize(runtime, model, profile, base);
         inst.values.insert(option.to_string(), value);
-        self.persist_one(&key(runtime, model, profile));
+        self.persist_one(&key(runtime, model, profile))
     }
 
     pub fn toggle_favorite(
@@ -204,10 +258,10 @@ impl ProfileStore {
         model: &str,
         profile: &str,
         base: &BTreeMap<String, String>,
-    ) {
+    ) -> io::Result<()> {
         let inst = self.materialize(runtime, model, profile, base);
         inst.favorite = !inst.favorite;
-        self.persist_one(&key(runtime, model, profile));
+        self.persist_one(&key(runtime, model, profile))
     }
 
     /// Ensure an instance exists, seeding its values from `base` (the resolved
@@ -233,25 +287,52 @@ impl ProfileStore {
             .filter(|(_, model, _)| self.model_dirs.contains_key(model))
             .cloned()
             .collect();
+        let existing_fallbacks: Vec<Key> =
+            keys.iter().filter(|entry| self.fallback.contains(*entry)).cloned().collect();
         for entry in keys {
             self.persist_yaml(&entry);
         }
-        self.save_legacy();
+        if let Err(error) = self.save_legacy() {
+            // The legacy file still contains these entries. Keep tracking them
+            // as fallbacks so a later edit updates legacy before YAML can get
+            // ahead of it.
+            self.fallback.extend(existing_fallbacks);
+            warn!(%error, "failed to persist profile fallback");
+        }
     }
 
-    fn persist_one(&mut self, entry: &Key) {
-        self.persist_yaml(entry);
-        self.save_legacy();
+    fn persist_one(&mut self, entry: &Key) -> io::Result<()> {
+        let was_fallback = self.fallback.contains(entry);
+        if was_fallback {
+            // The legacy record may override YAML on the next load. Persist the
+            // current value there before allowing a successful YAML write to
+            // make the legacy copy stale.
+            self.save_legacy()?;
+        }
+        if !self.persist_yaml(entry) {
+            return if was_fallback { Ok(()) } else { self.save_legacy() };
+        }
+        if let Err(error) = self.save_legacy() {
+            if was_fallback {
+                // Cleanup failed, so the current legacy record is still on
+                // disk and must remain authoritative on later edits.
+                self.fallback.insert(entry.clone());
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
-    fn persist_yaml(&mut self, entry: &Key) {
+    fn persist_yaml(&mut self, entry: &Key) -> bool {
         match self.write_profile(entry) {
             Ok(()) => {
                 self.fallback.remove(entry);
+                true
             }
             Err(err) => {
                 self.fallback.insert(entry.clone());
                 warn!(model = %entry.1, profile = %entry.2, %err, "using legacy profile fallback");
+                false
             }
         }
     }
@@ -273,15 +354,12 @@ impl ProfileStore {
             custom: inst.custom,
         };
         let yaml = serde_yaml::to_string(&file).map_err(std::io::Error::other)?;
-        write_atomic_if_changed(
-            &dir.join("profiles").join(profile_filename(profile)),
-            yaml.as_bytes(),
-        )
+        write_if_changed(&dir.join("profiles").join(profile_filename(profile)), yaml.as_bytes())
     }
 
     // Retain unavailable/failed instances in the legacy store; never discard
     // user profiles merely because the managed catalog cannot be written.
-    fn save_legacy(&self) {
+    fn save_legacy(&self) -> io::Result<()> {
         let file = StoreFile {
             instances: self
                 .fallback
@@ -299,30 +377,32 @@ impl ProfileStore {
                 .collect(),
         };
         if file.instances.is_empty() {
-            if let Err(err) = std::fs::remove_file(&self.legacy_path)
-                && err.kind() != std::io::ErrorKind::NotFound
-            {
-                warn!(path = %self.legacy_path.display(), %err, "failed to retire legacy store");
-            }
-            return;
+            return match std::fs::remove_file(&self.legacy_path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            };
         }
-        match serde_json::to_vec_pretty(&file) {
-            Ok(bytes) => {
-                if let Err(err) = std::fs::write(&self.legacy_path, bytes) {
-                    warn!(path = %self.legacy_path.display(), %err, "failed to write profile store");
-                }
-            }
-            Err(err) => warn!(%err, "failed to serialize profile store"),
+        let bytes = serde_json::to_vec_pretty(&file).map_err(io::Error::other)?;
+        crate::persistence::write_atomic(&self.legacy_path, &bytes)
+    }
+
+    fn remove_profile_file(&self, model: &str, profile: &str) -> io::Result<()> {
+        let Some(dir) = self.model_dirs.get(model) else { return Ok(()) };
+        let path = dir.join("profiles").join(profile_filename(profile));
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
         }
     }
 
-    fn remove_profile_file(&self, model: &str, profile: &str) {
-        let Some(dir) = self.model_dirs.get(model) else { return };
-        let path = dir.join("profiles").join(profile_filename(profile));
-        if let Err(err) = std::fs::remove_file(&path)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(path = %path.display(), %err, "failed to remove profile file");
+    fn rollback_new_profile(&mut self, entry: &Key, error: io::Error) -> io::Error {
+        self.instances.remove(entry);
+        self.fallback.remove(entry);
+        match self.remove_profile_file(&entry.1, &entry.2) {
+            Ok(()) => error,
+            Err(rollback) => rollback_failure(error, rollback),
         }
     }
 
@@ -389,16 +469,12 @@ fn profile_filename(name: &str) -> String {
     format!("{safe}-{hash}.yml")
 }
 
-fn write_atomic_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
-        return Ok(());
-    }
-    let tmp = path.with_extension("yml.tmp");
-    std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, path))
-}
-
 fn key(runtime: &str, model: &str, profile: &str) -> Key {
     (runtime.to_string(), model.to_string(), profile.to_string())
+}
+
+fn rollback_failure(error: io::Error, rollback: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{error}; rollback also failed: {rollback}"))
 }
 
 /// Convenience for callers that have a model path.
@@ -410,7 +486,164 @@ pub fn model_key(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn fixture() -> (PathBuf, Model, ProfileStore) {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("llmctl-profile-errors-{nonce}"));
+        let catalog = root.join("model");
+        std::fs::create_dir_all(catalog.join("profiles")).unwrap();
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "name": "model.gguf", "path": root.join("model.gguf"),
+            "catalog_dir": catalog, "size_bytes": 0, "quantization": null,
+            "architecture": null, "context_length": null, "modified": null,
+            "has_chat_template": false
+        }))
+        .unwrap();
+        let store = ProfileStore::load(root.join("legacy.json"), std::slice::from_ref(&model));
+        (root, model, store)
+    }
+
+    #[test]
+    fn failed_rename_preserves_the_original_on_disk_and_in_memory() {
+        let (root, model, mut store) = fixture();
+        let key = model.profile_key();
+        store.create("llama.cpp", &key, "Original", BTreeMap::new(), true).unwrap();
+        let original = model.catalog_dir.join("profiles/Original.yml");
+        let bytes = std::fs::read(&original).unwrap();
+        std::fs::create_dir(&store.legacy_path).unwrap();
+        assert!(store.rename("llama.cpp", &key, "Original", "Renamed").is_err());
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        assert!(!model.catalog_dir.join("profiles/Renamed.yml").exists());
+        assert!(store.get("llama.cpp", &key, "Original").is_some());
+        assert!(store.get("llama.cpp", &key, "Renamed").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_create_leaves_no_profile_in_memory_or_on_disk() {
+        let (root, model, mut store) = fixture();
+        let key = model.profile_key();
+        std::fs::create_dir(&store.legacy_path).unwrap();
+        assert!(store.create("llama.cpp", &key, "New", BTreeMap::new(), true).is_err());
+        assert!(store.get("llama.cpp", &key, "New").is_none());
+        assert!(!model.catalog_dir.join("profiles/New.yml").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_delete_keeps_the_profile_visible() {
+        let (root, model, mut store) = fixture();
+        let key = model.profile_key();
+        let file = model.catalog_dir.join("profiles/Chat.yml");
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(store.delete("llama.cpp", &key, "Chat").is_err());
+        assert!(store.get("llama.cpp", &key, "Chat").is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_legacy_update_does_not_unlink_the_profile() {
+        let (root, model, mut store) = fixture();
+        let key = model.profile_key();
+        let file = model.catalog_dir.join("profiles/Chat.yml");
+        let bytes = std::fs::read(&file).unwrap();
+        std::fs::create_dir(&store.legacy_path).unwrap();
+        assert!(store.delete("llama.cpp", &key, "Chat").is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
+        assert!(store.get("llama.cpp", &key, "Chat").is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_edit_reports_error_and_keeps_the_edit_for_retry() {
+        let (root, model, mut store) = fixture();
+        let key = model.profile_key();
+        let file = model.catalog_dir.join("profiles/Chat.yml");
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        std::fs::create_dir(&store.legacy_path).unwrap();
+        assert!(
+            store
+                .set_value("llama.cpp", &key, "Chat", "temperature", "0.7".into(), &BTreeMap::new())
+                .is_err()
+        );
+        assert_eq!(store.get("llama.cpp", &key, "Chat").unwrap().values["temperature"], "0.7");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fallback_edits_override_stale_yaml_on_reload_and_rescan() {
+        let (root, model, mut store) = fixture();
+        let entry = key("llama.cpp", &model.profile_key(), "Chat");
+        store.instances.get_mut(&entry).unwrap().values.insert("temperature".into(), "0.7".into());
+        store.fallback.insert(entry.clone());
+        store.save_legacy().unwrap();
+        let mut reloaded =
+            ProfileStore::load(store.legacy_path.clone(), std::slice::from_ref(&model));
+        assert_eq!(reloaded.instances[&entry].values["temperature"], "0.7");
+        reloaded
+            .instances
+            .get_mut(&entry)
+            .unwrap()
+            .values
+            .insert("temperature".into(), "0.8".into());
+        reloaded.fallback.insert(entry.clone());
+        reloaded.sync_models(&[model]);
+        assert_eq!(reloaded.instances[&entry].values["temperature"], "0.8");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_fallback_update_cannot_leave_yaml_newer_than_legacy() {
+        let (root, model, mut store) = fixture();
+        let model_key = model.profile_key();
+        let entry = key("llama.cpp", &model_key, "Chat");
+        store.instances.get_mut(&entry).unwrap().values.insert("temperature".into(), "0.1".into());
+        store.fallback.insert(entry);
+        store.save_legacy().unwrap();
+
+        let yaml = model.catalog_dir.join("profiles/Chat.yml");
+        let yaml_before = std::fs::read(&yaml).unwrap();
+        let original_permissions = std::fs::metadata(&root).unwrap().permissions();
+        let mut read_only = original_permissions.clone();
+        read_only.set_mode(0o555);
+        std::fs::set_permissions(&root, read_only).unwrap();
+
+        assert!(
+            store
+                .set_value(
+                    "llama.cpp",
+                    &model_key,
+                    "Chat",
+                    "temperature",
+                    "0.7".into(),
+                    &BTreeMap::new(),
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&yaml).unwrap(), yaml_before);
+
+        std::fs::set_permissions(&root, original_permissions).unwrap();
+        store
+            .set_value(
+                "llama.cpp",
+                &model_key,
+                "Chat",
+                "temperature",
+                "0.7".into(),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        let reloaded = ProfileStore::load(store.legacy_path.clone(), &[model]);
+        assert_eq!(
+            reloaded.instances[&key("llama.cpp", &model_key, "Chat")].values["temperature"],
+            "0.7"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn migrates_legacy_json_to_model_yaml_and_keeps_backup() {
@@ -432,6 +665,9 @@ mod tests {
         };
         std::fs::write(&legacy, serde_json::to_vec(&file).unwrap()).unwrap();
         let model = Model {
+            entry: crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf {
+                remote: None,
+            }),
             id: "test".into(),
             name: "source.gguf".into(),
             path: model_path,
@@ -449,9 +685,7 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
-            flm: None,
             runtime: crate::runtime::llama_cpp::NAME.into(),
-            remote: None,
         };
         let store = ProfileStore::load(legacy.clone(), &[model]);
         assert_eq!(
@@ -472,6 +706,9 @@ mod tests {
         let legacy = root.join("profiles.json");
         let model_path = root.join("source.gguf");
         let model = Model {
+            entry: crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf {
+                remote: None,
+            }),
             id: "test".into(),
             name: "source.gguf".into(),
             path: model_path.clone(),
@@ -489,19 +726,19 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
-            flm: None,
             runtime: crate::runtime::llama_cpp::NAME.into(),
-            remote: None,
         };
         let mut store = ProfileStore::load(legacy.clone(), &[model]);
-        store.set_value(
-            "llama.cpp",
-            &model_key(&model_path),
-            "Chat",
-            "ctx-size",
-            "8192".into(),
-            &BTreeMap::new(),
-        );
+        store
+            .set_value(
+                "llama.cpp",
+                &model_key(&model_path),
+                "Chat",
+                "ctx-size",
+                "8192".into(),
+                &BTreeMap::new(),
+            )
+            .unwrap();
         let saved: StoreFile = serde_json::from_slice(&std::fs::read(&legacy).unwrap()).unwrap();
         assert_eq!(saved.instances.len(), 1);
         assert_eq!(saved.instances[0].values["ctx-size"], "8192");

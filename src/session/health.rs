@@ -66,3 +66,160 @@ pub fn probe(host: &str, port: u16, path: &str) -> Health {
 pub fn port_is_free(port: u16) -> bool {
     std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
+
+/// Identifies a probe attempt across restart, PID reacquisition, and endpoint changes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProbeKey {
+    pub session: String,
+    pub pid: i32,
+    pub host: String,
+    pub port: u16,
+    pub path: String,
+}
+
+/// At most four socket probes run concurrently; submitting/polling never waits.
+pub struct HealthChecks {
+    pending: std::collections::HashSet<ProbeKey>,
+    queued: std::collections::VecDeque<ProbeKey>,
+    active: usize,
+    tx: std::sync::mpsc::Sender<(ProbeKey, Health)>,
+    rx: std::sync::mpsc::Receiver<(ProbeKey, Health)>,
+    probe: std::sync::Arc<dyn Fn(&ProbeKey) -> Health + Send + Sync>,
+}
+
+impl Default for HealthChecks {
+    fn default() -> Self {
+        Self::new(std::sync::Arc::new(|key| probe(&key.host, key.port, &key.path)))
+    }
+}
+
+impl HealthChecks {
+    fn new(probe: std::sync::Arc<dyn Fn(&ProbeKey) -> Health + Send + Sync>) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self { pending: Default::default(), queued: Default::default(), active: 0, tx, rx, probe }
+    }
+
+    pub fn request(&mut self, key: ProbeKey) {
+        if !self.pending.insert(key.clone()) {
+            return;
+        }
+        self.queued.push_back(key);
+        self.start_queued();
+    }
+
+    fn start_queued(&mut self) {
+        while self.active < 4 {
+            let Some(key) = self.queued.pop_front() else { break };
+            self.active += 1;
+            let tx = self.tx.clone();
+            let probe = self.probe.clone();
+            std::thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| probe(&key)))
+                    .unwrap_or(Health::Down);
+                let _ = tx.send((key, result));
+            });
+        }
+    }
+
+    pub fn poll(&mut self) -> Vec<(ProbeKey, Health)> {
+        let results: Vec<_> = self.rx.try_iter().collect();
+        for (key, _) in &results {
+            self.pending.remove(key);
+            self.active -= 1;
+        }
+        self.start_queued();
+        results
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
+    use std::time::Instant;
+
+    #[test]
+    fn workers_are_bounded_deduplicated_and_do_not_starve_queued_sessions() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_gate = gate.clone();
+        let (tx, rx) = mpsc::channel();
+        let mut checks = HealthChecks::new(Arc::new(move |key| {
+            tx.send(key.clone()).unwrap();
+            let (lock, ready) = &*worker_gate;
+            let guard = lock.lock().unwrap();
+            let _guard =
+                ready.wait_timeout_while(guard, Duration::from_secs(2), |open| !*open).unwrap();
+            Health::Ready
+        }));
+        let keys: Vec<_> = (0..5)
+            .map(|i| ProbeKey {
+                session: i.to_string(),
+                pid: i,
+                host: "localhost".into(),
+                port: 80,
+                path: "/".into(),
+            })
+            .collect();
+        for key in &keys {
+            checks.request(key.clone());
+            checks.request(key.clone());
+        }
+        assert_eq!(checks.active, 4);
+        assert_eq!(checks.queued.len(), 1);
+        assert_eq!(checks.pending.len(), 5);
+        for _ in 0..4 {
+            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(checks.poll().is_empty());
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut completed = Vec::new();
+        while completed.len() < 5 && Instant::now() < deadline {
+            completed.extend(checks.poll());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(completed.len(), 5);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), keys[4]);
+        assert!(checks.pending.is_empty());
+        assert_eq!(checks.active, 0);
+    }
+
+    #[test]
+    fn panicking_workers_release_their_slots() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe_attempts = attempts.clone();
+        let mut checks = HealthChecks::new(Arc::new(move |_| {
+            assert!(
+                probe_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 4,
+                "health test panic"
+            );
+            Health::Ready
+        }));
+        let keys: Vec<_> = (0..5)
+            .map(|i| ProbeKey {
+                session: i.to_string(),
+                pid: i,
+                host: "localhost".into(),
+                port: 80,
+                path: "/".into(),
+            })
+            .collect();
+        for key in keys {
+            checks.request(key);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut completed = Vec::new();
+        while completed.len() < 5 && Instant::now() < deadline {
+            completed.extend(checks.poll());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(completed.len(), 5);
+        assert_eq!(completed.iter().filter(|(_, health)| *health == Health::Down).count(), 4);
+        assert_eq!(completed.iter().filter(|(_, health)| *health == Health::Ready).count(), 1);
+        assert!(checks.pending.is_empty());
+        assert_eq!(checks.active, 0);
+    }
+}
