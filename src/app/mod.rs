@@ -1152,8 +1152,7 @@ impl App {
                 self.session_view.selection.select(any.then_some(0));
             }
             KeyCode::Char('G') | KeyCode::End => {
-                let len = self.async_job_count();
-                self.session_view.selection.select((len > 0).then_some(len - 1));
+                self.session_view.select_last(self.async_job_count());
             }
             KeyCode::Char('x') => self.stop_async_job(false),
             KeyCode::Char('K') => self.stop_async_job(true),

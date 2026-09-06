@@ -163,8 +163,14 @@ impl ProfileStore {
         custom: bool,
     ) -> io::Result<()> {
         let entry = key(runtime, model, profile);
+        if self.instances.contains_key(&entry) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "profile already exists"));
+        }
         self.instances.insert(entry.clone(), Instance { values, favorite: false, custom });
-        self.persist_one(&entry)
+        if let Err(error) = self.persist_one(&entry) {
+            return Err(self.rollback_new_profile(&entry, error));
+        }
+        Ok(())
     }
 
     /// Rename a profile instance, preserving its values/flags.
@@ -184,30 +190,39 @@ impl ProfileStore {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "profile not found"))?;
         self.instances.insert(new_key.clone(), inst);
         if let Err(error) = self.persist_one(&new_key) {
-            self.instances.remove(&new_key);
-            self.fallback.remove(&new_key);
-            return Err(error);
+            return Err(self.rollback_new_profile(&new_key, error));
         }
         // The replacement is durable before the original is removed. If removal
         // fails, both names survive and the caller reports the failure.
         self.delete(runtime, model, old)
     }
 
-    /// Delete on disk before removing the in-memory instance. A failed unlink
-    /// must not make a profile disappear until the next reload.
+    /// Remove the persisted record only after the fallback store has accepted
+    /// the in-memory deletion, so either failure leaves a recoverable profile.
     pub fn delete(&mut self, runtime: &str, model: &str, profile: &str) -> io::Result<()> {
         let entry = key(runtime, model, profile);
-        self.remove_profile_file(model, profile)?;
         let previous = self.instances.remove(&entry);
         let was_fallback = self.fallback.remove(&entry);
         if let Err(error) = self.save_legacy() {
+            if let Some(previous) = previous.clone() {
+                self.instances.insert(entry.clone(), previous);
+            }
+            if was_fallback {
+                self.fallback.insert(entry.clone());
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.remove_profile_file(model, profile) {
             if let Some(previous) = previous {
                 self.instances.insert(entry.clone(), previous);
             }
             if was_fallback {
                 self.fallback.insert(entry);
             }
-            return Err(error);
+            return match self.save_legacy() {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback_failure(error, rollback)),
+            };
         }
         Ok(())
     }
@@ -356,6 +371,15 @@ impl ProfileStore {
         }
     }
 
+    fn rollback_new_profile(&mut self, entry: &Key, error: io::Error) -> io::Error {
+        self.instances.remove(entry);
+        self.fallback.remove(entry);
+        match self.remove_profile_file(&entry.1, &entry.2) {
+            Ok(()) => error,
+            Err(rollback) => rollback_failure(error, rollback),
+        }
+    }
+
     fn back_up_legacy(&self) {
         if !self.legacy_path.exists() {
             return;
@@ -423,6 +447,10 @@ fn key(runtime: &str, model: &str, profile: &str) -> Key {
     (runtime.to_string(), model.to_string(), profile.to_string())
 }
 
+fn rollback_failure(error: io::Error, rollback: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{error}; rollback also failed: {rollback}"))
+}
+
 /// Convenience for callers that have a model path.
 #[cfg(test)]
 pub fn model_key(path: &Path) -> String {
@@ -457,12 +485,23 @@ mod tests {
         store.create("llama.cpp", &key, "Original", BTreeMap::new(), true).unwrap();
         let original = model.catalog_dir.join("profiles/Original.yml");
         let bytes = std::fs::read(&original).unwrap();
-        std::fs::create_dir(model.catalog_dir.join("profiles/Renamed.yml")).unwrap();
         std::fs::create_dir(&store.legacy_path).unwrap();
         assert!(store.rename("llama.cpp", &key, "Original", "Renamed").is_err());
         assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        assert!(!model.catalog_dir.join("profiles/Renamed.yml").exists());
         assert!(store.get("llama.cpp", &key, "Original").is_some());
         assert!(store.get("llama.cpp", &key, "Renamed").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_create_leaves_no_profile_in_memory_or_on_disk() {
+        let (root, model, mut store) = fixture();
+        let key = model.profile_key();
+        std::fs::create_dir(&store.legacy_path).unwrap();
+        assert!(store.create("llama.cpp", &key, "New", BTreeMap::new(), true).is_err());
+        assert!(store.get("llama.cpp", &key, "New").is_none());
+        assert!(!model.catalog_dir.join("profiles/New.yml").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -474,6 +513,19 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         std::fs::create_dir(&file).unwrap();
         assert!(store.delete("llama.cpp", &key, "Chat").is_err());
+        assert!(store.get("llama.cpp", &key, "Chat").is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_legacy_update_does_not_unlink_the_profile() {
+        let (root, model, mut store) = fixture();
+        let key = model.profile_key();
+        let file = model.catalog_dir.join("profiles/Chat.yml");
+        let bytes = std::fs::read(&file).unwrap();
+        std::fs::create_dir(&store.legacy_path).unwrap();
+        assert!(store.delete("llama.cpp", &key, "Chat").is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
         assert!(store.get("llama.cpp", &key, "Chat").is_some());
         std::fs::remove_dir_all(root).unwrap();
     }

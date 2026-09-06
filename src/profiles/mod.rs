@@ -224,12 +224,13 @@ mod tests {
             let mut store = empty_store();
             assert!(
                 store
-                    .create(
+                    .set_value(
                         "llama.cpp",
                         &model.profile_key(),
                         "Default",
-                        BTreeMap::from([(key.into(), value.into())]),
-                        false
+                        key,
+                        value.into(),
+                        &BTreeMap::new(),
                     )
                     .is_err()
             );
@@ -250,21 +251,22 @@ mod tests {
         let backend = backend();
         let model = model();
         let mut store = empty_store();
-        assert!(
-            store
-                .create(
-                    "llama.cpp",
-                    &model.profile_key(),
-                    "Default",
-                    BTreeMap::from([
-                        ("temperature".into(), " DEFAULT ".into()),
-                        ("flash-attn".into(), "true".into()),
-                        ("reasoning".into(), "OFF".into()),
-                    ]),
-                    false
-                )
-                .is_err()
-        );
+        for (key, value) in
+            [("temperature", " DEFAULT "), ("flash-attn", "true"), ("reasoning", "OFF")]
+        {
+            assert!(
+                store
+                    .set_value(
+                        "llama.cpp",
+                        &model.profile_key(),
+                        "Default",
+                        key,
+                        value.into(),
+                        &BTreeMap::new(),
+                    )
+                    .is_err()
+            );
+        }
         let options =
             resolve_options(&backend, &model, &profile("Default"), &store, &Defaults::default());
         validate_options(&backend, &model, &options).unwrap();

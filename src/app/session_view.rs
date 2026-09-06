@@ -25,6 +25,10 @@ impl Default for SessionViewState {
 }
 
 impl SessionViewState {
+    pub(super) fn select_last(&mut self, count: usize) {
+        self.selection.select(count.checked_sub(1));
+    }
+
     pub(super) fn sync_selection(&mut self, count: usize) {
         self.selection.select(if count == 0 {
             None
@@ -57,5 +61,16 @@ mod tests {
         assert_eq!(view.selection.selected(), Some(0));
         view.sync_selection(0);
         assert_eq!(view.selection.selected(), None);
+    }
+
+    #[test]
+    fn selecting_last_on_an_empty_list_clears_the_selection() {
+        let mut view = SessionViewState::default();
+        view.selection.select(Some(2));
+        view.select_last(0);
+        assert_eq!(view.selection.selected(), None);
+
+        view.select_last(3);
+        assert_eq!(view.selection.selected(), Some(2));
     }
 }
