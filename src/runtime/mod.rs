@@ -29,6 +29,23 @@ use crate::session::record::DownloadRecord;
 pub use flm::FlmBackend;
 pub use llama_cpp::LlamaCppBackend;
 
+/// Stable persistence/catalog identity, independent of selection and ordering.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RuntimeId(pub String);
+
+/// A backend-owned transfer that can run on a worker without borrowing App.
+#[derive(Clone)]
+pub struct ModelTransfer {
+    pub runtime: RuntimeId,
+    pub model: Box<Model>,
+    pub targets: Vec<PathBuf>,
+    pub run: fn(
+        &Model,
+        &std::sync::atomic::AtomicBool,
+        &mut dyn FnMut(u64, u64),
+    ) -> Result<crate::discovery::online::DownloadResult>,
+}
+
 /// The filesystem context a backend needs to enumerate its models.
 pub struct CatalogCtx<'a> {
     /// Configured model roots (llama.cpp scans these; FastFlowLM ignores them
@@ -234,6 +251,18 @@ pub(crate) fn tree_bytes(dir: &Path) -> u64 {
 
 /// One inference runtime: discovery result plus its dialect and behavior.
 pub trait RuntimeBackend: Send + Sync {
+    /// Stable identifier used for catalogs and persisted profiles.
+    fn id(&self) -> RuntimeId;
+
+    /// A transfer managed by this backend, if the model is not installed.
+    fn model_transfer(&self, _model: &Model) -> Option<ModelTransfer> {
+        None
+    }
+
+    fn download_available(&self, model: &Model) -> bool {
+        self.model_transfer(model).is_some()
+    }
+
     /// Identity and probe result, rendered in the Runtime column.
     fn descriptor(&self) -> &Runtime;
 
@@ -390,7 +419,8 @@ pub trait RuntimeBackend: Send + Sync {
 pub fn templates_for(runtime: &str) -> &'static [Template] {
     match runtime {
         flm::NAME => flm::TEMPLATES,
-        _ => llama_cpp::TEMPLATES,
+        llama_cpp::NAME => llama_cpp::TEMPLATES,
+        _ => &[],
     }
 }
 
@@ -404,7 +434,8 @@ pub fn templates_for(runtime: &str) -> &'static [Template] {
 pub fn throughput_parser(runtime: &str) -> fn(&str) -> Vec<crate::session::throughput::Sample> {
     match runtime {
         flm::NAME => flm::parse_throughput,
-        _ => llama_cpp::parse_throughput,
+        llama_cpp::NAME => llama_cpp::parse_throughput,
+        _ => |_| Vec::new(),
     }
 }
 

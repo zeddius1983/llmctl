@@ -348,7 +348,7 @@ impl SessionManager {
     /// panics. Tests that do need real processes are `#[ignore]`d and run
     /// single-threaded; these take a supervisor that touches no signals.
     #[cfg(test)]
-    fn without_supervisor(dir: PathBuf, log_dir: PathBuf) -> Self {
+    pub(crate) fn without_supervisor(dir: PathBuf, log_dir: PathBuf) -> Self {
         struct NeverSpawns;
         impl SessionSupervisor for NeverSpawns {
             fn spawn(&self, _spec: &LaunchSpec) -> Result<supervisor::Spawned> {

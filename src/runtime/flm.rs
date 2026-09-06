@@ -308,6 +308,37 @@ impl FlmBackend {
 }
 
 impl RuntimeBackend for FlmBackend {
+    fn id(&self) -> super::RuntimeId {
+        super::RuntimeId(NAME.into())
+    }
+
+    fn download_available(&self, model: &Model) -> bool {
+        model.flm.as_ref().is_some_and(|flm| !flm.installed)
+    }
+
+    fn model_transfer(&self, model: &Model) -> Option<super::ModelTransfer> {
+        if model.flm.as_ref()?.installed {
+            return None;
+        }
+        Some(super::ModelTransfer {
+            runtime: self.id(),
+            model: Box::new(model.clone()),
+            targets: model_dir(model).into_iter().collect(),
+            run: |model, cancelled, progress| {
+                download(model, cancelled, progress)
+                    .map(|outcome| match outcome {
+                        DownloadOutcome::Downloaded(path) => {
+                            crate::discovery::online::DownloadResult::Downloaded(path)
+                        }
+                        DownloadOutcome::Cancelled => {
+                            crate::discovery::online::DownloadResult::Cancelled
+                        }
+                    })
+                    .map_err(anyhow::Error::msg)
+            },
+        })
+    }
+
     fn descriptor(&self) -> &Runtime {
         &self.runtime
     }

@@ -9,6 +9,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use ratatui::DefaultTerminal;
 use ratatui::widgets::ListState;
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +21,9 @@ use crate::discovery;
 use crate::discovery::ModelSource;
 use crate::domain::{Model, OptionItem, Profile, format_unix_date, human_size};
 use crate::profiles::{self, ProfileStore};
-use crate::runtime::{CatalogCtx, Deletion, LaunchContext, RuntimeBackend};
+use crate::runtime::{
+    CatalogCtx, Deletion, LaunchContext, ModelTransfer, RuntimeBackend, RuntimeId,
+};
 use crate::session::{self, LaunchRequest, SessionManager};
 use crate::ui;
 
@@ -118,10 +121,8 @@ pub enum ModelDownloadStatus {
 enum DownloadSource {
     /// Hugging Face blobs that llmctl fetches into the Hub cache itself.
     Hub(Box<crate::domain::RemoteModel>),
-    /// A FastFlowLM model, fetched from its Hugging Face repository into
-    /// `flm`'s model directory. Deliberately not `flm pull` — that cannot
-    /// resume and mis-detects partial downloads.
-    Flm(Box<crate::domain::Model>),
+    /// A transfer whose layout and implementation belong to its backend.
+    Backend(ModelTransfer),
 }
 
 pub struct ModelDownload {
@@ -151,9 +152,7 @@ impl ModelDownload {
                 .filter_map(|blob| discovery::online::cache_blob_paths(&remote.repo, &blob.oid))
                 .flat_map(|(incomplete, complete)| [incomplete, complete])
                 .collect(),
-            DownloadSource::Flm(model) => {
-                crate::runtime::flm::model_dir(model).into_iter().collect()
-            }
+            DownloadSource::Backend(transfer) => transfer.targets.clone(),
         }
     }
 }
@@ -406,13 +405,9 @@ pub struct App {
     /// Scroll offset (lines from the top) for the log view when not following.
     pub log_scroll: u16,
     should_quit: bool,
-    /// Discovered GGUF models for the llama.cpp runtime, plus its cached online
-    /// tree. The online browsing machinery below is llama.cpp-specific, so this
-    /// list stays llama.cpp's alone.
-    scanned_models: Vec<Model>,
-    /// FastFlowLM's catalog, from `flm list`. Unlike the GGUF scan this is a
-    /// single curated list covering installed and available models alike.
-    flm_models: Vec<Model>,
+    /// Shared Hugging Face source metadata, separate from runtime catalogs.
+    online_models: Vec<Model>,
+    catalogs: HashMap<RuntimeId, Vec<Model>>,
     catalog_prefix: Vec<String>,
     catalog_history: Vec<(Vec<Model>, Option<usize>, Vec<String>)>,
     /// Expanded, absolute model search directories.
@@ -449,13 +444,22 @@ pub struct App {
 impl App {
     pub fn new(config: Config, paths: Paths) -> Self {
         let runtimes = crate::runtime::discover(&config, &paths);
+        Self::with_runtimes(config, paths, runtimes, |paths| {
+            SessionManager::new(paths.sessions_dir.clone(), paths.log_dir.clone())
+        })
+    }
+
+    fn with_runtimes(
+        config: Config,
+        paths: Paths,
+        runtimes: Vec<Box<dyn RuntimeBackend>>,
+        sessions: impl FnOnce(&Paths) -> SessionManager,
+    ) -> Self {
         let model_sources = resolve_model_sources(&config.models.paths, &config.models.sources);
         let model_cache = paths.cache_dir.join("models.json");
-        let mut scanned_models = discovery::scan_models(&model_sources, &model_cache);
-        discovery::reconcile(&paths.models_dir, &mut scanned_models);
         let online_sort = discovery::online::cached_sort(&paths.models_dir);
         let (model_downloads, next_download_id) = restore_model_downloads(&paths.models_dir);
-        scanned_models.extend(discovery::online::load_cached(&paths.models_dir));
+        let online_models = discovery::online::load_cached(&paths.models_dir);
 
         let catalog_ctx = CatalogCtx {
             sources: &model_sources,
@@ -465,18 +469,13 @@ impl App {
             // Nothing is memoized yet, so this reads from `flm` either way.
             reload: false,
         };
-        let flm_models = runtimes
-            .iter()
-            .find(|backend| !backend.supports_online_browse())
-            .map(|backend| backend.models(&catalog_ctx))
-            .unwrap_or_default();
-
-        let mut all_models = scanned_models.clone();
-        all_models.extend(flm_models.iter().cloned());
+        let catalogs: HashMap<_, _> =
+            runtimes.iter().map(|backend| (backend.id(), backend.models(&catalog_ctx))).collect();
+        let all_models: Vec<_> = catalogs.values().flatten().cloned().collect();
         let store = ProfileStore::load(paths.state_dir.join("profiles.json"), &all_models);
         // Built after discovery's one-shot `Command`s: the supervisor ignores
         // SIGCHLD, which would otherwise prevent reaping those probe processes.
-        let sessions = SessionManager::new(paths.sessions_dir.clone(), paths.log_dir.clone());
+        let sessions = sessions(&paths);
 
         let (online_tx, online_rx) = mpsc::channel();
         let (download_tx, download_rx) = mpsc::channel();
@@ -503,8 +502,8 @@ impl App {
             log_follow: true,
             log_scroll: 0,
             should_quit: false,
-            scanned_models,
-            flm_models,
+            online_models,
+            catalogs,
             catalog_prefix: Vec::new(),
             catalog_history: Vec::new(),
             model_sources,
@@ -597,7 +596,7 @@ impl App {
             self.sessions.sessions.iter().any(|session| {
                 session.record.command.iter().any(|argument| argument == "--hf-repo")
             });
-        let has_incomplete_remote = self.scanned_models.iter().any(|model| {
+        let has_incomplete_remote = self.online_models.iter().any(|model| {
             model.remote.as_ref().is_some_and(|remote| {
                 remote.file.is_some()
                     // A dFlash drafter is deliberately absent here: a native
@@ -616,7 +615,7 @@ impl App {
         }
         let models = discovery::online::load_cached(&self.models_dir);
         let newly_cached = models.iter().any(|fresh| {
-            self.scanned_models.iter().find(|old| old.id == fresh.id).is_some_and(|old| {
+            self.online_models.iter().find(|old| old.id == fresh.id).is_some_and(|old| {
                 (old.path.as_os_str().is_empty() && !fresh.path.as_os_str().is_empty())
                     || (old.mtp_path.is_none() && fresh.mtp_path.is_some())
                     || (old.dflash_path.is_none() && fresh.dflash_path.is_some())
@@ -624,10 +623,10 @@ impl App {
             })
         });
         if newly_cached {
-            self.scanned_models
+            self.online_models
                 .retain(|model| !discovery::online::is_online_path(&model.catalog_path));
-            self.scanned_models.extend(models);
-            self.store.sync_models(&self.scanned_models);
+            self.online_models.extend(models);
+            self.sync_online_catalogs();
             self.rebuild_below(Pane::Model);
         }
     }
@@ -662,10 +661,10 @@ impl App {
                     }
                 }
                 Ok(models) => {
-                    self.scanned_models
+                    self.online_models
                         .retain(|model| !discovery::online::is_online_path(&model.catalog_path));
-                    self.scanned_models.extend(models);
-                    self.store.sync_models(&self.scanned_models);
+                    self.online_models.extend(models);
+                    self.sync_online_catalogs();
                     if self.online_restore_models {
                         self.show_online_models_root();
                         self.online_restore_models = false;
@@ -692,30 +691,32 @@ impl App {
         if self.online_search_results.is_empty() {
             return;
         }
-        self.scanned_models
+        self.online_models
             .retain(|model| !self.online_search_results.iter().any(|id| id == &model.id));
         self.online_search_results.clear();
+        self.rebuild_online_catalogs();
     }
 
     fn replace_online_search_results(&mut self, models: Vec<Model>) {
         self.clear_online_search_results();
         for model in models {
-            if self.scanned_models.iter().any(|cached| cached.id == model.id) {
+            if self.online_models.iter().any(|cached| cached.id == model.id) {
                 continue;
             }
             self.online_search_results.push(model.id.clone());
-            self.scanned_models.push(model);
+            self.online_models.push(model);
         }
+        self.rebuild_online_catalogs();
     }
 
     fn save_online_search_selection(&mut self, model: &Model) -> std::result::Result<(), String> {
         discovery::online::save_selected_repository(&self.models_dir, model, self.online_sort)
             .map_err(|error| error.to_string())?;
         self.clear_online_search_results();
-        self.scanned_models
+        self.online_models
             .retain(|cached| !discovery::online::is_online_path(&cached.catalog_path));
-        self.scanned_models.extend(discovery::online::load_cached(&self.models_dir));
-        self.store.sync_models(&self.scanned_models);
+        self.online_models.extend(discovery::online::load_cached(&self.models_dir));
+        self.sync_online_catalogs();
         Ok(())
     }
 
@@ -763,16 +764,14 @@ impl App {
             return;
         };
         let cached = match &request {
-            discovery::online::Request::Repositories(_) => {
-                self.scanned_models.iter().any(|model| {
-                    model
-                        .remote
-                        .as_ref()
-                        .is_some_and(|remote| remote.file.is_none() && !remote.repo.is_empty())
-                })
-            }
+            discovery::online::Request::Repositories(_) => self.online_models.iter().any(|model| {
+                model
+                    .remote
+                    .as_ref()
+                    .is_some_and(|remote| remote.file.is_none() && !remote.repo.is_empty())
+            }),
             discovery::online::Request::Repository(repo) => {
-                let artifacts = self.scanned_models.iter().filter(|model| {
+                let artifacts = self.online_models.iter().filter(|model| {
                     model
                         .remote
                         .as_ref()
@@ -867,7 +866,7 @@ impl App {
         self.catalog_history.clear();
         self.catalog_prefix.clear();
         // Same catalog, arranged differently — no reason to ask `flm` again.
-        self.refresh_flm_models(false);
+        self.refresh_selected_catalog(false);
         self.rebuild_below(Pane::Runtime);
 
         self.restore_catalog_position(selection.as_deref(), &prefix);
@@ -907,9 +906,9 @@ impl App {
             return;
         }
 
-        self.scanned_models.retain(|model| !discovery::online::is_online_path(&model.catalog_path));
-        self.scanned_models.extend(discovery::online::load_cached(&self.models_dir));
-        self.store.sync_models(&self.scanned_models);
+        self.online_models.retain(|model| !discovery::online::is_online_path(&model.catalog_path));
+        self.online_models.extend(discovery::online::load_cached(&self.models_dir));
+        self.sync_online_catalogs();
 
         self.online_restore_models = true;
         self.show_online_models_root();
@@ -1487,8 +1486,10 @@ impl App {
     /// Start (or reveal) a download for the selected model — the `d` key.
     fn download_selected_model(&mut self) {
         let Some(model) = self.selected_model().cloned() else { return };
-        if model.flm.is_some() {
-            self.download_flm_model(&model);
+        if let Some(transfer) =
+            self.runtimes.selected().and_then(|backend| backend.model_transfer(&model))
+        {
+            self.download_backend_model(transfer);
             return;
         }
         let Some(remote) = model.remote.clone() else { return };
@@ -1578,14 +1579,9 @@ impl App {
         self.spawn_model_download(id, DownloadSource::Hub(Box::new(remote)), cancelled);
     }
 
-    /// `flm pull <tag>`. There is no persisted resume record: `flm` keeps its
-    /// own partial state and a re-run picks up where it left off, so an
-    /// interrupted pull is simply started again.
-    fn download_flm_model(&mut self, model: &Model) {
-        let Some(flm) = model.flm.as_ref() else { return };
-        if flm.installed {
-            return;
-        }
+    /// Start a transfer prepared by the selected runtime.
+    fn download_backend_model(&mut self, transfer: ModelTransfer) {
+        let model = &transfer.model;
         // Already tracked: jump to it rather than starting a second transfer.
         if let Some(index) =
             self.model_downloads.iter().position(|download| download.model_id == model.id)
@@ -1613,11 +1609,11 @@ impl App {
 
         let id = self.next_download_id();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let source = DownloadSource::Flm(Box::new(model.clone()));
+        let source = DownloadSource::Backend(transfer.clone());
         self.model_downloads.push(ModelDownload {
             id,
             model_id: model.id.clone(),
-            model: flm.tag.clone(),
+            model: model.name.clone(),
             downloaded_bytes: 0,
             total_bytes: model.size_bytes,
             status: ModelDownloadStatus::Downloading,
@@ -1652,17 +1648,9 @@ impl App {
                     discovery::online::download_model(&remote, &cancelled, progress)
                         .map_err(|error| error.to_string())
                 }
-                DownloadSource::Flm(model) => {
-                    crate::runtime::flm::download(&model, &cancelled, progress).map(|outcome| {
-                        match outcome {
-                            crate::runtime::flm::DownloadOutcome::Downloaded(path) => {
-                                discovery::online::DownloadResult::Downloaded(path)
-                            }
-                            crate::runtime::flm::DownloadOutcome::Cancelled => {
-                                discovery::online::DownloadResult::Cancelled
-                            }
-                        }
-                    })
+                DownloadSource::Backend(transfer) => {
+                    (transfer.run)(&transfer.model, &cancelled, &mut { progress })
+                        .map_err(|error| error.to_string())
                 }
             };
             let _ = tx.send(ModelDownloadEvent::Finished { id, result });
@@ -1671,7 +1659,7 @@ impl App {
 
     fn poll_model_download(&mut self) {
         let mut refresh_models = false;
-        let mut refresh_flm = false;
+        let mut refresh_runtimes = HashSet::new();
         let mut completed_records = Vec::new();
         while let Ok(event) = self.download_rx.try_recv() {
             match event {
@@ -1697,8 +1685,10 @@ impl App {
                         Ok(discovery::online::DownloadResult::Downloaded(path)) => {
                             download.downloaded_bytes = download.total_bytes;
                             download.status = ModelDownloadStatus::Downloaded(path);
-                            match download.source {
-                                DownloadSource::Flm { .. } => refresh_flm = true,
+                            match &download.source {
+                                DownloadSource::Backend(transfer) => {
+                                    refresh_runtimes.insert(transfer.runtime.clone());
+                                }
                                 DownloadSource::Hub(_) => {
                                     completed_records.push(download.model_id.clone());
                                     refresh_models = true;
@@ -1723,10 +1713,8 @@ impl App {
                 tracing::warn!(%error, model = %model_id, "failed to remove completed download record");
             }
         }
-        if refresh_flm {
-            // A download just finished: `flm` now reports the model installed,
-            // which is exactly the change the cached catalog cannot know about.
-            self.refresh_flm_models(true);
+        for runtime in refresh_runtimes {
+            self.refresh_runtime_models(&runtime, true);
             self.reselect_current_catalog();
         }
         if refresh_models {
@@ -1749,9 +1737,9 @@ impl App {
 
     fn refresh_downloaded_online_models(&mut self) {
         let selected = self.models.selected().map(|model| model.id.clone());
-        self.scanned_models.retain(|model| !discovery::online::is_online_path(&model.catalog_path));
-        self.scanned_models.extend(discovery::online::load_cached(&self.models_dir));
-        self.store.sync_models(&self.scanned_models);
+        self.online_models.retain(|model| !discovery::online::is_online_path(&model.catalog_path));
+        self.online_models.extend(discovery::online::load_cached(&self.models_dir));
+        self.sync_online_catalogs();
         if self.runtimes.selected().is_some_and(|backend| backend.supports_online_browse()) {
             let items = self.catalog_children(&self.catalog_prefix);
             let index = selected
@@ -1777,7 +1765,7 @@ impl App {
         let id = self.next_download_id();
         let cancelled = Arc::new(AtomicBool::new(false));
         let source = self.model_downloads[index].source.clone();
-        // Only Hub downloads persist a resume record; `flm` tracks its own.
+        // Hub transfers persist job records; backend transfers resume via their backend.
         if let DownloadSource::Hub(remote) = &source {
             let record = discovery::online::DownloadJobRecord::new(
                 self.model_downloads[index].model_id.clone(),
@@ -2486,13 +2474,11 @@ impl App {
     /// is not cached yet, or a FastFlowLM catalog entry that is not installed.
     pub fn download_available(&self) -> bool {
         self.focus == Pane::Model
-            && self.selected_model().is_some_and(|model| match &model.flm {
-                Some(flm) => !flm.installed,
-                None => {
-                    model.path.as_os_str().is_empty()
-                        && model.remote.as_ref().is_some_and(|remote| remote.file.is_some())
-                }
-            })
+            && self
+                .runtimes
+                .selected()
+                .zip(self.selected_model())
+                .is_some_and(|(backend, model)| backend.download_available(model))
     }
 
     /// Whether `D` can remove the selection from local storage.
@@ -2625,14 +2611,7 @@ impl App {
     /// online view — re-queries the Hub, which is a lot of upheaval for "one
     /// artifact is no longer on disk".
     fn reload_catalog_in_place(&mut self) {
-        if self.runtimes.selected().is_some_and(|backend| backend.supports_online_browse()) {
-            self.scanned_models = discovery::scan_models(&self.model_sources, &self.model_cache);
-            discovery::reconcile(&self.models_dir, &mut self.scanned_models);
-            self.scanned_models.extend(discovery::online::load_cached(&self.models_dir));
-            self.store.sync_models(&self.scanned_models);
-        } else {
-            self.refresh_flm_models(true);
-        }
+        self.refresh_selected_catalog(true);
 
         let prefixes: Vec<Vec<String>> =
             self.catalog_history.iter().map(|(_, _, prefix)| prefix.clone()).collect();
@@ -2670,14 +2649,37 @@ impl App {
         self.catalog_history.last().map(|(items, selected, _)| (items.as_slice(), *selected))
     }
 
-    /// The flat model list backing the browser tree for the selected runtime.
+    /// The selected runtime always owns its catalog, regardless of capabilities.
     fn catalog_source(&self) -> &[Model] {
-        // The online (Hugging Face) subtree and its blob downloads only exist
-        // for llama.cpp, so the two catalogs are stored separately rather than
-        // merged behind one list.
-        match self.runtimes.selected() {
-            Some(backend) if !backend.supports_online_browse() => &self.flm_models,
-            _ => &self.scanned_models,
+        self.runtimes
+            .selected()
+            .and_then(|backend| self.catalogs.get(&backend.id()))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn sync_online_catalogs(&mut self) {
+        self.rebuild_online_catalogs();
+        for backend in &self.runtimes.items {
+            if backend.supports_online_browse() {
+                if let Some(models) = self.catalogs.get(&backend.id()) {
+                    self.store.sync_models(models);
+                }
+            }
+        }
+    }
+
+    fn rebuild_online_catalogs(&mut self) {
+        for backend in &self.runtimes.items {
+            if !backend.supports_online_browse() {
+                continue;
+            }
+            let models = self.catalogs.entry(backend.id()).or_default();
+            models.retain(|model| !discovery::online::is_online_path(&model.catalog_path));
+            models.extend(self.online_models.iter().cloned().map(|mut model| {
+                model.runtime = backend.id().0;
+                model
+            }));
         }
     }
 
@@ -2692,14 +2694,8 @@ impl App {
         catalog_children_of(source, prefix)
     }
 
-    /// Rebuild the FastFlowLM model list for the current arrangement.
-    ///
-    /// `reload` decides whether `flm list` runs again or the backend serves the
-    /// catalog it already has. Pass it when the catalog itself may have changed
-    /// — a manual refresh, or a download that just installed a model — and not
-    /// when only the arrangement did.
-    fn refresh_flm_models(&mut self, reload: bool) {
-        let Some(backend) = self.runtimes.items.iter().find(|b| !b.supports_online_browse()) else {
+    fn refresh_runtime_models(&mut self, id: &RuntimeId, reload: bool) {
+        let Some(backend) = self.runtimes.items.iter().find(|backend| &backend.id() == id) else {
             return;
         };
         let ctx = CatalogCtx {
@@ -2709,8 +2705,22 @@ impl App {
             view: self.catalog_view,
             reload,
         };
-        self.flm_models = backend.models(&ctx);
-        self.store.sync_models(&self.flm_models);
+        let models = backend.models(&ctx);
+        if backend.supports_online_browse() {
+            self.online_models = models
+                .iter()
+                .filter(|model| discovery::online::is_online_path(&model.catalog_path))
+                .cloned()
+                .collect();
+        }
+        self.store.sync_models(&models);
+        self.catalogs.insert(id.clone(), models);
+    }
+
+    fn refresh_selected_catalog(&mut self, reload: bool) {
+        if let Some(id) = self.runtimes.selected().map(|backend| backend.id()) {
+            self.refresh_runtime_models(&id, reload);
+        }
     }
 
     /// Re-scan configured model directories (the `F5` refresh).
@@ -2719,13 +2729,7 @@ impl App {
             self.reload_online_layout();
             return;
         }
-        // The user asked for fresh data, so go back to `flm` — this is how a
-        // model installed outside llmctl shows up.
-        self.refresh_flm_models(true);
-        self.scanned_models = discovery::scan_models(&self.model_sources, &self.model_cache);
-        discovery::reconcile(&self.models_dir, &mut self.scanned_models);
-        self.scanned_models.extend(discovery::online::load_cached(&self.models_dir));
-        self.store.sync_models(&self.scanned_models);
+        self.refresh_selected_catalog(true);
         self.catalog_history.clear();
         self.catalog_prefix.clear();
         // Models or anything downstream may have changed; rebuild from runtime.
@@ -3363,6 +3367,117 @@ fn cycle_device(devices: &[String], current: &str, dir: i32) -> String {
 mod tests {
     use super::*;
 
+    struct CatalogBackend {
+        runtime: crate::domain::Runtime,
+        online: bool,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RuntimeBackend for CatalogBackend {
+        fn id(&self) -> RuntimeId {
+            RuntimeId(self.runtime.name.clone())
+        }
+        fn descriptor(&self) -> &crate::domain::Runtime {
+            &self.runtime
+        }
+        fn schema(&self) -> &'static crate::profiles::registry::OptionSchema {
+            &crate::runtime::llama_cpp::SCHEMA
+        }
+        fn templates(&self) -> &'static [crate::profiles::templates::Template] {
+            &[]
+        }
+        fn models(&self, _: &CatalogCtx) -> Vec<Model> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let mut model = flm_catalog_entry(&self.runtime.name, "chat");
+            model.runtime = self.runtime.name.clone();
+            vec![model]
+        }
+        fn spec_default(
+            &self,
+            spec: &crate::profiles::registry::OptionSpec,
+            _: &Model,
+            _: &crate::config::Defaults,
+        ) -> String {
+            spec.default.into()
+        }
+        fn build_command(&self, _: &LaunchContext) -> session::command::Command {
+            session::command::Command { argv: vec![] }
+        }
+        fn chat_argv(&self, _: &LaunchContext) -> Option<Vec<String>> {
+            None
+        }
+        fn bench_argv(&self, _: &LaunchContext) -> Option<Vec<String>> {
+            None
+        }
+        fn health_path(&self) -> &'static str {
+            "/health"
+        }
+        fn process_token(&self, ctx: &LaunchContext) -> String {
+            ctx.model.name.clone()
+        }
+        fn supports_online_browse(&self) -> bool {
+            self.online
+        }
+    }
+
+    #[test]
+    fn a_third_runtime_has_its_own_catalog_and_refresh() {
+        let root =
+            std::env::temp_dir().join(format!("llmctl-three-runtimes-{}", std::process::id()));
+        let paths = Paths {
+            config_file: root.join("config.toml"),
+            models_dir: root.join("models"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+            sessions_dir: root.join("sessions"),
+        };
+        paths.ensure_dirs().unwrap();
+        let counts: Vec<_> =
+            (0..3).map(|_| Arc::new(std::sync::atomic::AtomicUsize::new(0))).collect();
+        let runtimes: Vec<Box<dyn RuntimeBackend>> = counts
+            .iter()
+            .enumerate()
+            .map(|(i, reads)| {
+                Box::new(CatalogBackend {
+                    runtime: crate::domain::Runtime {
+                        name: format!("runtime-{i}"),
+                        description: String::new(),
+                        version: None,
+                        binary_path: None,
+                        bench_path: None,
+                        formats: vec![],
+                        devices: vec![],
+                    },
+                    online: i == 0,
+                    reads: reads.clone(),
+                }) as Box<dyn RuntimeBackend>
+            })
+            .collect();
+        let mut app = App::with_runtimes(Config::default(), paths, runtimes, |paths| {
+            SessionManager::without_supervisor(paths.sessions_dir.clone(), paths.log_dir.clone())
+        });
+        for i in 0..3 {
+            app.runtimes.state.select(Some(i));
+            assert_eq!(app.catalog_source()[0].runtime, format!("runtime-{i}"));
+        }
+        app.refresh_selected_catalog(true);
+        assert_eq!(
+            counts.iter().map(|count| count.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+            [1, 1, 2]
+        );
+        let mut transient = flm_catalog_entry("search-result", "chat");
+        transient.catalog_path = vec!["online".into(), "huggingface".into(), "org/repo".into()];
+        app.replace_online_search_results(vec![transient]);
+        assert_eq!(app.catalog_source().len(), 1, "online source must not alter a non-Hub catalog");
+        app.runtimes.state.select(Some(0));
+        assert_eq!(app.catalog_source().len(), 2);
+        app.clear_online_search_results();
+        assert_eq!(app.catalog_source().len(), 1);
+        assert!(crate::runtime::templates_for("runtime-2").is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn selector() -> Selector {
         Selector {
             key: "chat-template".into(),
@@ -3612,7 +3727,7 @@ mod tests {
         // F5 re-reads the catalog through the same subprocess path, so it fails
         // the same way if the SIGCHLD disposition is not handled.
         app.refresh_models();
-        assert!(!app.flm_models.is_empty(), "F5 emptied the FastFlowLM catalog");
+        assert!(!app.catalog_source().is_empty(), "F5 emptied the FastFlowLM catalog");
         assert!(!app.models.items.is_empty(), "F5 emptied the model pane");
 
         let _ = std::fs::remove_dir_all(&root);

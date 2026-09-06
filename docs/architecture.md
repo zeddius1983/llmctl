@@ -175,3 +175,12 @@ can implement the same trait. See ADR-005 and ADR-007.
   must be given a window size via `TIOCSWINSZ` or crossterm renders blank).
   Multi-byte escape sequences (Home/End/arrows) are split by the driver, so
   those bindings are verified by unit tests instead.
+
+## Runtime catalog ownership
+
+`App` stores catalogs by stable `RuntimeId`. Each registered backend enumerates
+its own models and prepares its own optional `ModelTransfer`, including target
+paths and worker behavior. Refresh and download completion address the owning
+runtime explicitly. Hugging Face browsing metadata is a shared source overlay;
+updates are applied only to backends advertising that browsing capability.
+Unknown runtime names have no built-in templates or throughput parser.

@@ -476,6 +476,15 @@ pub const NAME: &str = "llama.cpp";
 const HELP_CACHE: &str = "llama-server.help.txt";
 
 impl RuntimeBackend for LlamaCppBackend {
+    fn id(&self) -> super::RuntimeId {
+        super::RuntimeId(NAME.into())
+    }
+
+    fn download_available(&self, model: &Model) -> bool {
+        model.path.as_os_str().is_empty()
+            && model.remote.as_ref().is_some_and(|remote| remote.file.is_some())
+    }
+
     fn descriptor(&self) -> &Runtime {
         &self.runtime
     }
