@@ -244,6 +244,9 @@ fn build_model(path: &Path, size: u64, modified: Option<u64>) -> Model {
         .or_else(|| info.as_ref().and_then(|i| i.file_type_label.clone()));
 
     Model {
+        entry: crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf {
+            remote: None,
+        }),
         id: String::new(),
         name,
         path: path.to_path_buf(),
@@ -261,9 +264,7 @@ fn build_model(path: &Path, size: u64, modified: Option<u64>) -> Model {
         context_length: info.as_ref().and_then(|i| i.context_length),
         modified,
         has_chat_template: info.as_ref().map(|i| i.has_chat_template).unwrap_or(false),
-        flm: None,
         runtime: crate::runtime::llama_cpp::NAME.into(),
-        remote: None,
     }
 }
 
@@ -513,6 +514,9 @@ mod tests {
 
     fn model(id: &str, path: &str, catalog_path: &[&str]) -> Model {
         Model {
+            entry: crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf {
+                remote: None,
+            }),
             id: id.into(),
             name: Path::new(path).file_name().unwrap().to_string_lossy().into_owned(),
             path: path.into(),
@@ -530,9 +534,7 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
-            flm: None,
             runtime: crate::runtime::llama_cpp::NAME.into(),
-            remote: None,
         }
     }
 

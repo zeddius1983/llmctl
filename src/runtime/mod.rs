@@ -75,8 +75,25 @@ pub struct CatalogCtx<'a> {
 /// their own model metadata (`Model::flm`, `Model::remote`, …) for the rest.
 pub struct LaunchContext<'a> {
     pub binary: &'a str,
-    pub model: &'a Model,
+    model: &'a Model,
     pub options: &'a [OptionItem],
+}
+
+impl<'a> LaunchContext<'a> {
+    pub fn new(
+        binary: &'a str,
+        model: &'a Model,
+        options: &'a [OptionItem],
+    ) -> std::result::Result<Self, String> {
+        if model.is_catalog_dir() {
+            return Err("select a model rather than a catalog directory".into());
+        }
+        Ok(Self { binary, model, options })
+    }
+
+    pub fn model(&self) -> &'a Model {
+        self.model
+    }
 }
 
 /// A directory that is worth nothing once the directories it depends on are

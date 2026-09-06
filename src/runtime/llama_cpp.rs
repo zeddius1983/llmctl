@@ -482,7 +482,7 @@ impl RuntimeBackend for LlamaCppBackend {
 
     fn download_available(&self, model: &Model) -> bool {
         model.path.as_os_str().is_empty()
-            && model.remote.as_ref().is_some_and(|remote| remote.file.is_some())
+            && model.remote().is_some_and(|remote| remote.file.is_some())
     }
 
     fn descriptor(&self) -> &Runtime {
@@ -533,7 +533,7 @@ impl RuntimeBackend for LlamaCppBackend {
     /// set of hash-named blobs. Both are removable; only the second needs the
     /// cache layout unpicked for it.
     fn deletion(&self, model: &Model, catalog: &[Model]) -> Option<Deletion> {
-        match model.remote {
+        match model.remote() {
             Some(_) => crate::discovery::online::deletion(model, catalog),
             None => local_deletion(model, catalog),
         }
@@ -633,7 +633,7 @@ impl RuntimeBackend for LlamaCppBackend {
     }
 
     fn build_command(&self, ctx: &LaunchContext) -> Command {
-        let model = ctx.model;
+        let model = ctx.model();
         let drafter = drafter(ctx.options);
         let draft_path = draft_path(model, drafter).map(|p| p.display().to_string());
         let projector_path = model.projector_path.as_ref().map(|p| p.display().to_string());
@@ -667,7 +667,8 @@ impl RuntimeBackend for LlamaCppBackend {
         let binary = cli_binary(ctx.binary)?;
         let options: Vec<OptionItem> =
             ctx.options.iter().filter(|o| o.key != "host" && o.key != "port").cloned().collect();
-        let sub = LaunchContext { binary: &binary, model: ctx.model, options: &options };
+        let sub = LaunchContext::new(&binary, ctx.model(), &options)
+            .expect("selected model is launchable");
         let mut argv = self.build_command(&sub).argv;
         argv.push("-cnv".into());
         Some(argv)
@@ -675,7 +676,7 @@ impl RuntimeBackend for LlamaCppBackend {
 
     fn bench_argv(&self, ctx: &LaunchContext) -> Option<Vec<String>> {
         let bench = self.runtime.bench_path.as_ref()?.display().to_string();
-        let mut argv = vec![bench, "-m".into(), ctx.model.path.display().to_string()];
+        let mut argv = vec![bench, "-m".into(), ctx.model().path.display().to_string()];
         for key in ["device", "gpu-layers"] {
             if let Some(opt) = ctx.options.iter().find(|o| o.key == key && o.value != DEFAULT) {
                 argv.push(if key == "device" { "--device".into() } else { "-ngl".into() });
@@ -694,9 +695,9 @@ impl RuntimeBackend for LlamaCppBackend {
     /// A remote launch names the repo-relative filename that llama.cpp will
     /// fetch; a local one names the GGUF path.
     fn process_token(&self, ctx: &LaunchContext) -> String {
-        match remote_launch(ctx.model, drafter(ctx.options)) {
+        match remote_launch(ctx.model(), drafter(ctx.options)) {
             Some(remote) => remote.file.clone().unwrap_or_default(),
-            None => ctx.model.path.display().to_string(),
+            None => ctx.model().path.display().to_string(),
         }
     }
 
@@ -725,14 +726,14 @@ impl RuntimeBackend for LlamaCppBackend {
                     .into(),
             );
         }
-        let remote = remote_launch(ctx.model, drafter)?;
+        let remote = remote_launch(ctx.model(), drafter)?;
         if !self.hf_supported {
             return Some(
                 "this llama-server does not advertise --hf-repo/--hf-file; upgrade llama.cpp"
                     .into(),
             );
         }
-        let cached = draft_path(ctx.model, drafter).is_some();
+        let cached = draft_path(ctx.model(), drafter).is_some();
         match draft_hf(remote, drafter, cached) {
             Some(_) if !self.draft_hf_supported => {
                 return Some(
@@ -754,7 +755,7 @@ impl RuntimeBackend for LlamaCppBackend {
             }
             _ => {}
         }
-        if ctx.model.projector_path.is_none()
+        if ctx.model().projector_path.is_none()
             && remote.projector_file.is_some()
             && !self.mmproj_auto_supported
         {
@@ -769,7 +770,7 @@ impl RuntimeBackend for LlamaCppBackend {
     /// The Hub blobs llama.cpp will pull, so the session shows download
     /// progress rather than sitting in `Starting` for minutes.
     fn launch_download(&self, ctx: &LaunchContext) -> Option<DownloadRecord> {
-        let remote = remote_launch(ctx.model, drafter(ctx.options))?;
+        let remote = remote_launch(ctx.model(), drafter(ctx.options))?;
         let blobs: Vec<DownloadBlob> = remote
             .blobs
             .iter()
@@ -1025,7 +1026,7 @@ fn config_default(spec: &OptionSpec, defaults: &Defaults) -> String {
 /// The remote identity to launch from, when one or more required artifacts are
 /// not in the local cache and llama.cpp must fetch them itself.
 fn remote_launch(model: &Model, drafter: Option<Drafter>) -> Option<&RemoteModel> {
-    let remote = model.remote.as_ref()?;
+    let remote = model.remote()?;
     let base_missing = model.path.as_os_str().is_empty();
     let draft_missing =
         draft_path(model, drafter).is_none() && draft_file(remote, drafter).is_some();
@@ -1209,6 +1210,9 @@ mod tests {
     /// A bare local GGUF with no companions and no remote identity.
     fn test_model() -> Model {
         Model {
+            entry: crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf {
+                remote: None,
+            }),
             id: "models:1".into(),
             name: "model.gguf".into(),
             path: "/m/model.gguf".into(),
@@ -1226,8 +1230,6 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
-            remote: None,
-            flm: None,
             runtime: NAME.into(),
         }
     }
@@ -1615,11 +1617,8 @@ mod tests {
             cli: "--spec-type".into(),
             description: String::new(),
         };
-        let ctx = LaunchContext {
-            binary: "llama-server",
-            model: &model,
-            options: std::slice::from_ref(&selected),
-        };
+        let ctx = LaunchContext::new("llama-server", &model, std::slice::from_ref(&selected))
+            .expect("selected model is launchable");
         assert!(backend.launch_blocker(&ctx).unwrap().contains("draft-dflash"));
     }
 
@@ -1748,21 +1747,15 @@ mod tests {
             cli: "-lm".into(),
             description: String::new(),
         };
-        let ctx = LaunchContext {
-            binary: "llama-server",
-            model: &model,
-            options: std::slice::from_ref(&none),
-        };
+        let ctx = LaunchContext::new("llama-server", &model, std::slice::from_ref(&none))
+            .expect("selected model is launchable");
         assert!(backend.launch_blocker(&ctx).unwrap().contains("--load-mode"));
 
         // At its omitted default the flag never reaches the command line, so an
         // older binary launches fine.
         let default = OptionItem { value: DEFAULT.into(), ..none };
-        let ctx = LaunchContext {
-            binary: "llama-server",
-            model: &model,
-            options: std::slice::from_ref(&default),
-        };
+        let ctx = LaunchContext::new("llama-server", &model, std::slice::from_ref(&default))
+            .expect("selected model is launchable");
         assert!(backend.launch_blocker(&ctx).is_none());
     }
 

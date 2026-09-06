@@ -597,7 +597,7 @@ impl App {
                 session.record.command.iter().any(|argument| argument == "--hf-repo")
             });
         let has_incomplete_remote = self.online_models.iter().any(|model| {
-            model.remote.as_ref().is_some_and(|remote| {
+            model.remote().is_some_and(|remote| {
                 remote.file.is_some()
                     // A dFlash drafter is deliberately absent here: a native
                     // `-hf` launch cannot fetch an unqualified companion, so
@@ -766,21 +766,20 @@ impl App {
         let cached = match &request {
             discovery::online::Request::Repositories(_) => self.online_models.iter().any(|model| {
                 model
-                    .remote
+                    .remote()
                     .as_ref()
                     .is_some_and(|remote| remote.file.is_none() && !remote.repo.is_empty())
             }),
             discovery::online::Request::Repository(repo) => {
                 let artifacts = self.online_models.iter().filter(|model| {
                     model
-                        .remote
+                        .remote()
                         .as_ref()
                         .is_some_and(|remote| remote.repo == *repo && remote.file.is_some())
                 });
                 let mut found = false;
                 let complete = artifacts.inspect(|_| found = true).all(|model| {
-                    !model.path.as_os_str().is_empty()
-                        || !model.remote.as_ref().unwrap().blobs.is_empty()
+                    !model.path.as_os_str().is_empty() || !model.remote().unwrap().blobs.is_empty()
                 });
                 found && complete
             }
@@ -1098,7 +1097,7 @@ impl App {
                     .cloned();
                 let promote = self.model_search.as_ref().is_some_and(|search| search.online)
                     && target.as_ref().is_some_and(|model| {
-                        model.remote.as_ref().is_some_and(|remote| remote.file.is_none())
+                        model.remote().is_some_and(|remote| remote.file.is_none())
                     });
                 self.model_search = None;
                 self.online_search_due = None;
@@ -1382,7 +1381,7 @@ impl App {
             .display()
             .to_string();
 
-        let ctx = LaunchContext { binary: &binary, model, options: &options };
+        let ctx = LaunchContext::new(&binary, model, &options)?;
         if let Some(blocker) = backend.launch_blocker(&ctx) {
             return Err(blocker);
         }
@@ -1492,7 +1491,7 @@ impl App {
             self.download_backend_model(transfer);
             return;
         }
-        let Some(remote) = model.remote.clone() else { return };
+        let Some(remote) = model.remote().cloned() else { return };
         let total_bytes = remote.blobs.iter().map(|blob| blob.size_bytes).sum();
         let downloaded_bytes = discovery::online::cached_downloaded_bytes(&remote);
         if remote.file.is_none() {
@@ -1817,7 +1816,7 @@ impl App {
             self.message = Some(Message { title: "Invalid profile".into(), lines: vec![error] });
             return;
         }
-        let ctx = LaunchContext { binary: &binary, model, options: &self.options.items };
+        let Ok(ctx) = LaunchContext::new(&binary, model, &self.options.items) else { return };
         match backend.chat_argv(&ctx) {
             Some(argv) => self.pending_chat = Some(argv),
             None => {
@@ -1851,7 +1850,7 @@ impl App {
             self.message = Some(Message { title: "Invalid profile".into(), lines: vec![error] });
             return;
         }
-        let ctx = LaunchContext { binary: &binary, model, options: &self.options.items };
+        let Ok(ctx) = LaunchContext::new(&binary, model, &self.options.items) else { return };
         self.pending_benchmark = backend.bench_argv(&ctx);
     }
 
@@ -2904,7 +2903,7 @@ impl App {
                 (primary, meta.join(" · "))
             }),
             Pane::Model => self.models.selected().map(|m| {
-                if let Some(remote) = &m.remote {
+                if let Some(remote) = m.remote() {
                     let primary = match &remote.file {
                         Some(file) => format!("hf://{}/{file}", remote.repo),
                         None => format!("hf://{}", remote.repo),
@@ -3037,7 +3036,7 @@ fn online_repository_children(models: &[Model], prefix: &[String]) -> Option<Vec
             .filter(|model| {
                 model.catalog_path.starts_with(prefix)
                     && model.catalog_path.len() == prefix.len() + 1
-                    && model.remote.as_ref().is_some_and(|remote| remote.file.is_none())
+                    && model.remote().is_some_and(|remote| remote.file.is_none())
             })
             .cloned()
             .collect(),
@@ -3055,7 +3054,7 @@ fn online_artifact_children(models: &[Model], prefix: &[String]) -> Option<Vec<M
         .filter(|model| {
             model.catalog_path.starts_with(prefix)
                 && model.catalog_path.len() == prefix.len() + 1
-                && model.remote.as_ref().is_some_and(|remote| remote.file.is_some())
+                && model.remote().is_some_and(|remote| remote.file.is_some())
         })
         .cloned()
         .collect();
@@ -3123,6 +3122,7 @@ fn catalog_children_of(source: &[Model], prefix: &[String]) -> Vec<Model> {
                 model.clone()
             } else {
                 Model {
+                    entry: crate::domain::CatalogEntry::Directory { repository: None },
                     id: String::new(),
                     name,
                     path: PathBuf::new(),
@@ -3140,8 +3140,6 @@ fn catalog_children_of(source: &[Model], prefix: &[String]) -> Vec<Model> {
                     context_length: None,
                     modified: None,
                     has_chat_template: false,
-                    remote: None,
-                    flm: None,
                     runtime: model.runtime.clone(),
                 }
             }
@@ -3171,7 +3169,7 @@ fn rank_models(
         .filter_map(|(index, m)| {
             if !catalog_entry_in_search_scope(
                 &m.catalog_path,
-                m.remote.is_some(),
+                m.remote().is_some(),
                 scope,
                 online_only,
             ) {
@@ -3413,7 +3411,7 @@ mod tests {
             "/health"
         }
         fn process_token(&self, ctx: &LaunchContext) -> String {
-            ctx.model.name.clone()
+            ctx.model().name.clone()
         }
         fn supports_online_browse(&self) -> bool {
             self.online
@@ -3617,6 +3615,7 @@ mod tests {
 
     fn flm_catalog_entry(tag: &str, label: &str) -> Model {
         let mut model = crate::domain::Model {
+            entry: crate::domain::CatalogEntry::Directory { repository: None },
             id: format!("flm:{tag}"),
             name: tag.into(),
             path: PathBuf::new(),
@@ -3634,21 +3633,21 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: true,
-            remote: None,
-            flm: None,
             runtime: crate::runtime::flm::NAME.into(),
         };
-        model.flm = Some(crate::domain::FlmModel {
-            tag: tag.into(),
-            installed: false,
-            repo: format!("FastFlowLM/{tag}"),
-            revision: "main".into(),
-            files: vec!["model.q4nx".into()],
-            labels: vec![label.into()],
-            vlm: false,
-            asr: false,
-            max_prefill_len: None,
-        });
+        model.entry = crate::domain::CatalogEntry::Model(crate::domain::ModelSource::FastFlowLm(
+            crate::domain::FlmModel {
+                tag: tag.into(),
+                installed: false,
+                repo: format!("FastFlowLM/{tag}"),
+                revision: "main".into(),
+                files: vec!["model.q4nx".into()],
+                labels: vec![label.into()],
+                vlm: false,
+                asr: false,
+                max_prefill_len: None,
+            },
+        ));
         model
     }
 
@@ -3702,13 +3701,13 @@ mod tests {
         let index = app.models.items.iter().position(|m| m.is_model()).unwrap();
         app.models.state.select(Some(index));
         app.rebuild_below(Pane::Model);
-        let tag = app.selected_model().unwrap().flm.as_ref().unwrap().tag.clone();
+        let tag = app.selected_model().unwrap().flm().unwrap().tag.clone();
 
         app.on_key(KeyEvent::from(KeyCode::Char('s')));
         assert_eq!(app.catalog_view_label(), Some("Categories"));
         assert_eq!(app.focus, Pane::Model, "arrangement switch moved the focus");
         assert_eq!(
-            app.selected_model().and_then(|m| m.flm.as_ref()).map(|f| f.tag.clone()),
+            app.selected_model().and_then(|m| m.flm()).map(|f| f.tag.clone()),
             Some(tag.clone()),
             "arrangement switch lost the selected model"
         );
@@ -3719,7 +3718,7 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Char('s')));
         assert_eq!(app.catalog_view_label(), Some("Flat"));
         assert_eq!(
-            app.selected_model().and_then(|m| m.flm.as_ref()).map(|f| f.tag.clone()),
+            app.selected_model().and_then(|m| m.flm()).map(|f| f.tag.clone()),
             Some(tag),
             "switching back lost the selected model"
         );

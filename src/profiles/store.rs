@@ -537,6 +537,9 @@ mod tests {
         };
         std::fs::write(&legacy, serde_json::to_vec(&file).unwrap()).unwrap();
         let model = Model {
+            entry: crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf {
+                remote: None,
+            }),
             id: "test".into(),
             name: "source.gguf".into(),
             path: model_path,
@@ -554,9 +557,7 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
-            flm: None,
             runtime: crate::runtime::llama_cpp::NAME.into(),
-            remote: None,
         };
         let store = ProfileStore::load(legacy.clone(), &[model]);
         assert_eq!(
@@ -577,6 +578,9 @@ mod tests {
         let legacy = root.join("profiles.json");
         let model_path = root.join("source.gguf");
         let model = Model {
+            entry: crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf {
+                remote: None,
+            }),
             id: "test".into(),
             name: "source.gguf".into(),
             path: model_path.clone(),
@@ -594,9 +598,7 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
-            flm: None,
             runtime: crate::runtime::llama_cpp::NAME.into(),
-            remote: None,
         };
         let mut store = ProfileStore::load(legacy.clone(), &[model]);
         store

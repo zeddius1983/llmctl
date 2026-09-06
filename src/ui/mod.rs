@@ -189,7 +189,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
             .iter()
             .map(|m| {
                 let label = m.display_label();
-                if let Some(remote) = &m.remote
+                if let Some(remote) = m.remote()
                     && remote.file.is_none()
                 {
                     return ListItem::new(Line::from(vec![
@@ -1577,6 +1577,9 @@ mod tests {
     /// A minimal local model leaf that tests reshape as they need.
     fn sample_model() -> crate::domain::Model {
         crate::domain::Model {
+            entry: crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf {
+                remote: None,
+            }),
             id: String::new(),
             name: String::new(),
             // Non-empty so this reads as a model leaf, not a catalog folder.
@@ -1595,8 +1598,6 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
-            remote: None,
-            flm: None,
             runtime: crate::runtime::llama_cpp::NAME.into(),
         }
     }
@@ -1608,17 +1609,19 @@ mod tests {
         model.catalog_path = vec![model.name.clone()];
         model.size_bytes = 20_600_000_000;
         model.quantization = Some("Q4_K_M".into());
-        model.remote = Some(crate::domain::RemoteModel {
-            repo: "owner/repo".into(),
-            revision: None,
-            file: Some(model.name.clone()),
-            blobs: Vec::new(),
-            mtp_file: None,
-            dflash_file: None,
-            projector_file: None,
-            downloads: 0,
-            likes: 0,
-            gated: false,
+        model.entry = crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf {
+            remote: Some(crate::domain::RemoteModel {
+                repo: "owner/repo".into(),
+                revision: None,
+                file: Some(model.name.clone()),
+                blobs: Vec::new(),
+                mtp_file: None,
+                dflash_file: None,
+                projector_file: None,
+                downloads: 0,
+                likes: 0,
+                gated: false,
+            }),
         });
 
         assert_eq!(
@@ -1626,7 +1629,8 @@ mod tests {
             ("Q4_K_M       20.6 GB  ".into(), "Qwen-AgentWorld-35B-A3B-UD-Q4_K_M.gguf".into())
         );
 
-        model.remote = None;
+        model.entry =
+            crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf { remote: None });
         assert_eq!(
             model_artifact_columns(&model).unwrap(),
             ("Q4_K_M       20.6 GB  ".into(), "Qwen-AgentWorld-35B-A3B-UD-Q4_K_M.gguf".into())
@@ -1665,6 +1669,7 @@ mod tests {
     fn online_catalog_nodes_use_cloud_icons() {
         let mut model = sample_model();
         model.path = std::path::PathBuf::new();
+        model.entry = crate::domain::CatalogEntry::Directory { repository: None };
 
         model.catalog_path = vec!["online".into()];
         assert_eq!(model_icon(&model), ICON_CLOUD);

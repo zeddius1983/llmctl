@@ -184,3 +184,10 @@ paths and worker behavior. Refresh and download completion address the owning
 runtime explicitly. Hugging Face browsing metadata is a shared source overlay;
 updates are applied only to backends advertising that browsing capability.
 Unknown runtime names have no built-in templates or throughput parser.
+
+Catalog rows retain shared display and persistence metadata in `Model`, with an
+explicit `CatalogEntry` payload: a directory (optionally a Hub repository), or
+a `ModelSource` (GGUF with optional remote identity, or FastFlowLM). Only the
+compatibility DTO in `domain/wire.rs` interprets legacy empty paths and optional
+identity fields. `LaunchContext::new` rejects directory entries. Serialized
+scan caches retain their original flat format and profile keys are unchanged.

@@ -179,6 +179,9 @@ mod tests {
 
     fn model() -> Model {
         Model {
+            entry: crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf {
+                remote: None,
+            }),
             id: "test-model".into(),
             name: "x.gguf".into(),
             path: "/tmp/x.gguf".into(),
@@ -196,9 +199,7 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
-            flm: None,
             runtime: crate::runtime::llama_cpp::NAME.into(),
-            remote: None,
         }
     }
 
