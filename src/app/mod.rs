@@ -5,6 +5,8 @@
 //! `IMPLEMENTATION_PLAN.md` → Navigation model).
 
 mod browser;
+mod catalog_jobs;
+use catalog_jobs::CatalogJobs;
 mod downloads;
 mod modals;
 mod session_view;
@@ -296,6 +298,7 @@ pub struct App {
     /// Shared Hugging Face source metadata, separate from runtime catalogs.
     online_models: Vec<Model>,
     catalogs: HashMap<RuntimeId, Vec<Model>>,
+    catalog_jobs: CatalogJobs,
     /// Expanded, absolute model search directories.
     model_sources: Vec<ModelSource>,
     model_cache: PathBuf,
@@ -335,7 +338,7 @@ impl App {
     fn with_runtimes(
         config: Config,
         paths: Paths,
-        runtimes: Vec<Box<dyn RuntimeBackend>>,
+        runtimes: Vec<Arc<dyn RuntimeBackend>>,
         sessions: impl FnOnce(&Paths) -> SessionManager,
     ) -> Self {
         let model_sources = resolve_model_sources(&config.models.paths, &config.models.sources);
@@ -371,6 +374,7 @@ impl App {
             should_quit: false,
             online_models,
             catalogs,
+            catalog_jobs: CatalogJobs::default(),
             model_sources,
             model_cache,
             models_dir: paths.models_dir,
@@ -401,10 +405,12 @@ impl App {
     /// blocking on input (no async runtime needed — see ADR-007).
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.should_quit {
+            self.poll_catalogs();
             self.poll_online();
             self.poll_online_search();
             self.poll_model_download();
             self.poll_restarts();
+            self.sessions.poll_health();
             let errors = self.sessions.take_persistence_errors();
             if !errors.is_empty() {
                 self.modals.message =
@@ -721,19 +727,9 @@ impl App {
         if count < 2 {
             return;
         }
-        // Remember where we are browsing, and what is selected if it is a
-        // model, so the new arrangement can restore both.
-        let prefix = self.browser.catalog_prefix.clone();
-        let selection = self.selected_model().map(|model| model.id.clone());
-
         self.catalog_view = (self.catalog_view + 1) % count;
-        self.browser.catalog_history.clear();
-        self.browser.catalog_prefix.clear();
-        // Same catalog, arranged differently — no reason to ask `flm` again.
+        // Keep the current browser intact until the replacement is ready.
         self.refresh_selected_catalog(false);
-        self.rebuild_below(Pane::Runtime);
-
-        self.restore_catalog_position(selection.as_deref(), &prefix);
     }
 
     fn cycle_online_sort(&mut self) {
@@ -2438,7 +2434,21 @@ impl App {
     /// artifact is no longer on disk".
     fn reload_catalog_in_place(&mut self) {
         self.refresh_selected_catalog(true);
+    }
 
+    fn rebuild_catalog_in_place(&mut self) {
+        let selection = self.selected_model().map(|model| model.id.clone());
+        let prefix = self.browser.catalog_prefix.clone();
+        let focus = self.browser.focus;
+        let children = self.catalog_children(&prefix);
+        if (!prefix.is_empty() && children.is_empty())
+            || selection.as_ref().is_some_and(|id| !children.iter().any(|model| &model.id == id))
+        {
+            self.rebuild_below(Pane::Runtime);
+            self.restore_catalog_position(selection.as_deref(), &prefix);
+            self.browser.focus = focus;
+            return;
+        }
         let prefixes: Vec<Vec<String>> =
             self.browser.catalog_history.iter().map(|(_, _, prefix)| prefix.clone()).collect();
         let rebuilt: Vec<Vec<Model>> =
@@ -2537,16 +2547,37 @@ impl App {
             view: self.catalog_view,
             reload,
         };
-        let models = backend.models(&ctx);
-        if backend.supports_online_browse() {
-            self.online_models = models
+        self.catalog_jobs.request(backend.clone(), &ctx);
+    }
+
+    fn poll_catalogs(&mut self) {
+        for mut result in self.catalog_jobs.poll() {
+            if self
+                .browser
+                .runtimes
+                .items
                 .iter()
-                .filter(|model| discovery::online::is_online_path(&model.catalog_path))
-                .cloned()
-                .collect();
+                .any(|backend| backend.id() == result.runtime && backend.supports_online_browse())
+            {
+                // Hub completions and search overlays may be newer than the
+                // cache snapshot the scanner read. The UI owns that source.
+                result
+                    .models
+                    .retain(|model| !discovery::online::is_online_path(&model.catalog_path));
+                result.models.extend(self.online_models.iter().cloned());
+            }
+            self.store.sync_models(&result.models);
+            self.catalogs.insert(result.runtime.clone(), result.models);
+            if self
+                .browser
+                .runtimes
+                .selected()
+                .is_some_and(|backend| backend.id() == result.runtime)
+            {
+                self.rebuild_catalog_in_place();
+                self.refresh_model_search();
+            }
         }
-        self.store.sync_models(&models);
-        self.catalogs.insert(id.clone(), models);
     }
 
     fn refresh_selected_catalog(&mut self, reload: bool) {
@@ -3175,6 +3206,15 @@ fn cycle_device(devices: &[String], current: &str, dir: i32) -> String {
 mod tests {
     use super::*;
 
+    fn finish_catalogs(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.catalog_jobs.is_idle() && Instant::now() < deadline {
+            app.poll_catalogs();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(app.catalog_jobs.is_idle(), "catalog worker did not finish");
+    }
+
     struct CatalogBackend {
         runtime: crate::domain::Runtime,
         online: bool,
@@ -3194,10 +3234,11 @@ mod tests {
         fn templates(&self) -> &'static [crate::profiles::templates::Template] {
             &[]
         }
-        fn models(&self, _: &CatalogCtx) -> Vec<Model> {
+        fn models(&self, ctx: &CatalogCtx) -> Vec<Model> {
             self.reads.fetch_add(1, Ordering::Relaxed);
             let mut model = flm_catalog_entry(&self.runtime.name, "chat");
             model.runtime = self.runtime.name.clone();
+            model.name = format!("view-{}-reload-{}", ctx.view, ctx.reload);
             vec![model]
         }
         fn spec_default(
@@ -3229,6 +3270,46 @@ mod tests {
     }
 
     #[test]
+    fn catalog_requests_coalesce_preserving_forced_reload_and_latest_view() {
+        let backend = Arc::new(CatalogBackend {
+            runtime: crate::domain::Runtime {
+                name: "queued-runtime".into(),
+                description: String::new(),
+                version: None,
+                binary_path: None,
+                bench_path: None,
+                formats: vec![],
+                devices: vec![],
+            },
+            online: false,
+            reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let mut jobs = CatalogJobs::default();
+        let mut ctx = CatalogCtx {
+            sources: &[],
+            cache_path: std::path::Path::new("unused"),
+            models_dir: std::path::Path::new("unused"),
+            view: 0,
+            reload: false,
+        };
+        jobs.request(backend.clone(), &ctx);
+        ctx.reload = true;
+        jobs.request(backend.clone(), &ctx);
+        ctx.reload = false;
+        ctx.view = 2;
+        jobs.request(backend.clone(), &ctx);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut results = Vec::new();
+        while results.is_empty() && Instant::now() < deadline {
+            results.extend(jobs.poll());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(results.len(), 1, "superseded results must not reach the UI");
+        assert_eq!(results[0].models[0].name, "view-2-reload-true");
+        assert_eq!(backend.reads.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn a_third_runtime_has_its_own_catalog_and_refresh() {
         let root =
             std::env::temp_dir().join(format!("llmctl-three-runtimes-{}", std::process::id()));
@@ -3243,11 +3324,11 @@ mod tests {
         paths.ensure_dirs().unwrap();
         let counts: Vec<_> =
             (0..3).map(|_| Arc::new(std::sync::atomic::AtomicUsize::new(0))).collect();
-        let runtimes: Vec<Box<dyn RuntimeBackend>> = counts
+        let runtimes: Vec<Arc<dyn RuntimeBackend>> = counts
             .iter()
             .enumerate()
             .map(|(i, reads)| {
-                Box::new(CatalogBackend {
+                Arc::new(CatalogBackend {
                     runtime: crate::domain::Runtime {
                         name: format!("runtime-{i}"),
                         description: String::new(),
@@ -3259,7 +3340,7 @@ mod tests {
                     },
                     online: i == 0,
                     reads: reads.clone(),
-                }) as Box<dyn RuntimeBackend>
+                }) as Arc<dyn RuntimeBackend>
             })
             .collect();
         let mut app = App::with_runtimes(Config::default(), paths, runtimes, |paths| {
@@ -3270,6 +3351,11 @@ mod tests {
             assert_eq!(app.catalog_source()[0].runtime, format!("runtime-{i}"));
         }
         app.refresh_selected_catalog(true);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.catalog_source()[0].name != "view-0-reload-true" && Instant::now() < deadline {
+            app.poll_catalogs();
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(
             counts.iter().map(|count| count.load(Ordering::Relaxed)).collect::<Vec<_>>(),
             [1, 1, 2]
@@ -3497,6 +3583,7 @@ mod tests {
         assert!(categories > 0, "Categories view showed nothing");
 
         app.on_key(KeyEvent::from(KeyCode::Char('s')));
+        finish_catalogs(&mut app);
 
         assert_eq!(app.catalog_view_label(), Some("Flat"));
         assert!(!app.browser.models.items.is_empty(), "Flat view showed nothing");
@@ -3515,6 +3602,7 @@ mod tests {
         let tag = app.selected_model().unwrap().flm().unwrap().tag.clone();
 
         app.on_key(KeyEvent::from(KeyCode::Char('s')));
+        finish_catalogs(&mut app);
         assert_eq!(app.catalog_view_label(), Some("Categories"));
         assert_eq!(app.browser.focus, Pane::Model, "arrangement switch moved the focus");
         assert_eq!(
@@ -3530,6 +3618,7 @@ mod tests {
 
         // And back again, from the deeper arrangement to the flatter one.
         app.on_key(KeyEvent::from(KeyCode::Char('s')));
+        finish_catalogs(&mut app);
         assert_eq!(app.catalog_view_label(), Some("Flat"));
         assert_eq!(
             app.selected_model().and_then(|m| m.flm()).map(|f| f.tag.clone()),
@@ -3540,6 +3629,7 @@ mod tests {
         // F5 re-reads the catalog through the same subprocess path, so it fails
         // the same way if the SIGCHLD disposition is not handled.
         app.refresh_models();
+        finish_catalogs(&mut app);
         assert!(!app.catalog_source().is_empty(), "F5 emptied the FastFlowLM catalog");
         assert!(!app.browser.models.items.is_empty(), "F5 emptied the model pane");
 
@@ -3589,6 +3679,7 @@ mod tests {
         assert!(app.selected_model().is_none());
 
         app.on_key(KeyEvent::from(KeyCode::Char('s')));
+        finish_catalogs(&mut app);
 
         assert_eq!(app.catalog_view_label(), Some("Flat"));
         // Inside `online`, showing models — not back at the group list.

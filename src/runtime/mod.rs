@@ -15,6 +15,7 @@ pub mod llama_cpp;
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
@@ -468,10 +469,10 @@ pub(crate) fn resolve_binary(binary: &str) -> Option<std::path::PathBuf> {
 }
 
 /// Probe every known runtime, in display order.
-pub fn discover(config: &Config, paths: &Paths) -> Vec<Box<dyn RuntimeBackend>> {
+pub fn discover(config: &Config, paths: &Paths) -> Vec<Arc<dyn RuntimeBackend>> {
     vec![
-        Box::new(LlamaCppBackend::discover(&config.runtime.llama_cpp, &paths.cache_dir)),
-        Box::new(FlmBackend::discover(&config.runtime.fastflowlm)),
+        Arc::new(LlamaCppBackend::discover(&config.runtime.llama_cpp, &paths.cache_dir)),
+        Arc::new(FlmBackend::discover(&config.runtime.fastflowlm)),
     ]
 }
 

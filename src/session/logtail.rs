@@ -6,7 +6,8 @@
 //! since.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 /// How far back the first poll reaches. A session rediscovered after an llmctl
@@ -24,57 +25,56 @@ const MAX_POLL_BYTES: u64 = 256 * 1024;
 pub struct LogTail {
     offset: u64,
     started: bool,
+    partial: Vec<u8>,
+    discard_line: bool,
+    identity: Option<(u64, u64)>,
 }
 
 impl LogTail {
     /// Lines appended since the last poll.
     ///
-    /// Only whole lines are returned: a partial trailing write stays unconsumed
-    /// and completes on a later poll, so a rate is never parsed out of half a
-    /// line.
+    /// Only whole lines are returned. Partial lines are buffered up to 64 KiB;
+    /// oversized lines are discarded. Each poll reads at most 256 KiB.
     pub fn poll(&mut self, path: &Path) -> Vec<String> {
-        let Ok(file) = File::open(path) else { return Vec::new() };
-        let Ok(len) = file.metadata().map(|meta| meta.len()) else { return Vec::new() };
-
-        // Priming lands mid-line; that fragment is dropped below.
-        let mut skip_first = false;
+        let Ok(mut file) = File::open(path) else { return Vec::new() };
+        let Ok(metadata) = file.metadata() else { return Vec::new() };
+        let len = metadata.len();
+        let identity = (metadata.dev(), metadata.ino());
         if !self.started {
             self.started = true;
             self.offset = len.saturating_sub(PRIME_BYTES);
-            skip_first = self.offset > 0;
-        } else if len < self.offset {
-            // Truncated or replaced — a restart writing a fresh log.
+            self.discard_line = self.offset > 0;
+        } else if self.identity != Some(identity) || len < self.offset {
             self.offset = 0;
+            self.partial.clear();
+            self.discard_line = false;
         }
-        if len <= self.offset {
+        self.identity = Some(identity);
+        if len <= self.offset || file.seek(SeekFrom::Start(self.offset)).is_err() {
             return Vec::new();
         }
-
-        let mut reader = BufReader::new(file);
-        if reader.seek(SeekFrom::Start(self.offset)).is_err() {
-            return Vec::new();
-        }
-
         let budget = (len - self.offset).min(MAX_POLL_BYTES);
-        let mut lines = Vec::new();
-        let mut consumed = 0_u64;
-        let mut buffer = Vec::new();
-        while consumed < budget {
-            buffer.clear();
-            let Ok(read) = reader.read_until(b'\n', &mut buffer) else { break };
-            if read == 0 {
-                break;
-            }
-            if !buffer.ends_with(b"\n") {
-                // A line still being written: leave it for next time.
-                break;
-            }
-            consumed += read as u64;
-            lines.push(String::from_utf8_lossy(&buffer).trim_end().to_string());
+        let mut bytes = Vec::with_capacity(budget as usize);
+        // The reader, rather than the outer line loop, enforces the byte budget.
+        if file.take(budget).read_to_end(&mut bytes).is_err() {
+            return Vec::new();
         }
-        self.offset += consumed;
-        if skip_first && !lines.is_empty() {
-            lines.remove(0);
+        self.offset += bytes.len() as u64;
+        let mut lines = Vec::new();
+        for segment in bytes.split_inclusive(|byte| *byte == b'\n') {
+            let complete = segment.ends_with(b"\n");
+            if self.discard_line || self.partial.len() + segment.len() > PRIME_BYTES as usize {
+                // Oversized lines are skipped in bounded chunks. Retaining an
+                // arbitrary suffix could turn it into a false timing sample.
+                self.partial.clear();
+                self.discard_line = !complete;
+                continue;
+            }
+            self.partial.extend_from_slice(segment);
+            if complete {
+                lines.push(String::from_utf8_lossy(&self.partial).trim_end().to_string());
+                self.partial.clear();
+            }
         }
         lines
     }
@@ -173,6 +173,36 @@ mod tests {
         let mut file =
             std::fs::OpenOptions::new().create(true).append(true).open(path).expect("open");
         file.write_all(text.as_bytes()).expect("write");
+    }
+
+    #[test]
+    fn oversized_lines_obey_the_byte_budget_and_do_not_hide_following_lines() {
+        let path = scratch("oversized");
+        append(&path, "");
+        let mut tail = LogTail::default();
+        assert!(tail.poll(&path).is_empty());
+        append(&path, &"x".repeat(MAX_POLL_BYTES as usize * 2 + 10));
+        append(&path, "\nvalid sample\n");
+        for expected in [MAX_POLL_BYTES, MAX_POLL_BYTES * 2] {
+            assert!(tail.poll(&path).is_empty());
+            assert_eq!(tail.offset, expected);
+            assert!(tail.partial.len() <= PRIME_BYTES as usize);
+        }
+        assert_eq!(tail.poll(&path), ["valid sample"]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_larger_replacement_resets_the_offset_and_partial_line() {
+        let path = scratch("larger-replacement");
+        append(&path, "partial");
+        let mut tail = LogTail::default();
+        assert!(tail.poll(&path).is_empty());
+        let replacement = scratch("new-inode");
+        append(&replacement, "new complete line\n");
+        std::fs::rename(replacement, &path).unwrap();
+        assert_eq!(tail.poll(&path), ["new complete line"]);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -39,6 +39,7 @@ pub struct DetachedSupervisor;
 
 impl DetachedSupervisor {
     pub fn new() -> Self {
+        let _lock = SIGCHLD_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // Reap detached children automatically: with SIGCHLD ignored the kernel
         // does not leave zombies for processes we deliberately don't `wait` on.
         // SAFETY: setting a signal disposition to SIG_IGN has no preconditions.
@@ -64,16 +65,26 @@ impl DetachedSupervisor {
 /// The previous disposition is restored rather than assumed, and restoring
 /// `SIG_IGN` also reaps anything that exited during the call, so the window
 /// leaves no zombie behind.
+// Catalog workers may capture subprocess output while the UI launches a server.
+// Serialize disposition changes until child ownership replaces this policy.
+static SIGCHLD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn with_default_sigchld<T>(f: impl FnOnce() -> T) -> T {
-    // SAFETY: setting a signal disposition is async-signal-safe and has no
-    // preconditions. llmctl spawns processes only from the main thread, so
-    // there is no window where another thread relies on the disposition.
-    let previous = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
-    let result = f();
-    if previous != libc::SIG_ERR {
-        unsafe { libc::signal(libc::SIGCHLD, previous) };
+    let _lock = SIGCHLD_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    struct Restore(libc::sighandler_t);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if self.0 != libc::SIG_ERR {
+                // SAFETY: the guard restores the disposition while holding the mutex.
+                unsafe {
+                    libc::signal(libc::SIGCHLD, self.0);
+                }
+            }
+        }
     }
-    result
+    // SAFETY: all application signal-disposition changes share this mutex.
+    let _restore = Restore(unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) });
+    f()
 }
 
 /// Run `command` to completion and capture its output, whatever `SIGCHLD`

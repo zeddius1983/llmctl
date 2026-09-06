@@ -307,7 +307,7 @@ Later branches build on the previous step; merge in this order.
 3. Runtime-owned catalog and download capabilities — implemented on `feature/runtime-catalogs`.
 4. Catalog entries and model-source types — implemented on `feature/model-states`.
 5. Smaller application state owners and modal state — implemented on `feature/app-state`.
-6. Background readiness/scans and bounded log reads.
+6. Background readiness/scans and bounded log reads — implemented on `feature/background-refresh`.
 7. Explicit child ownership instead of global SIGCHLD policy.
 8. Command/option API cleanup, Clippy, and documentation.
 

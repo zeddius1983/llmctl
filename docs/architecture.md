@@ -200,3 +200,19 @@ history), `DownloadManager` (jobs, cancellation, attempt IDs, worker events),
 input dialog plus an independent notification). These live under `app/` in
 separate modules. Navigation and transfer transitions are tested without a TUI,
 network requests, real inference binaries, or process-wide signal changes.
+
+## Background refresh and bounded log input
+
+Readiness probes run in at most four workers. Requests are deduplicated and
+queued fairly; completions carry session ID, PID, and endpoint so a stale
+response cannot promote a replacement process. Catalog refreshes run one worker
+per runtime, coalescing queued requests to the latest view while preserving
+forced reloads. The terminal continues displaying its current catalog until a
+replacement is ready, then restores its model or nearest surviving directory.
+Startup discovery still runs before the event loop.
+
+Log tails enforce a 256 KiB read budget at the reader, buffer partial lines up
+to 64 KiB, and discard oversized lines through their next newline. Device/inode
+identity detects replacements even when the new log is larger. Until explicit
+child ownership lands, subprocess capture and detached spawning serialize the
+legacy SIGCHLD disposition changes with a mutex and unwind-safe restoration.

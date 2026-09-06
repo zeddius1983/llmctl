@@ -316,6 +316,7 @@ pub struct SessionManager {
     supervisor: Box<dyn SessionSupervisor>,
     pub sessions: Vec<Session>,
     persistence_errors: Vec<String>,
+    health_checks: health::HealthChecks,
 }
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -334,6 +335,7 @@ impl SessionManager {
             supervisor: Box::new(DetachedSupervisor::new()),
             sessions: Vec::new(),
             persistence_errors: Vec::new(),
+            health_checks: health::HealthChecks::default(),
         };
         mgr.rediscover();
         mgr
@@ -367,6 +369,7 @@ impl SessionManager {
             supervisor: Box::new(NeverSpawns),
             sessions: Vec::new(),
             persistence_errors: Vec::new(),
+            health_checks: health::HealthChecks::default(),
         };
         mgr.rediscover();
         mgr
@@ -380,11 +383,12 @@ impl SessionManager {
             let alive =
                 proc::is_alive(record.pid) && proc::cmdline_matches(record.pid, &record.model_path);
             if alive {
-                let status = match health::probe(&record.host, record.port, &record.health_path) {
-                    Health::Ready => SessionStatus::Running,
-                    _ if download_percent(&record).is_some() => SessionStatus::Downloading,
-                    _ => SessionStatus::Starting,
+                let status = if download_percent(&record).is_some() {
+                    SessionStatus::Downloading
+                } else {
+                    SessionStatus::Starting
                 };
+                self.health_checks.request(probe_key(&record));
                 self.sessions.push(Session::new(record, status));
             } else {
                 record.delete(&self.dir);
@@ -558,9 +562,26 @@ impl SessionManager {
         (proc::is_alive(pid) && proc::cmdline_matches(pid, &model_path)).then_some(pid)
     }
 
+    pub fn poll_health(&mut self) {
+        for (key, health) in self.health_checks.poll() {
+            if health != Health::Ready {
+                continue;
+            }
+            if let Some(session) = self.sessions.iter_mut().find(|session| {
+                probe_key(&session.record) == key
+                    && !session.status.is_terminal()
+                    && session.restart_pending.is_none()
+            }) {
+                session.status = SessionStatus::Running;
+                session.download_percent = None;
+            }
+        }
+    }
+
     /// Refresh live status and resource usage for every session. Cheap enough
     /// to call on the periodic UI tick.
     pub fn refresh(&mut self) {
+        self.poll_health();
         for idx in 0..self.sessions.len() {
             // A restart in flight owns this session until its replacement is up:
             // the old pid is on its way out and the new one does not exist yet,
@@ -585,12 +606,9 @@ impl SessionManager {
                 continue;
             };
 
-            let host = self.sessions[idx].record.host.clone();
-            let port = self.sessions[idx].record.port;
             let prev = self.sessions[idx].last_cpu;
             let was_running = self.sessions[idx].status == SessionStatus::Running;
             let progress = download_percent(&self.sessions[idx].record);
-            let health_path = self.sessions[idx].record.health_path.clone();
 
             let rss = proc::rss_bytes(pid);
             let sample = proc::cpu_sample(pid);
@@ -605,8 +623,10 @@ impl SessionManager {
             // does cost something: servers that log each connection (FastFlowLM
             // logs four lines per request) fill their own log with llmctl's
             // health checks. Probe only while readiness is still in question.
-            let health =
-                if was_running { Health::Ready } else { health::probe(&host, port, &health_path) };
+            if !was_running {
+                self.health_checks.request(probe_key(&self.sessions[idx].record));
+            }
+            let health = if was_running { Health::Ready } else { Health::Loading };
 
             let s = &mut self.sessions[idx];
             s.rss_bytes = rss;
@@ -818,6 +838,16 @@ impl SessionManager {
             port = port.saturating_add(1);
         }
         preferred
+    }
+}
+
+fn probe_key(record: &SessionRecord) -> health::ProbeKey {
+    health::ProbeKey {
+        session: record.id.clone(),
+        pid: record.pid,
+        host: record.host.clone(),
+        port: record.port,
+        path: record.health_path.clone(),
     }
 }
 

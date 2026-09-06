@@ -2,10 +2,11 @@
 use super::{Pane, PaneList};
 use crate::domain::{Model, OptionItem, Profile};
 use crate::runtime::RuntimeBackend;
+use std::sync::Arc;
 
 pub struct BrowserState {
     pub focus: Pane,
-    pub runtimes: PaneList<Box<dyn RuntimeBackend>>,
+    pub runtimes: PaneList<Arc<dyn RuntimeBackend>>,
     pub models: PaneList<Model>,
     pub catalog_preview: Vec<Model>,
     pub profiles: PaneList<Profile>,
@@ -15,7 +16,7 @@ pub struct BrowserState {
 }
 
 impl BrowserState {
-    pub(super) fn new(runtimes: Vec<Box<dyn RuntimeBackend>>) -> Self {
+    pub(super) fn new(runtimes: Vec<Arc<dyn RuntimeBackend>>) -> Self {
         Self {
             focus: Pane::Runtime,
             runtimes: PaneList::new(runtimes),

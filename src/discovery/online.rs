@@ -1214,11 +1214,7 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 }
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if fs::read(path).is_ok_and(|current| current == bytes) {
-        return Ok(());
-    }
-    let tmp = path.with_extension("yml.tmp");
-    fs::write(&tmp, bytes).and_then(|_| fs::rename(&tmp, path))
+    crate::persistence::write_if_changed(path, bytes)
 }
 
 #[cfg(unix)]
