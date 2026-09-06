@@ -644,11 +644,7 @@ const MISSING: &str = "—";
 const COL_GAP: usize = 4;
 /// Below this much room for the model name, a column is not worth its space.
 const MIN_NAME: usize = 12;
-/// The widest the name column grows to.
-///
-/// Names are what the rows are about, so they get columns dropped for them —
-/// but only up to here. Past it the surplus stops seating a name and starts
-/// opening a gulf between the name and everything that describes it.
+/// The most room the planner will reclaim from metadata for a long model name.
 const MAX_NAME: usize = 32;
 
 /// Which column to give up first when the pane cannot hold them all.
@@ -741,8 +737,9 @@ fn rate_cell(label: &str, session: &Session, phase: Phase) -> String {
 /// How wide the name column is, and which columns follow it, in a pane of
 /// `width` holding names up to `longest` terminal columns wide.
 ///
-/// One answer for the whole list rather than one per row: rows that sized their
-/// own names would stop lining up, and the alignment is the point.
+/// The name consumes every column left after the fixed-width metadata. That
+/// keeps the metadata block against the pane's right edge and gives every row
+/// the same column starts regardless of model-name length.
 fn row_plan(width: usize, longest: usize) -> (usize, Vec<Column>) {
     const ORDER: [Column; 7] = [
         Column::Profile,
@@ -758,22 +755,16 @@ fn row_plan(width: usize, longest: usize) -> (usize, Vec<Column>) {
     };
 
     let room = width.saturating_sub(2); // status glyph and its space
-    // What the names in this pane actually need, within reason: giving up a
-    // column to seat a name whole is worth it, and `MAX_NAME` is where it stops
-    // being worth it.
     let wanted = longest.clamp(MIN_NAME, MAX_NAME);
     let mut columns = ORDER.to_vec();
     for dropped in DROP_ORDER {
-        if room >= cost(&columns) + wanted + COL_GAP {
+        if room >= cost(&columns) + wanted {
             break;
         }
         columns.retain(|column| *column != dropped);
     }
 
-    // Capped at what the names need. The leftover used to go here, which on a
-    // wide pane put sixty blank columns between the name and the profile and
-    // left the row reading as two unrelated halves.
-    let name = room.saturating_sub(cost(&columns) + COL_GAP).clamp(1, wanted.max(1));
+    let name = room.saturating_sub(cost(&columns)).max(1);
     (name, columns)
 }
 
@@ -1481,9 +1472,9 @@ fn center(area: Rect, horizontal: Constraint, vertical: Constraint) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::{
-        COL_GAP, ICON_CLOUD, ICON_DIRECTORY, MAX_NAME, MIN_COLS, MIN_ROWS, compact_count,
-        download_progress, model_artifact_columns, model_icon, render_confirm, render_help,
-        render_session_log, render_too_small, session_panes, truncate_download_name, wrap_hard,
+        ICON_CLOUD, ICON_DIRECTORY, MIN_COLS, MIN_ROWS, compact_count, download_progress,
+        model_artifact_columns, model_icon, render_confirm, render_help, render_session_log,
+        render_too_small, session_panes, truncate_download_name, wrap_hard,
     };
     use crate::app::Confirm;
 
@@ -1966,37 +1957,22 @@ mod tests {
         assert!(screen.contains("sort online models / switch catalog grouping"), "{screen}");
     }
 
-    /// Regression: the name column took every column the row had left over, so
-    /// a wide pane put sixty blanks between the name and the profile — and a
-    /// middling one truncated a name it had columns to spare for, because the
-    /// drop rule only ever asked for `MIN_NAME`.
+    /// Regression: the name column was capped at the longest visible name, so
+    /// the metadata block drifted left instead of staying against the pane's
+    /// right edge.
     #[test]
-    fn the_name_column_takes_what_the_names_need_and_no_more() {
+    fn session_metadata_stays_against_the_right_edge() {
         use unicode_width::UnicodeWidthStr;
 
         let sessions = [probe_session("muse-glimmer-30b-q8_0", true)];
-        let name = "muse-glimmer-30b-q8_0";
-
-        // Wide pane: the name is whole and the columns follow it directly,
-        // rather than after a run of padding.
-        let row = &rows_text(&sessions, 200)[0];
-        let gap = row.find("[inquisitor]").expect("the profile column") - row.find(name).unwrap();
-        assert_eq!(gap, name.width() + COL_GAP, "a gulf opened up: {row:?}");
-
-        // Middling pane: a column is given up to seat the name whole. It used
-        // to keep every column and cut the name to twenty.
-        let row = &rows_text(&sessions, 106)[0];
-        assert!(row.contains(name), "the name was cut with columns to spare: {row:?}");
-
-        // The cap holds: a name past `MAX_NAME` is truncated rather than
-        // pushing every column off the row.
-        let long = "a-very-long-model-name-that-keeps-going-and-going";
-        let row = &rows_text(&[probe_session(long, true)], 200)[0];
-        assert!(row.contains('…'), "{row:?}");
-        // In columns, not bytes: the status glyph and the ellipsis are both
-        // multibyte and neither is more than one column wide.
-        let at = row[..row.find("[inquisitor]").expect("the profile column")].width();
-        assert_eq!(at, 2 + MAX_NAME + COL_GAP, "the name column outgrew its cap: {row:?}");
+        for width in [106, 120, 200] {
+            let row = &rows_text(&sessions, width)[0];
+            assert_eq!(row.width(), width, "metadata did not reach the right edge: {row:?}");
+            assert!(
+                row.contains("muse-glimmer-30b-q8_0"),
+                "the name was cut unnecessarily: {row:?}"
+            );
+        }
 
         // Narrow panes still shed columns, and the name still gets `MIN_NAME`.
         let row = &rows_text(&sessions, 60)[0];
