@@ -63,7 +63,8 @@ pub struct ProfileStore {
     instances: BTreeMap<Key, Instance>,
     /// Absolute source model key -> managed catalog leaf.
     model_dirs: BTreeMap<String, PathBuf>,
-    /// Instances that could not be persisted to their per-model YAML file.
+    /// Instances whose legacy record remains authoritative, either because the
+    /// YAML write failed or because the legacy record could not be removed.
     fallback: BTreeSet<Key>,
 }
 
@@ -286,27 +287,52 @@ impl ProfileStore {
             .filter(|(_, model, _)| self.model_dirs.contains_key(model))
             .cloned()
             .collect();
+        let existing_fallbacks: Vec<Key> =
+            keys.iter().filter(|entry| self.fallback.contains(*entry)).cloned().collect();
         for entry in keys {
             self.persist_yaml(&entry);
         }
         if let Err(error) = self.save_legacy() {
+            // The legacy file still contains these entries. Keep tracking them
+            // as fallbacks so a later edit updates legacy before YAML can get
+            // ahead of it.
+            self.fallback.extend(existing_fallbacks);
             warn!(%error, "failed to persist profile fallback");
         }
     }
 
     fn persist_one(&mut self, entry: &Key) -> io::Result<()> {
-        self.persist_yaml(entry);
-        self.save_legacy()
+        let was_fallback = self.fallback.contains(entry);
+        if was_fallback {
+            // The legacy record may override YAML on the next load. Persist the
+            // current value there before allowing a successful YAML write to
+            // make the legacy copy stale.
+            self.save_legacy()?;
+        }
+        if !self.persist_yaml(entry) {
+            return if was_fallback { Ok(()) } else { self.save_legacy() };
+        }
+        if let Err(error) = self.save_legacy() {
+            if was_fallback {
+                // Cleanup failed, so the current legacy record is still on
+                // disk and must remain authoritative on later edits.
+                self.fallback.insert(entry.clone());
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
-    fn persist_yaml(&mut self, entry: &Key) {
+    fn persist_yaml(&mut self, entry: &Key) -> bool {
         match self.write_profile(entry) {
             Ok(()) => {
                 self.fallback.remove(entry);
+                true
             }
             Err(err) => {
                 self.fallback.insert(entry.clone());
                 warn!(model = %entry.1, profile = %entry.2, %err, "using legacy profile fallback");
+                false
             }
         }
     }
@@ -460,6 +486,7 @@ pub fn model_key(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn fixture() -> (PathBuf, Model, ProfileStore) {
@@ -566,6 +593,55 @@ mod tests {
         reloaded.fallback.insert(entry.clone());
         reloaded.sync_models(&[model]);
         assert_eq!(reloaded.instances[&entry].values["temperature"], "0.8");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_fallback_update_cannot_leave_yaml_newer_than_legacy() {
+        let (root, model, mut store) = fixture();
+        let model_key = model.profile_key();
+        let entry = key("llama.cpp", &model_key, "Chat");
+        store.instances.get_mut(&entry).unwrap().values.insert("temperature".into(), "0.1".into());
+        store.fallback.insert(entry);
+        store.save_legacy().unwrap();
+
+        let yaml = model.catalog_dir.join("profiles/Chat.yml");
+        let yaml_before = std::fs::read(&yaml).unwrap();
+        let original_permissions = std::fs::metadata(&root).unwrap().permissions();
+        let mut read_only = original_permissions.clone();
+        read_only.set_mode(0o555);
+        std::fs::set_permissions(&root, read_only).unwrap();
+
+        assert!(
+            store
+                .set_value(
+                    "llama.cpp",
+                    &model_key,
+                    "Chat",
+                    "temperature",
+                    "0.7".into(),
+                    &BTreeMap::new(),
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&yaml).unwrap(), yaml_before);
+
+        std::fs::set_permissions(&root, original_permissions).unwrap();
+        store
+            .set_value(
+                "llama.cpp",
+                &model_key,
+                "Chat",
+                "temperature",
+                "0.7".into(),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        let reloaded = ProfileStore::load(store.legacy_path.clone(), &[model]);
+        assert_eq!(
+            reloaded.instances[&key("llama.cpp", &model_key, "Chat")].values["temperature"],
+            "0.7"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

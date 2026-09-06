@@ -1368,7 +1368,7 @@ impl App {
         // it. On an artifact that is merely already downloaded this is a no-op.
         if total_bytes > 0 && downloaded_bytes >= total_bytes {
             match discovery::online::finalize_cached_download(&remote) {
-                Ok(_) => self.reload_catalog_in_place(),
+                Ok(_) => self.reload_catalog_in_place(false),
                 Err(error) => {
                     self.modals.message = Some(Message {
                         title: "Cannot download".into(),
@@ -2404,7 +2404,8 @@ impl App {
             .map(|download| (download.id, download.model_id.clone()))
             .collect();
         let result = plan.execute();
-        if result.is_ok() {
+        let removed = result.is_ok();
+        if removed {
             for (id, model_id) in &stale {
                 // Best-effort: a record left behind reappears as a resumable
                 // job, which is a nuisance rather than a hazard.
@@ -2413,7 +2414,7 @@ impl App {
             }
             self.sync_session_selection();
         }
-        self.reload_catalog_in_place();
+        self.reload_catalog_in_place(removed);
         self.modals.message = Some(match result {
             Ok(()) => Message {
                 title: "Model removed".into(),
@@ -2425,12 +2426,32 @@ impl App {
         });
     }
 
-    /// Re-read the catalog after a deletion without moving the browser.
+    /// Reconcile a known storage change immediately, then verify it with a
+    /// background catalog reload without moving the browser.
     ///
     /// `F5` would also work, but it resets to the catalog root and — in the
     /// online view — re-queries the Hub, which is a lot of upheaval for "one
     /// artifact is no longer on disk".
-    fn reload_catalog_in_place(&mut self) {
+    fn reload_catalog_in_place(&mut self, remove_selected: bool) {
+        let selected = self
+            .browser
+            .runtimes
+            .selected()
+            .zip(self.selected_model())
+            .map(|(backend, model)| (backend.id(), model.id.clone(), model.remote().is_some()));
+
+        // Hub state is cheap local metadata and can be reflected immediately:
+        // a finalized link becomes cached, and a deleted link becomes remote.
+        self.refresh_downloaded_online_models();
+        if let Some((runtime, model, false)) = selected
+            && remove_selected
+            && let Some(catalog) = self.catalogs.get_mut(&runtime)
+        {
+            // Scanned files and FastFlowLM installs disappear until the
+            // authoritative worker re-adds any remote/uninstalled form.
+            catalog.retain(|entry| entry.id != model);
+        }
+        self.rebuild_catalog_in_place();
         self.refresh_selected_catalog(true);
     }
 
@@ -2513,12 +2534,9 @@ impl App {
             if !backend.supports_online_browse() {
                 continue;
             }
-            let models = self.catalogs.entry(backend.id()).or_default();
-            models.retain(|model| !discovery::online::is_online_path(&model.catalog_path));
-            models.extend(self.online_models.iter().cloned().map(|mut model| {
-                model.runtime = backend.id().0;
-                model
-            }));
+            let runtime = backend.id();
+            let models = self.catalogs.entry(runtime.clone()).or_default();
+            merge_online_models(models, &self.online_models, &runtime);
         }
     }
 
@@ -2559,10 +2577,7 @@ impl App {
             {
                 // Hub completions and search overlays may be newer than the
                 // cache snapshot the scanner read. The UI owns that source.
-                result
-                    .models
-                    .retain(|model| !discovery::online::is_online_path(&model.catalog_path));
-                result.models.extend(self.online_models.iter().cloned());
+                merge_online_models(&mut result.models, &self.online_models, &result.runtime);
             }
             self.store.sync_models(&result.models);
             self.catalogs.insert(result.runtime.clone(), result.models);
@@ -2584,13 +2599,24 @@ impl App {
         }
     }
 
+    fn refresh_all_catalogs(&mut self, reload: bool) {
+        let runtimes: Vec<_> =
+            self.browser.runtimes.items.iter().map(|backend| backend.id()).collect();
+        for runtime in runtimes {
+            self.refresh_runtime_models(&runtime, reload);
+        }
+    }
+
     /// Re-scan configured model directories (the `F5` refresh).
     fn refresh_models(&mut self) {
-        if self.online_view_active() {
+        let online_view = self.online_view_active();
+        if online_view {
             self.reload_online_layout();
+        }
+        self.refresh_all_catalogs(true);
+        if online_view {
             return;
         }
-        self.refresh_selected_catalog(true);
         self.browser.catalog_history.clear();
         self.browser.catalog_prefix.clear();
         // Models or anything downstream may have changed; rebuild from runtime.
@@ -2863,6 +2889,16 @@ impl App {
         }
         crumbs
     }
+}
+
+/// Replace the shared Hub portion of a runtime catalog, assigning the receiving
+/// runtime before profile and launch code consume those models.
+fn merge_online_models(models: &mut Vec<Model>, online_models: &[Model], runtime: &RuntimeId) {
+    models.retain(|model| !discovery::online::is_online_path(&model.catalog_path));
+    models.extend(online_models.iter().cloned().map(|mut model| {
+        model.runtime.clone_from(&runtime.0);
+        model
+    }));
 }
 
 /// Hub repository lists are already ranked by the requested API sort. Preserve
@@ -3215,6 +3251,7 @@ mod tests {
         runtime: crate::domain::Runtime,
         online: bool,
         reads: Arc<std::sync::atomic::AtomicUsize>,
+        panic_once: Arc<AtomicBool>,
     }
 
     impl RuntimeBackend for CatalogBackend {
@@ -3232,6 +3269,7 @@ mod tests {
         }
         fn models(&self, ctx: &CatalogCtx) -> Vec<Model> {
             self.reads.fetch_add(1, Ordering::Relaxed);
+            assert!(!self.panic_once.swap(false, Ordering::Relaxed), "catalog test panic");
             let mut model = flm_catalog_entry(&self.runtime.name, "chat");
             model.runtime = self.runtime.name.clone();
             model.name = format!("view-{}-reload-{}", ctx.view, ctx.reload);
@@ -3279,6 +3317,7 @@ mod tests {
             },
             online: false,
             reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            panic_once: Arc::new(AtomicBool::new(false)),
         });
         let mut jobs = CatalogJobs::default();
         let mut ctx = CatalogCtx {
@@ -3303,6 +3342,44 @@ mod tests {
         assert_eq!(results.len(), 1, "superseded results must not reach the UI");
         assert_eq!(results[0].models[0].name, "view-2-reload-true");
         assert_eq!(backend.reads.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_panicking_catalog_worker_does_not_block_the_next_refresh() {
+        let backend = Arc::new(CatalogBackend {
+            runtime: crate::domain::Runtime {
+                name: "recovering-runtime".into(),
+                description: String::new(),
+                version: None,
+                binary_path: None,
+                bench_path: None,
+                formats: vec![],
+                devices: vec![],
+            },
+            online: false,
+            reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            panic_once: Arc::new(AtomicBool::new(true)),
+        });
+        let mut jobs = CatalogJobs::default();
+        let ctx = CatalogCtx {
+            sources: &[],
+            cache_path: std::path::Path::new("unused"),
+            models_dir: std::path::Path::new("unused"),
+            view: 0,
+            reload: true,
+        };
+
+        jobs.request(backend.clone(), &ctx);
+        jobs.request(backend.clone(), &ctx);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut results = Vec::new();
+        while results.is_empty() && Instant::now() < deadline {
+            results.extend(jobs.poll());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(results.len(), 1);
+        assert_eq!(backend.reads.load(Ordering::Relaxed), 2);
+        assert!(jobs.is_idle(), "panicked worker kept the runtime active");
     }
 
     #[test]
@@ -3336,6 +3413,7 @@ mod tests {
                     },
                     online: i == 0,
                     reads: reads.clone(),
+                    panic_once: Arc::new(AtomicBool::new(false)),
                 }) as Arc<dyn RuntimeBackend>
             })
             .collect();
@@ -3356,6 +3434,13 @@ mod tests {
             counts.iter().map(|count| count.load(Ordering::Relaxed)).collect::<Vec<_>>(),
             [1, 1, 2]
         );
+        app.refresh_models();
+        finish_catalogs(&mut app);
+        assert_eq!(
+            counts.iter().map(|count| count.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+            [2, 2, 3],
+            "F5 must refresh catalogs that are not currently selected"
+        );
         let mut transient = flm_catalog_entry("search-result", "chat");
         transient.catalog_path = vec!["online".into(), "huggingface".into(), "org/repo".into()];
         app.replace_online_search_results(vec![transient]);
@@ -3365,6 +3450,64 @@ mod tests {
         app.clear_online_search_results();
         assert_eq!(app.catalog_source().len(), 1);
         assert!(crate::runtime::templates_for("runtime-2").is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_online_models_adopt_the_receiving_runtime() {
+        let mut online = flm_catalog_entry("search-result", "chat");
+        online.runtime = "original-runtime".into();
+        let mut catalog = Vec::new();
+        merge_online_models(&mut catalog, &[online], &RuntimeId("second-hub-runtime".into()));
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].runtime, "second-hub-runtime");
+    }
+
+    #[test]
+    fn storage_changes_remove_stale_local_entries_before_the_async_reload() {
+        let stamp =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("llmctl-storage-refresh-{stamp}"));
+        let paths = Paths {
+            config_file: root.join("config.toml"),
+            models_dir: root.join("models"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+            sessions_dir: root.join("sessions"),
+        };
+        paths.ensure_dirs().unwrap();
+        let runtime = RuntimeId("storage-runtime".into());
+        let backend = Arc::new(CatalogBackend {
+            runtime: crate::domain::Runtime {
+                name: runtime.0.clone(),
+                description: String::new(),
+                version: None,
+                binary_path: None,
+                bench_path: None,
+                formats: vec![],
+                devices: vec![],
+            },
+            online: false,
+            reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            panic_once: Arc::new(AtomicBool::new(false)),
+        });
+        let mut app = App::with_runtimes(Config::default(), paths, vec![backend], |paths| {
+            SessionManager::without_supervisor(paths.sessions_dir.clone(), paths.log_dir.clone())
+        });
+        app.browser.focus = Pane::Model;
+        app.browser.catalog_prefix = vec!["online".into(), "chat".into()];
+        let items = app.catalog_children(&app.browser.catalog_prefix);
+        app.browser.models.replace(items);
+        let deleted = app.selected_model().expect("model leaf").id.clone();
+
+        app.reload_catalog_in_place(true);
+        assert!(
+            app.catalogs[&runtime].iter().all(|model| model.id != deleted),
+            "deleted model stayed actionable until the worker completed"
+        );
+
+        finish_catalogs(&mut app);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3807,6 +3950,11 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Char('y')));
         assert!(!gguf.exists(), "y must delete the file");
         assert!(app.modals.message.is_some(), "the outcome is reported");
+        assert_ne!(
+            app.selected_model().map(|model| model.name.as_str()),
+            Some("test-model.gguf"),
+            "the deleted model must stop being actionable before the background rescan"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

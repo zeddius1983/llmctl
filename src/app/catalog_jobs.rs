@@ -20,11 +20,16 @@ pub(super) struct CatalogResult {
     pub models: Vec<Model>,
 }
 
+struct CatalogCompletion {
+    runtime: RuntimeId,
+    models: Option<Vec<Model>>,
+}
+
 pub(super) struct CatalogJobs {
     active: std::collections::HashSet<RuntimeId>,
     queued: HashMap<RuntimeId, Request>,
-    tx: mpsc::Sender<CatalogResult>,
-    rx: mpsc::Receiver<CatalogResult>,
+    tx: mpsc::Sender<CatalogCompletion>,
+    rx: mpsc::Receiver<CatalogCompletion>,
 }
 
 impl Default for CatalogJobs {
@@ -61,7 +66,8 @@ impl CatalogJobs {
     }
 
     fn start(&mut self, request: Request) {
-        self.active.insert(request.backend.id());
+        let runtime = request.backend.id();
+        self.active.insert(runtime.clone());
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let ctx = CatalogCtx {
@@ -71,21 +77,26 @@ impl CatalogJobs {
                 view: request.view,
                 reload: request.reload,
             };
-            let models = request.backend.models(&ctx);
-            let _ = tx.send(CatalogResult { runtime: request.backend.id(), models });
+            let models = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                request.backend.models(&ctx)
+            }))
+            .ok();
+            let _ = tx.send(CatalogCompletion { runtime, models });
         });
     }
 
     pub fn poll(&mut self) -> Vec<CatalogResult> {
         let mut results = Vec::new();
-        while let Ok(result) = self.rx.try_recv() {
-            self.active.remove(&result.runtime);
-            if let Some(next) = self.queued.remove(&result.runtime) {
+        while let Ok(completion) = self.rx.try_recv() {
+            self.active.remove(&completion.runtime);
+            if let Some(next) = self.queued.remove(&completion.runtime) {
                 // The latest request supersedes the old result, and starts only
                 // after its writer has stopped touching the cache.
                 self.start(next);
+            } else if let Some(models) = completion.models {
+                results.push(CatalogResult { runtime: completion.runtime, models });
             } else {
-                results.push(result);
+                tracing::warn!(runtime = %completion.runtime.0, "catalog worker panicked");
             }
         }
         results

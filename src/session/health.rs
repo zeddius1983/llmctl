@@ -114,7 +114,8 @@ impl HealthChecks {
             let tx = self.tx.clone();
             let probe = self.probe.clone();
             std::thread::spawn(move || {
-                let result = probe(&key);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| probe(&key)))
+                    .unwrap_or(Health::Down);
                 let _ = tx.send((key, result));
             });
         }
@@ -181,6 +182,43 @@ mod tests {
         }
         assert_eq!(completed.len(), 5);
         assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), keys[4]);
+        assert!(checks.pending.is_empty());
+        assert_eq!(checks.active, 0);
+    }
+
+    #[test]
+    fn panicking_workers_release_their_slots() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe_attempts = attempts.clone();
+        let mut checks = HealthChecks::new(Arc::new(move |_| {
+            assert!(
+                probe_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 4,
+                "health test panic"
+            );
+            Health::Ready
+        }));
+        let keys: Vec<_> = (0..5)
+            .map(|i| ProbeKey {
+                session: i.to_string(),
+                pid: i,
+                host: "localhost".into(),
+                port: 80,
+                path: "/".into(),
+            })
+            .collect();
+        for key in keys {
+            checks.request(key);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut completed = Vec::new();
+        while completed.len() < 5 && Instant::now() < deadline {
+            completed.extend(checks.poll());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(completed.len(), 5);
+        assert_eq!(completed.iter().filter(|(_, health)| *health == Health::Down).count(), 4);
+        assert_eq!(completed.iter().filter(|(_, health)| *health == Health::Ready).count(), 1);
         assert!(checks.pending.is_empty());
         assert_eq!(checks.active, 0);
     }
