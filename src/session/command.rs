@@ -29,7 +29,7 @@ impl Command {
     /// (llama.cpp's `reasoning-effort` becomes a JSON kwarg).
     pub fn append_options(argv: &mut Vec<String>, schema: &OptionSchema, options: &[OptionItem]) {
         for opt in options {
-            if schema.omit_token(opt.spec.key) == Some(opt.value.as_str()) {
+            if schema.matching_omit_token(opt.spec.key, &opt.value).is_some() {
                 continue;
             }
             argv.push(opt.spec.cli.to_string());

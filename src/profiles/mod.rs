@@ -109,10 +109,8 @@ fn validate_value(
     spec: &registry::OptionSpec,
     value: &str,
 ) -> Result<String, String> {
-    if backend.schema().uses_sentinel(spec.key)
-        && value.trim().eq_ignore_ascii_case(registry::DEFAULT)
-    {
-        return Ok(registry::DEFAULT.into());
+    if let Some(token) = backend.schema().matching_omit_token(spec.key, value) {
+        return Ok(token.into());
     }
     backend.effective_kind(spec, model).validate(value)
 }

@@ -1307,6 +1307,41 @@ mod tests {
         assert_eq!(SCHEMA.omit_token("host"), None);
         assert_eq!(SCHEMA.omit_token("port"), None);
         assert_eq!(SCHEMA.omit_token("pmode"), Some(crate::profiles::registry::DEFAULT));
+        assert!(SCHEMA.uses_sentinel("pmode"));
+    }
+
+    #[test]
+    fn all_resolved_defaults_pass_launch_validation() {
+        let backend = FlmBackend {
+            runtime: Runtime {
+                name: NAME.into(),
+                description: String::new(),
+                version: None,
+                binary_path: None,
+                bench_path: None,
+                formats: vec![],
+                devices: vec![],
+            },
+            npu_ready: true,
+            npu_problem: None,
+            catalog_cache: Mutex::new(None),
+        };
+        let model =
+            entries()[0].to_model(&local("reasoning"), Path::new("/models"), Path::new("/cfg"));
+        let defaults = Defaults::default();
+        let options = SPECS
+            .iter()
+            .map(|spec| {
+                let value = backend.spec_default(spec, &model, &defaults);
+                OptionItem { spec, default: value.clone(), value, range: None }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            options.iter().find(|option| option.spec.key == "pmode").unwrap().value,
+            crate::profiles::registry::DEFAULT
+        );
+        crate::profiles::validate_options(&backend, &model, &options).unwrap();
     }
 
     fn opt(key: &str, value: &str) -> OptionItem {

@@ -47,13 +47,24 @@ impl OptionSchema {
         (self.cli_value)(key, value)
     }
 
+    /// Return the canonical omit token when `value` means this option should
+    /// be left off the command line.
+    /// Matching uses the same trimming and case folding as option validation,
+    /// so persisted values are canonicalized consistently.
+    pub fn matching_omit_token(&self, key: &str, value: &str) -> Option<&'static str> {
+        self.omit_token(key).filter(|token| value.trim().eq_ignore_ascii_case(token))
+    }
+
     /// Whether the option's omitted state is the [`DEFAULT`] sentinel (vs an
     /// in-band enum variant like `"auto"` or an enum's own `"default"` choice).
-    /// Only these get the sentinel editing affordances (the `default` text
-    /// entry); enums cycle through their variants instead.
+    /// A runtime may use the sentinel for an enum whose variants do not include
+    /// `default`; those enums need the same editing and validation behavior as
+    /// numeric sentinel options.
     pub fn uses_sentinel(&self, key: &str) -> bool {
         self.omit_token(key) == Some(DEFAULT)
-            && !matches!(self.spec(key).map(|s| s.kind), Some(OptionKind::Enum(_)))
+            && !self.spec(key).is_some_and(|spec| {
+                matches!(spec.kind, OptionKind::Enum(variants) if variants.contains(&DEFAULT))
+            })
     }
 
     /// Step the value by one increment (`dir = ±1`) for `+`/`-` and the `e`
