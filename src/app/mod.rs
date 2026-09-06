@@ -419,12 +419,11 @@ impl App {
                 self.tick();
             }
             terminal.draw(|frame| ui::draw(frame, self))?;
-            if event::poll(Duration::from_millis(250))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        self.on_key(key);
-                    }
-                }
+            if event::poll(Duration::from_millis(250))?
+                && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                self.on_key(key);
             }
             // A chat request hands the terminal to llama-cli, then we re-enter.
             if let Some(argv) = self.pending_chat.take() {
@@ -1854,10 +1853,10 @@ impl App {
         match key.code {
             KeyCode::Esc => self.modals.set_selector(None),
             KeyCode::Enter => {
-                if let Some(sel) = self.modals.take_selector() {
-                    if let Some(value) = sel.selected().map(str::to_string) {
-                        self.apply_option_value(&sel.key, value);
-                    }
+                if let Some(sel) = self.modals.take_selector()
+                    && let Some(value) = sel.selected().map(str::to_string)
+                {
+                    self.apply_option_value(&sel.key, value);
                 }
             }
             _ => {
@@ -1895,7 +1894,7 @@ impl App {
         let Some(option) = self.browser.options.selected() else {
             return;
         };
-        let key = option.key.clone();
+        let key = option.spec.key;
         let current = option.value.clone();
 
         if key == "device" {
@@ -1905,7 +1904,7 @@ impl App {
             }
             self.modals.set_selector(Some(Selector {
                 title: "Select device".into(),
-                key,
+                key: key.into(),
                 cursor: variants.iter().position(|v| *v == current).unwrap_or(0),
                 variants,
                 filter: String::new(),
@@ -1914,13 +1913,13 @@ impl App {
         }
 
         let Some(backend) = self.browser.runtimes.selected() else { return };
-        if let Some(spec) = backend.schema().spec(&key) {
+        if let Some(spec) = backend.schema().spec(key) {
             use profiles::registry::OptionKind;
             if let OptionKind::Enum(variants) = spec.kind {
                 if variants.len() > SELECTOR_THRESHOLD {
                     self.modals.set_selector(Some(Selector {
                         title: format!("Select {key}"),
-                        key,
+                        key: key.into(),
                         variants: variants.iter().map(|v| (*v).to_string()).collect(),
                         filter: String::new(),
                         // Start on the current value.
@@ -1931,18 +1930,18 @@ impl App {
                 // Small enums don't need a popup — `e` advances to the next
                 // state (which, for omittable options, cycles "default" too).
                 if let Some(next) = backend.schema().bump(spec, &spec.kind, &current, 1) {
-                    self.apply_option_value(&key, next);
+                    self.apply_option_value(key, next);
                 }
                 return;
             }
         }
-        let title = if backend.schema().uses_sentinel(&key) {
+        let title = if backend.schema().uses_sentinel(key) {
             format!("Edit {key} (number or 'default')")
         } else {
             format!("Edit {key}")
         };
         self.modals.set_prompt(Some(Prompt {
-            kind: PromptKind::EditOption { key: key.clone() },
+            kind: PromptKind::EditOption { key: key.to_string() },
             title,
             buffer: current,
             error: None,
@@ -1959,24 +1958,25 @@ impl App {
         let Some(option) = self.browser.options.selected() else {
             return;
         };
-        let key = option.key.clone();
+        let key = option.spec.key;
         let default = option.default.clone();
-        self.apply_option_value(&key, default);
+        self.apply_option_value(key, default);
     }
 
     /// Increment/decrement the selected option in place (auto-saves).
     fn adjust_option(&mut self, dir: i32) {
-        if let Some(option) = self.browser.options.selected() {
-            if option.key == "device" {
-                let next =
-                    self.browser.runtimes.selected().map(|runtime| {
-                        cycle_device(&runtime.descriptor().devices, &option.value, dir)
-                    });
-                if let Some(next) = next {
-                    self.apply_option_value("device", next);
-                }
-                return;
+        if let Some(option) = self.browser.options.selected()
+            && option.spec.key == "device"
+        {
+            let next = self
+                .browser
+                .runtimes
+                .selected()
+                .map(|runtime| cycle_device(&runtime.descriptor().devices, &option.value, dir));
+            if let Some(next) = next {
+                self.apply_option_value("device", next);
             }
+            return;
         }
         let schema = self.browser.runtimes.selected().map(|b| b.schema());
         self.transform_option(move |spec, kind, current| {
@@ -2004,10 +2004,10 @@ impl App {
         let Some(option) = self.browser.options.selected() else {
             return;
         };
-        let key = option.key.clone();
+        let key = option.spec.key;
         let current = option.value.clone();
         let Some(backend) = self.browser.runtimes.selected() else { return };
-        let Some(spec) = backend.schema().spec(&key) else {
+        let Some(spec) = backend.schema().spec(key) else {
             return;
         };
         // Use the model-aware kind so ctx-size respects the model's max context.
@@ -2016,7 +2016,7 @@ impl App {
             None => spec.kind,
         };
         if let Some(value) = f(spec, &kind, &current) {
-            self.apply_option_value(&key, value);
+            self.apply_option_value(key, value);
         }
     }
 
@@ -2275,11 +2275,11 @@ impl App {
     /// refresh its options.
     fn refresh_profiles(&mut self, select: Option<&str>) {
         self.rebuild_below(Pane::Model);
-        if let Some(name) = select {
-            if let Some(i) = self.browser.profiles.items.iter().position(|p| p.name == name) {
-                self.browser.profiles.state.select(Some(i));
-                self.rebuild_below(Pane::Profile);
-            }
+        if let Some(name) = select
+            && let Some(i) = self.browser.profiles.items.iter().position(|p| p.name == name)
+        {
+            self.browser.profiles.state.select(Some(i));
+            self.rebuild_below(Pane::Profile);
         }
     }
 
@@ -2501,10 +2501,10 @@ impl App {
     fn sync_online_catalogs(&mut self) {
         self.rebuild_online_catalogs();
         for backend in &self.browser.runtimes.items {
-            if backend.supports_online_browse() {
-                if let Some(models) = self.catalogs.get(&backend.id()) {
-                    self.store.sync_models(models);
-                }
+            if backend.supports_online_browse()
+                && let Some(models) = self.catalogs.get(&backend.id())
+            {
+                self.store.sync_models(models);
             }
         }
     }
@@ -2828,7 +2828,10 @@ impl App {
                 (p.name.clone(), format!("{kind}{fav}"))
             }),
             Pane::Options => self.browser.options.selected().map(|o| {
-                (o.key.clone(), format!("current {} · default {} · {}", o.value, o.default, o.cli))
+                (
+                    o.spec.key.to_string(),
+                    format!("current {} · default {} · {}", o.value, o.default, o.spec.cli),
+                )
             }),
         }
         .unwrap_or_default()
@@ -2849,15 +2852,15 @@ impl App {
                 crumbs.push(name.clone());
             }
         }
-        if self.browser.focus >= Pane::Profile {
-            if let Some(p) = self.browser.profiles.selected() {
-                crumbs.push(p.name.clone());
-            }
+        if self.browser.focus >= Pane::Profile
+            && let Some(p) = self.browser.profiles.selected()
+        {
+            crumbs.push(p.name.clone());
         }
-        if self.browser.focus >= Pane::Options {
-            if let Some(o) = self.browser.options.selected() {
-                crumbs.push(o.key.clone());
-            }
+        if self.browser.focus >= Pane::Options
+            && let Some(o) = self.browser.options.selected()
+        {
+            crumbs.push(o.spec.key.to_string());
         }
         crumbs
     }
@@ -3124,7 +3127,7 @@ fn default_model_sources(home: Option<&std::path::Path>) -> Vec<ModelSource> {
 
 /// Look up a resolved option's value by key.
 fn option_value(options: &[OptionItem], key: &str) -> Option<String> {
-    options.iter().find(|o| o.key == key).map(|o| o.value.clone())
+    options.iter().find(|o| o.spec.key == key).map(|o| o.value.clone())
 }
 
 /// Hand the terminal to a foreground tool, then re-enter the TUI.

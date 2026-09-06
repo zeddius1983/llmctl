@@ -96,8 +96,7 @@ pub(crate) fn is_variation_selector(c: char) -> bool {
 pub(crate) fn visible_line(raw: &str) -> String {
     raw.split('\r')
         .map(strip_control)
-        .filter(|segment| !segment.trim().is_empty())
-        .last()
+        .rfind(|segment| !segment.trim().is_empty())
         .unwrap_or_default()
 }
 

@@ -459,7 +459,7 @@ impl RuntimeBackend for FlmBackend {
         let options: Vec<OptionItem> = ctx
             .options
             .iter()
-            .filter(|o| !matches!(o.key.as_str(), "host" | "port" | "q-len" | "socket" | "cors"))
+            .filter(|o| !matches!(o.spec.key, "host" | "port" | "q-len" | "socket" | "cors"))
             .cloned()
             .collect();
         Command::append_options(&mut argv, &SCHEMA, &options);
@@ -477,7 +477,7 @@ impl RuntimeBackend for FlmBackend {
     fn bench_argv(&self, ctx: &LaunchContext) -> Option<Vec<String>> {
         let mut argv = vec![ctx.binary.to_string(), "bench".into(), tag(ctx.model())];
         let options: Vec<OptionItem> =
-            ctx.options.iter().filter(|o| o.key == "pmode").cloned().collect();
+            ctx.options.iter().filter(|o| o.spec.key == "pmode").cloned().collect();
         Command::append_options(&mut argv, &SCHEMA, &options);
         Some(argv)
     }
@@ -1309,14 +1309,12 @@ mod tests {
         assert_eq!(SCHEMA.omit_token("pmode"), Some(crate::profiles::registry::DEFAULT));
     }
 
-    fn opt(key: &str, value: &str, cli: &str) -> OptionItem {
+    fn opt(key: &str, value: &str) -> OptionItem {
         OptionItem {
-            key: key.into(),
+            spec: SCHEMA.spec(key).unwrap(),
             value: value.into(),
             default: String::new(),
             range: None,
-            cli: cli.into(),
-            description: String::new(),
         }
     }
 
@@ -1339,10 +1337,10 @@ mod tests {
         let model =
             entries()[0].to_model(&local("reasoning"), Path::new("/models"), Path::new("/cfg"));
         let options = vec![
-            opt("ctx-len", "8192", "--ctx-len"),
-            opt("pmode", crate::profiles::registry::DEFAULT, "--pmode"),
-            opt("host", "127.0.0.1", "--host"),
-            opt("port", "52625", "--port"),
+            opt("ctx-len", "8192"),
+            opt("pmode", crate::profiles::registry::DEFAULT),
+            opt("host", "127.0.0.1"),
+            opt("port", "52625"),
         ];
         let ctx =
             LaunchContext::new("flm", &model, &options).expect("selected model is launchable");
@@ -1376,11 +1374,7 @@ mod tests {
         };
         let model =
             entries()[0].to_model(&local("reasoning"), Path::new("/models"), Path::new("/cfg"));
-        let options = vec![
-            opt("ctx-len", "8192", "--ctx-len"),
-            opt("host", "127.0.0.1", "--host"),
-            opt("port", "52625", "--port"),
-        ];
+        let options = vec![opt("ctx-len", "8192"), opt("host", "127.0.0.1"), opt("port", "52625")];
         let ctx =
             LaunchContext::new("flm", &model, &options).expect("selected model is launchable");
         let argv = backend.chat_argv(&ctx).unwrap();
@@ -1408,11 +1402,7 @@ mod tests {
         };
         let model =
             entries()[0].to_model(&local("reasoning"), Path::new("/models"), Path::new("/cfg"));
-        let options = vec![
-            opt("pmode", "turbo", "--pmode"),
-            opt("ctx-len", "8192", "--ctx-len"),
-            opt("port", "52625", "--port"),
-        ];
+        let options = vec![opt("pmode", "turbo"), opt("ctx-len", "8192"), opt("port", "52625")];
         let ctx =
             LaunchContext::new("flm", &model, &options).expect("selected model is launchable");
         let argv = backend.bench_argv(&ctx).unwrap();
@@ -1469,11 +1459,8 @@ mod tests {
         let model = entry.to_model(&local("chat"), &model_root(), Path::new("/tmp"));
 
         let port = 52999;
-        let options = vec![
-            opt("host", "127.0.0.1", "--host"),
-            opt("port", &port.to_string(), "--port"),
-            opt("ctx-len", "2048", "--ctx-len"),
-        ];
+        let options =
+            vec![opt("host", "127.0.0.1"), opt("port", &port.to_string()), opt("ctx-len", "2048")];
         let binary = binary.display().to_string();
         let ctx =
             LaunchContext::new(&binary, &model, &options).expect("selected model is launchable");

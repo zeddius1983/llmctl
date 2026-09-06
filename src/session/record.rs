@@ -73,10 +73,10 @@ impl SessionRecord {
     /// Remove the record's JSON file (session ended / pruned).
     pub fn delete(&self, dir: &Path) {
         let path = self.file_in(dir);
-        if let Err(err) = std::fs::remove_file(&path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                warn!(path = %path.display(), %err, "failed to remove session record");
-            }
+        if let Err(err) = std::fs::remove_file(&path)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %path.display(), %err, "failed to remove session record");
         }
     }
 

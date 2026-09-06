@@ -1,8 +1,6 @@
 //! Core domain types shared across the app. Pure data, no I/O.
-//!
-//! Phase 0 populates these with static stub data so the panes render. Phases
-//! 1–2 replace the stubs with real discovery and profile/option stores.
 
+pub mod options;
 mod wire;
 
 use std::path::PathBuf;
@@ -10,7 +8,7 @@ use wire::ModelFile;
 
 use serde::{Deserialize, Serialize};
 
-/// An inference backend (MVP: only llama.cpp).
+/// A discovered inference backend.
 #[derive(Debug, Clone)]
 pub struct Runtime {
     pub name: String,
@@ -180,16 +178,15 @@ pub struct Profile {
     pub favorite: bool,
 }
 
-/// One editable launch option, with the metadata shown in the Info pane.
+/// One editable launch option. Static schema metadata is shared; the value,
+/// resolved default, and range belong to this model/profile instance.
 #[derive(Debug, Clone)]
 pub struct OptionItem {
-    pub key: String,
+    pub spec: &'static options::OptionSpec,
     pub value: String,
     pub default: String,
     /// Human-readable allowed range, e.g. "0.0 – 2.0" (None for free-form).
     pub range: Option<String>,
-    pub cli: String,
-    pub description: String,
 }
 
 impl Runtime {
@@ -274,7 +271,7 @@ pub fn format_unix_date(secs: u64) -> String {
     // days since epoch → civil date (Howard Hinnant's algorithm).
     let z = (secs / 86_400) as i64 + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as i64; // [0, 146096]
+    let doe = z - era * 146_097; // [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
     let year = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]

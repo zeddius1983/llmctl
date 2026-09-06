@@ -50,20 +50,20 @@ a runtime = a module under `src/runtime/` + one entry in `runtime::discover`.
 ```
 src/
   main.rs        entry: XDG paths, file tracing, launch TUI
-  app/           App state, event loop, navigation, prompts, actions
+  app/           App coordination, browser/download/session-view/modal state, catalog workers
   config/        Config (first-run config.toml generation) + XDG Paths resolution
-  domain/        pure types (Runtime, Model, FlmModel, Profile, OptionItem), helpers
+  domain/        pure types, options.rs (static metadata + validation), wire.rs (cache compatibility)
   discovery/     catalog.rs (source parsing + managed tree), gguf.rs (header parser),
                  models.rs (scan+cache), online.rs (lazy Hugging Face catalog),
                  hf.rs (shared Hub transfer: Range resume, tree API, URLs)
   runtime/       mod.rs (RuntimeBackend trait, CatalogCtx, LaunchContext, discover),
-                 llama_cpp.rs (llama-server: discovery, option table, argv, /health),
+                 llama_cpp.rs (discovery, option table, /health), llama_cpp/command.rs (named requests),
                  flm.rs (FastFlowLM: flm discovery+validate, catalog, options,
                  resumable Hub downloads)
-  profiles/      registry.rs (generic option model + OptionSchema), templates.rs
+  profiles/      registry.rs (OptionSchema + CLI rules), templates.rs
                  (Template type; tables live with the backends), store.rs
                  (per-model YAML), mod.rs (resolution layering)
-  session/       command.rs (builder), supervisor.rs (DetachedSupervisor: setsid/signals),
+  session/       command.rs (argv/display), supervisor.rs (owned children, setsid/signals),
                  record.rs (session-<id>.json), proc.rs (/proc), health.rs (/health), mod.rs (SessionManager)
   ui/            ratatui rendering (browser columns, Session Manager, log view, footer, prompts, help)
 docs/            requirements, architecture, decisions (ADRs), roadmap
@@ -99,7 +99,9 @@ legacy profile migration), `~/.cache/llmctl/` (models.json, llama-server.help.tx
 ## Coding standards
 
 - Match the style of surrounding code (naming, comment density, idioms).
-- `cargo build` must be **warning-free**; run `cargo fmt`. Use `#[allow(dead_code)]`
+- `cargo build` must be **warning-free**; run `cargo fmt` and
+  `cargo clippy --locked --all-targets -- -D warnings`. CI also runs these checks
+  and the default test suite. Use `#[allow(dead_code)]`
   with a note (e.g. "used in Phase N") only for genuinely forward-looking fields.
 - Unit-test pure logic (resolution, validation, parsing). The TUI is smoke-tested
   via a PTY driver (`$CLAUDE_JOB_DIR/tmp/drive.py`); per-key delays matter, and

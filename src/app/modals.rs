@@ -65,9 +65,7 @@ impl Modals {
         }
     }
     pub(super) fn take_selector(&mut self) -> Option<Selector> {
-        if self.selector().is_none() {
-            return None;
-        }
+        self.selector()?;
         match self.active.take() {
             Some(Modal::Selector(value)) => Some(value),
             _ => None,
@@ -106,9 +104,7 @@ impl Modals {
         }
     }
     pub(super) fn take_confirm(&mut self) -> Option<Confirm> {
-        if self.confirm().is_none() {
-            return None;
-        }
+        self.confirm()?;
         match self.active.take() {
             Some(Modal::Confirm(value)) => Some(value),
             _ => None,

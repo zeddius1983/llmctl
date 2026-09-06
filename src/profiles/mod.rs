@@ -76,12 +76,10 @@ pub fn resolve_options(
             let value = validate_value(backend, model, spec, &value).unwrap_or(value);
 
             OptionItem {
-                key: spec.key.to_string(),
+                spec,
                 value,
                 default,
                 range: backend.effective_kind(spec, model).range_label(),
-                cli: spec.cli.to_string(),
-                description: spec.description.to_string(),
             }
         })
         .collect()
@@ -97,10 +95,10 @@ pub fn validate_options(
     for option in options {
         let spec = backend
             .schema()
-            .spec(&option.key)
-            .ok_or_else(|| format!("unknown option: {}", option.key))?;
+            .spec(option.spec.key)
+            .ok_or_else(|| format!("unknown option: {}", option.spec.key))?;
         validate_value(backend, model, spec, &option.value)
-            .map_err(|error| format!("{}: {error}", option.key))?;
+            .map_err(|error| format!("{}: {error}", option.spec.key))?;
     }
     Ok(())
 }
@@ -130,7 +128,7 @@ pub fn current_values(
 ) -> BTreeMap<String, String> {
     resolve_options(backend, model, profile, store, defaults)
         .into_iter()
-        .map(|o| (o.key, o.value))
+        .map(|o| (o.spec.key.to_string(), o.value))
         .collect()
 }
 
@@ -212,7 +210,7 @@ mod tests {
     }
 
     fn value_of(opts: &[OptionItem], key: &str) -> String {
-        opts.iter().find(|o| o.key == key).unwrap().value.clone()
+        opts.iter().find(|o| o.spec.key == key).unwrap().value.clone()
     }
 
     #[test]

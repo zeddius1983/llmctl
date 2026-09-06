@@ -233,7 +233,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
             .iter()
             .map(|o| {
                 ListItem::new(Line::from(vec![
-                    Span::raw(format!("{icon}  {}: ", o.key)),
+                    Span::raw(format!("{icon}  {}: ", o.spec.key)),
                     Span::styled(o.value.clone(), Style::default().fg(ACCENT)),
                 ]))
             })
@@ -332,16 +332,16 @@ fn render_option_detail(frame: &mut Frame, area: Rect, app: &App) {
         .selected()
         .map(|o| {
             Text::from(vec![
-                Line::from(o.key.clone().bold().fg(ACCENT)),
+                Line::from(o.spec.key.bold().fg(ACCENT)),
                 Line::raw(""),
                 kv("Current", &o.value),
                 kv("Default", &o.default),
                 kv("Range", o.range.as_deref().unwrap_or("free-form")),
                 Line::raw(""),
                 Line::from("CLI".bold()),
-                Line::from(o.cli.clone()),
+                Line::from(o.spec.cli),
                 Line::raw(""),
-                Line::from(o.description.clone()),
+                Line::from(o.spec.description),
             ])
         })
         .unwrap_or_else(|| Text::from(Line::from("(no option selected)".dim())));

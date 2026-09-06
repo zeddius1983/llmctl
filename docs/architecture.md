@@ -9,8 +9,9 @@ Component structure and application design for `llmctl`. See
 `llmctl` is a single-binary Rust TUI built on ratatui + crossterm. It runs a
 synchronous draw/input loop; since Phase 3 a short `event::poll` timeout adds a
 periodic tick that refreshes live session status without an async runtime
-(ADR-007). State lives in one `App` struct; rendering is a pure function of that
-state.
+(ADR-007). `App` coordinates browser, download, session-view, and modal state
+owners; rendering reads that state. Scans and readiness probes report worker
+completions to the event loop.
 
 ```
             ┌──────────────┐   draw(&App)   ┌──────────────┐
@@ -24,8 +25,8 @@ state.
               ▼                    ▼                ▼                     ▼
          config/             discovery/         profiles/            domain/
        Config, Paths     gguf, models,      registry, templates,   pure types,
-       (config.toml,     runtimes           store, resolution      helpers,
-        XDG dirs)        (scan + cache)      (per runtime+model)    vLLM stubs
+       (config.toml,     online, hf         store, resolution      helpers,
+        XDG dirs)        (scan + cache)      (per runtime+model)    option kinds
 ```
 
 ## Modules
@@ -35,9 +36,10 @@ state.
 - **`config/`** — `Config` (deserialized from `config.toml`; a documented
   standard-source file is generated on first run) and `Paths`
   (config/state/cache/log/sessions locations).
-- **`domain/`** — IO-free types: `Runtime`, `Model`, `Profile`, `OptionItem`;
-  helpers (`human_size`, `format_unix_date`); and `stubs` for the demo vLLM
-  runtime/models.
+- **`domain/`** — IO-free types: `Runtime`, `Model`, `CatalogEntry`, `ModelSource`,
+  `Profile`, `OptionItem`; helpers (`human_size`, `format_unix_date`); static
+  `OptionSpec` metadata and `OptionKind` validation/adjustment in `options.rs`.
+  `wire.rs` isolates compatibility with existing serialized model caches.
 - **`discovery/`**
   - `catalog.rs` — normalize known/custom source layouts and reconcile the
     managed directory tree, identity manifests, and model symlinks.
@@ -68,27 +70,28 @@ state.
     cleanup preserves those records. The left jobs column stacks Sessions over Downloads
     with a 70/30 split; both panes map into one continuous selection index and
     share the right-hand Detail pane.
-  - `runtimes.rs` — locate `llama-server` (explicit path or `$PATH`), capture
-    `--version`, cache `--help`.
+- **`runtime/`** — `RuntimeBackend` capabilities and stable `RuntimeId` keys.
+  `llama_cpp.rs` and `flm.rs` own discovery, schemas, templates, model enumeration,
+  downloads, launch commands, and readiness/identity conventions.
+  `llama_cpp/command.rs` builds local and Hub commands from named requests.
 - **`profiles/`**
-  - `registry.rs` — static `REGISTRY` of `OptionSpec`s (kind, default, range,
-    step, CLI flag, description) plus `OptionKind` validate/adjust/extreme logic.
-  - `templates.rs` — built-in global templates (Default/Chat/Coding/Long
-    Context/Server) as option overrides.
+  - `registry.rs` — `OptionSchema` couples each backend's static option table to
+    its omission, flag, and value-encoding rules.
+  - `templates.rs` — template type and lookup; each backend owns its table.
   - `store.rs` — `ProfileStore`: model-scoped instances persisted as YAML in
     each catalog leaf; create/rename/delete/favorite/set-value, auto-saved.
   - `mod.rs` — resolution: `list_profiles`, `resolve_options`,
-    `current_values`, `effective_kind` (model-aware ctx-size bound).
+    `current_values`, and validation through the backend's model-aware bounds.
 - **`session/`**
-  - `command.rs` — pure launch-command builder (argv + shell-quoted display;
-    bool flags emitted only when on, local model via `-m`, remote model via
-    `--hf-repo` and `--hf-file`).
+  - `command.rs` — generic argv, schema-driven option emission, and shell-quoted
+    display; runtime-specific prefixes live with their backends.
   - `supervisor.rs` — `SessionSupervisor` trait + `DetachedSupervisor` (`setsid`
-    pre-exec, stdio→log file, owned `Child` handles and nonblocking reaping, `kill(-pgid, …)`); plus the
+    pre-exec, stdio→log file, owned `Child` handles, nonblocking reaping, and
+    process-group/descendant signals); plus the
     OSC 52 base64 helper used for clipboard yank.
   - `record.rs` — `SessionRecord` persisted as `session-<id>.json`; load/prune.
   - `proc.rs` — `/proc` liveness, cmdline match (PID-reuse guard), RSS, CPU%.
-  - `health.rs` — minimal `/health` TCP probe; bindable-port check.
+  - `health.rs` — bounded readiness worker queue and TCP probe; bindable-port check.
   - `mod.rs` — `SessionManager`: launch, rediscover + prune, refresh
     (status/resources), stop/kill/restart, port-conflict resolution.
 - **`ui/`** — all rendering: the browser's three columns + footer, the Session
@@ -220,3 +223,16 @@ to 64 KiB, and discard oversized lines through their next newline. Device/inode
 identity detects replacements even when the new log is larger. Catalog workers
 use standard subprocess output capture; child ownership keeps these independent
 of detached server lifecycle management.
+
+## Command and option boundaries
+
+`LocalCommand` and `HuggingFaceCommand` name binary, model identity, and companion
+inputs; their `build` methods use the llama.cpp schema. Cached companion paths
+continue to take precedence over remote references. `session::command::Command`
+only knows generic argv, option emission, and shell display.
+
+`OptionItem` borrows its static `OptionSpec`, sharing key, CLI flag, description,
+and kind. Current value, model-aware default, and displayed range remain owned
+per resolved row. Persistence still writes only string keys and values, so
+existing profiles and caches require no migration. CI runs formatting, build,
+tests, and Clippy with warnings denied on each pull request.

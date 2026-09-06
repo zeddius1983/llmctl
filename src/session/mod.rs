@@ -882,10 +882,10 @@ fn slug(s: &str) -> String {
 
 /// Replace the value following `--port` in an argv (used on restart).
 fn set_port_arg(argv: &mut [String], port: u16) {
-    if let Some(i) = argv.iter().position(|a| a == "--port") {
-        if let Some(v) = argv.get_mut(i + 1) {
-            *v = port.to_string();
-        }
+    if let Some(i) = argv.iter().position(|a| a == "--port")
+        && let Some(v) = argv.get_mut(i + 1)
+    {
+        *v = port.to_string();
     }
 }
 
@@ -1096,14 +1096,12 @@ mod tests {
         assert_eq!(session_status_label(SessionStatus::Starting, None), "Starting");
     }
 
-    fn opt(key: &str, value: &str, cli: &str) -> crate::domain::OptionItem {
+    fn opt(key: &str, value: &str) -> crate::domain::OptionItem {
         crate::domain::OptionItem {
-            key: key.into(),
+            spec: crate::runtime::llama_cpp::SCHEMA.spec(key).unwrap(),
             value: value.into(),
             default: String::new(),
             range: None,
-            cli: cli.into(),
-            description: String::new(),
         }
     }
 
@@ -1143,14 +1141,13 @@ mod tests {
         std::fs::set_permissions(&server, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
 
-        let command = Command::build_local(
-            &server.display().to_string(),
-            "/models/fake.gguf",
-            None,
-            None,
-            &crate::runtime::llama_cpp::SCHEMA,
-            &[opt("host", "127.0.0.1", "--host"), opt("port", "18900", "--port")],
-        );
+        let command = crate::runtime::llama_cpp::command::LocalCommand {
+            binary: &server.display().to_string(),
+            model_path: "/models/fake.gguf",
+            draft_path: None,
+            projector_path: None,
+        }
+        .build(&[opt("host", "127.0.0.1"), opt("port", "18900")]);
         let req = LaunchRequest {
             runtime: "llama.cpp".into(),
             model: "fake.gguf".into(),

@@ -130,11 +130,11 @@ impl DownloadManager {
     }
 
     pub(super) fn cancel(&mut self, index: usize) {
-        if let Some(job) = self.jobs.get_mut(index) {
-            if matches!(job.status, ModelDownloadStatus::Downloading) {
-                job.cancelled.store(true, Ordering::Relaxed);
-                job.status = ModelDownloadStatus::Cancelling;
-            }
+        if let Some(job) = self.jobs.get_mut(index)
+            && matches!(job.status, ModelDownloadStatus::Downloading)
+        {
+            job.cancelled.store(true, Ordering::Relaxed);
+            job.status = ModelDownloadStatus::Cancelling;
         }
     }
 

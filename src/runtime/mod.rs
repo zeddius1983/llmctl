@@ -34,17 +34,20 @@ pub use llama_cpp::LlamaCppBackend;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RuntimeId(pub String);
 
+/// Worker entry point for a backend-owned model transfer.
+pub type TransferWorker = fn(
+    &Model,
+    &std::sync::atomic::AtomicBool,
+    &mut dyn FnMut(u64, u64),
+) -> Result<crate::discovery::online::DownloadResult>;
+
 /// A backend-owned transfer that can run on a worker without borrowing App.
 #[derive(Clone)]
 pub struct ModelTransfer {
     pub runtime: RuntimeId,
     pub model: Box<Model>,
     pub targets: Vec<PathBuf>,
-    pub run: fn(
-        &Model,
-        &std::sync::atomic::AtomicBool,
-        &mut dyn FnMut(u64, u64),
-    ) -> Result<crate::discovery::online::DownloadResult>,
+    pub run: TransferWorker,
 }
 
 /// The filesystem context a backend needs to enumerate its models.
@@ -502,7 +505,7 @@ mod tests {
             trees: vec![tree.clone()],
             ..Deletion::default()
         };
-        assert!(plan.overlaps(&[blob.clone()]));
+        assert!(plan.overlaps(std::slice::from_ref(&blob)));
         // The same blob spelled with a traversal is the same file.
         assert!(plan.overlaps(&[blobs.join("..").join("blobs").join("aa")]));
         // Anything inside a tree the plan removes counts too.
@@ -527,7 +530,11 @@ mod tests {
 
         let plain = root.join("plain.gguf");
         std::fs::write(&plain, vec![0u8; 100]).unwrap();
-        assert_eq!(freed_bytes(&[plain.clone()]), 100, "a file with one name frees its length");
+        assert_eq!(
+            freed_bytes(std::slice::from_ref(&plain)),
+            100,
+            "a file with one name frees its length"
+        );
         // Spelling it twice does not free it twice.
         assert_eq!(freed_bytes(&[plain.clone(), root.join(".").join("plain.gguf")]), 100);
 
@@ -535,7 +542,11 @@ mod tests {
         let other_name = root.join("also-shared.gguf");
         std::fs::write(&shared, vec![0u8; 400]).unwrap();
         std::fs::hard_link(&shared, &other_name).unwrap();
-        assert_eq!(freed_bytes(&[shared.clone()]), 0, "the contents survive under the other name");
+        assert_eq!(
+            freed_bytes(std::slice::from_ref(&shared)),
+            0,
+            "the contents survive under the other name"
+        );
         assert_eq!(
             freed_bytes(&[shared.clone(), other_name.clone()]),
             400,

@@ -1,6 +1,8 @@
 //! The llama.cpp backend: `llama-server` discovery, its option vocabulary and
 //! CLI dialect, command construction, and the `/health` readiness contract.
 
+pub(crate) mod command;
+
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
 
@@ -513,7 +515,7 @@ impl RuntimeBackend for LlamaCppBackend {
         let value = |key: &str| {
             options
                 .iter()
-                .find(|option| option.key == key)
+                .find(|option| option.spec.key == key)
                 .map(|option| option.value.as_str())
                 .filter(|value| *value != DEFAULT && !value.is_empty())
         };
@@ -638,25 +640,23 @@ impl RuntimeBackend for LlamaCppBackend {
         let projector_path = model.projector_path.as_ref().map(|p| p.display().to_string());
 
         match remote_launch(model, drafter) {
-            Some(remote) => Command::build_huggingface(
-                ctx.binary,
-                &remote.repo,
-                remote.file.as_deref().unwrap_or_default(),
-                draft_path.as_deref(),
-                draft_hf(remote, drafter, draft_path.is_some()).as_deref(),
-                projector_path.as_deref(),
-                projector_path.is_none() && remote.projector_file.is_some(),
-                &SCHEMA,
-                ctx.options,
-            ),
-            None => Command::build_local(
-                ctx.binary,
-                &model.path.display().to_string(),
-                draft_path.as_deref(),
-                projector_path.as_deref(),
-                &SCHEMA,
-                ctx.options,
-            ),
+            Some(remote) => command::HuggingFaceCommand {
+                binary: ctx.binary,
+                repo: &remote.repo,
+                file: remote.file.as_deref().unwrap_or_default(),
+                draft_path: draft_path.as_deref(),
+                draft_hf: draft_hf(remote, drafter, draft_path.is_some()).as_deref(),
+                projector_path: projector_path.as_deref(),
+                projector_auto: projector_path.is_none() && remote.projector_file.is_some(),
+            }
+            .build(ctx.options),
+            None => command::LocalCommand {
+                binary: ctx.binary,
+                model_path: &model.path.display().to_string(),
+                draft_path: draft_path.as_deref(),
+                projector_path: projector_path.as_deref(),
+            }
+            .build(ctx.options),
         }
     }
 
@@ -664,8 +664,12 @@ impl RuntimeBackend for LlamaCppBackend {
     /// options (the endpoint) are dropped.
     fn chat_argv(&self, ctx: &LaunchContext) -> Option<Vec<String>> {
         let binary = cli_binary(ctx.binary)?;
-        let options: Vec<OptionItem> =
-            ctx.options.iter().filter(|o| o.key != "host" && o.key != "port").cloned().collect();
+        let options: Vec<OptionItem> = ctx
+            .options
+            .iter()
+            .filter(|o| o.spec.key != "host" && o.spec.key != "port")
+            .cloned()
+            .collect();
         let sub = LaunchContext::new(&binary, ctx.model(), &options)
             .expect("selected model is launchable");
         let mut argv = self.build_command(&sub).argv;
@@ -677,7 +681,8 @@ impl RuntimeBackend for LlamaCppBackend {
         let bench = self.runtime.bench_path.as_ref()?.display().to_string();
         let mut argv = vec![bench, "-m".into(), ctx.model().path.display().to_string()];
         for key in ["device", "gpu-layers"] {
-            if let Some(opt) = ctx.options.iter().find(|o| o.key == key && o.value != DEFAULT) {
+            if let Some(opt) = ctx.options.iter().find(|o| o.spec.key == key && o.value != DEFAULT)
+            {
                 argv.push(if key == "device" { "--device".into() } else { "-ngl".into() });
                 argv.push(opt.value.clone());
             }
@@ -707,10 +712,9 @@ impl RuntimeBackend for LlamaCppBackend {
         // Applies to every launch, local or remote: the flag itself is too new
         // for the binary.
         if !self.load_mode_supported
-            && ctx
-                .options
-                .iter()
-                .any(|o| o.key == "load-mode" && SCHEMA.omit_token("load-mode") != Some(&o.value))
+            && ctx.options.iter().any(|o| {
+                o.spec.key == "load-mode" && SCHEMA.omit_token("load-mode") != Some(&o.value)
+            })
         {
             return Some(
                 "this llama-server does not advertise --load-mode; upgrade llama.cpp or leave load-mode at default"
@@ -990,7 +994,7 @@ enum Drafter {
 /// `--spec-type` values (ngram-*, and the draft types llmctl does not pair a
 /// companion for) need no artifact from the catalog.
 fn drafter(options: &[OptionItem]) -> Option<Drafter> {
-    options.iter().find(|o| o.key == "spec-type").and_then(|o| match o.value.as_str() {
+    options.iter().find(|o| o.spec.key == "spec-type").and_then(|o| match o.value.as_str() {
         "draft-mtp" => Some(Drafter::Mtp),
         "draft-dflash" => Some(Drafter::DFlash),
         _ => None,
@@ -1550,12 +1554,10 @@ mod tests {
         assert_eq!(spec.kind.validate("draft-dflash").unwrap(), "draft-dflash");
 
         let opts = vec![OptionItem {
-            key: "spec-type".into(),
+            spec: SCHEMA.spec("spec-type").unwrap(),
             value: "draft-dflash".into(),
             default: "none".into(),
             range: None,
-            cli: "--spec-type".into(),
-            description: String::new(),
         }];
         assert_eq!(drafter(&opts), Some(Drafter::DFlash));
 
@@ -1609,12 +1611,10 @@ mod tests {
         // An explicit draft-dflash — from a profile saved against a newer
         // llama.cpp — is refused with an explanation rather than launched.
         let selected = OptionItem {
-            key: "spec-type".into(),
+            spec: SCHEMA.spec("spec-type").unwrap(),
             value: "draft-dflash".into(),
             default: "none".into(),
             range: None,
-            cli: "--spec-type".into(),
-            description: String::new(),
         };
         let ctx = LaunchContext::new("llama-server", &model, std::slice::from_ref(&selected))
             .expect("selected model is launchable");
@@ -1713,12 +1713,10 @@ mod tests {
         let mut backend = test_backend();
         backend.runtime.devices = vec!["ROCm0".into()];
         let option = |key: &str, value: &str| OptionItem {
-            key: key.into(),
+            spec: SCHEMA.spec(key).unwrap(),
             value: value.into(),
             default: DEFAULT.into(),
             range: None,
-            cli: String::new(),
-            description: String::new(),
         };
 
         let cpu = vec![option("device", "ROCm0"), option("gpu-layers", "0")];
@@ -1739,12 +1737,10 @@ mod tests {
         backend.load_mode_supported = false;
         let model = test_model();
         let none = OptionItem {
-            key: "load-mode".into(),
+            spec: SCHEMA.spec("load-mode").unwrap(),
             value: "none".into(),
             default: DEFAULT.into(),
             range: None,
-            cli: "-lm".into(),
-            description: String::new(),
         };
         let ctx = LaunchContext::new("llama-server", &model, std::slice::from_ref(&none))
             .expect("selected model is launchable");
