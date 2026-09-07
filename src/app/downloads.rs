@@ -147,6 +147,25 @@ impl DownloadManager {
     pub(super) fn spawn(&self, id: u64, source: DownloadSource, cancelled: Arc<AtomicBool>) {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
+            let (source_kind, source_name) = match &source {
+                DownloadSource::Hub(remote) => (
+                    "huggingface".to_string(),
+                    format!(
+                        "{}/{}",
+                        remote.repo,
+                        remote.file.as_deref().unwrap_or("unknown artifact")
+                    ),
+                ),
+                DownloadSource::Backend(transfer) => {
+                    (transfer.runtime.0.clone(), transfer.model.name.clone())
+                }
+            };
+            tracing::info!(
+                download_id = id,
+                source = %source_kind,
+                model = %source_name,
+                "model download started"
+            );
             let progress = |downloaded_bytes, total_bytes| {
                 let _ = tx.send(ModelDownloadEvent::Progress { id, downloaded_bytes, total_bytes });
             };
@@ -160,6 +179,35 @@ impl DownloadManager {
                         .map_err(|error| error.to_string())
                 }
             };
+            match &result {
+                Ok(discovery::online::DownloadResult::Downloaded(path)) => tracing::info!(
+                    download_id = id,
+                    source = %source_kind,
+                    model = %source_name,
+                    path = %path.display(),
+                    "model download completed"
+                ),
+                Ok(discovery::online::DownloadResult::Cancelled) => tracing::info!(
+                    download_id = id,
+                    source = %source_kind,
+                    model = %source_name,
+                    "model download cancelled"
+                ),
+                Err(error) if cancelled.load(Ordering::Relaxed) => tracing::info!(
+                    download_id = id,
+                    source = %source_kind,
+                    model = %source_name,
+                    %error,
+                    "model download cancelled after transfer error"
+                ),
+                Err(error) => tracing::error!(
+                    download_id = id,
+                    source = %source_kind,
+                    model = %source_name,
+                    %error,
+                    "model download failed"
+                ),
+            }
             let _ = tx.send(ModelDownloadEvent::Finished { id, result });
         });
     }
