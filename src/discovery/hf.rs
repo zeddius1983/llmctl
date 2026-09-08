@@ -144,7 +144,7 @@ fn download_url(request: DownloadRequest<'_>, mut progress: impl FnMut(u64, u64)
         }
 
         let offset = dest.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-        if offset == expected_bytes {
+        if expected_bytes > 0 && offset == expected_bytes {
             progress(expected_bytes, expected_bytes);
             return Ok(true);
         }
@@ -411,6 +411,52 @@ mod tests {
         let requests = requests.lock().unwrap();
         assert!(!requests[0].to_ascii_lowercase().contains("range:"));
         assert!(requests[1].to_ascii_lowercase().contains("range: bytes=5-"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zero_byte_transfer_still_creates_its_destination() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/empty", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+
+        let root = std::env::temp_dir().join(format!(
+            "llmctl-hf-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let dest = root.join("empty.part");
+        let cancelled = AtomicBool::new(false);
+        let completed = download_url(
+            DownloadRequest {
+                repo: "owner/repo",
+                revision: "main",
+                file: "empty",
+                url: &url,
+                dest: &dest,
+                expected_bytes: 0,
+                cancelled: &cancelled,
+                retry: RetryPolicy { attempts: 1, initial_delay: Duration::ZERO },
+            },
+            |_, _| {},
+        )
+        .unwrap();
+
+        server.join().unwrap();
+        assert!(completed);
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), 0);
         std::fs::remove_dir_all(root).unwrap();
     }
 

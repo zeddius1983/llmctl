@@ -10,15 +10,25 @@ static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Write beside the destination, then rename so readers never see partial JSON
 /// or YAML. Unique scratch names also isolate concurrent writers.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic_with_sequence(path, bytes, &SEQUENCE)
+}
+
+fn write_atomic_with_sequence(path: &Path, bytes: &[u8], sequence: &AtomicU64) -> io::Result<()> {
     let name = path.file_name().ok_or_else(|| io::Error::other("missing filename"))?;
-    let mut scratch_name = name.to_os_string();
-    scratch_name.push(format!(
-        ".{}.{}.tmp",
-        std::process::id(),
-        SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let scratch = path.with_file_name(scratch_name);
-    let mut file = OpenOptions::new().create_new(true).write(true).open(&scratch)?;
+    let (scratch, mut file) = loop {
+        let mut scratch_name = name.to_os_string();
+        scratch_name.push(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            sequence.fetch_add(1, Ordering::Relaxed)
+        ));
+        let scratch = path.with_file_name(scratch_name);
+        match OpenOptions::new().create_new(true).write(true).open(&scratch) {
+            Ok(file) => break (scratch, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
     let result = (|| {
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -49,6 +59,26 @@ mod tests {
         assert!(write_atomic(&root.join("record"), b"replacement").is_err());
         assert_eq!(fs::read(root.join("record/keep")).unwrap(), b"original");
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_scratch_file_does_not_block_a_later_process_write() {
+        let root = std::env::temp_dir().join(format!(
+            "llmctl-stale-scratch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("record.json");
+        let stale = root.join(format!("record.json.{}.0.tmp", std::process::id()));
+        fs::write(&stale, b"interrupted").unwrap();
+
+        write_atomic_with_sequence(&path, b"current", &AtomicU64::new(0)).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"current");
+        assert_eq!(fs::read(&stale).unwrap(), b"interrupted");
+        assert!(!root.join(format!("record.json.{}.1.tmp", std::process::id())).exists());
         fs::remove_dir_all(root).unwrap();
     }
 }

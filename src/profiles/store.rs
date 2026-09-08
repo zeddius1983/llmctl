@@ -193,9 +193,13 @@ impl ProfileStore {
         if let Err(error) = self.persist_one(&new_key) {
             return Err(self.rollback_new_profile(&new_key, error));
         }
-        // The replacement is durable before the original is removed. If removal
-        // fails, both names survive and the caller reports the failure.
-        self.delete(runtime, model, old)
+        // The replacement is durable before the original is removed. Roll it
+        // back if that removal fails, so a reported failure leaves only the
+        // original name in memory and on disk.
+        if let Err(error) = self.delete(runtime, model, old) {
+            return Err(self.rollback_new_profile(&new_key, error));
+        }
+        Ok(())
     }
 
     /// Remove the persisted record only after the fallback store has accepted
@@ -400,10 +404,14 @@ impl ProfileStore {
     fn rollback_new_profile(&mut self, entry: &Key, error: io::Error) -> io::Error {
         self.instances.remove(entry);
         self.fallback.remove(entry);
-        match self.remove_profile_file(&entry.1, &entry.2) {
-            Ok(()) => error,
-            Err(rollback) => rollback_failure(error, rollback),
+        let mut result = error;
+        if let Err(rollback) = self.save_legacy() {
+            result = rollback_failure(result, rollback);
         }
+        if let Err(rollback) = self.remove_profile_file(&entry.1, &entry.2) {
+            result = rollback_failure(result, rollback);
+        }
+        result
     }
 
     fn back_up_legacy(&self) {
@@ -518,6 +526,42 @@ mod tests {
         assert!(!model.catalog_dir.join("profiles/Renamed.yml").exists());
         assert!(store.get("llama.cpp", &key, "Original").is_some());
         assert!(store.get("llama.cpp", &key, "Renamed").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_rename_delete_phase_rolls_back_the_new_name() {
+        let (root, model, mut store) = fixture();
+        let key = model.profile_key();
+        store.create("llama.cpp", &key, "Original", BTreeMap::new(), true).unwrap();
+        let original = model.catalog_dir.join("profiles/Original.yml");
+        std::fs::remove_file(&original).unwrap();
+        std::fs::create_dir(&original).unwrap();
+
+        assert!(store.rename("llama.cpp", &key, "Original", "Renamed").is_err());
+        assert!(original.is_dir());
+        assert!(!model.catalog_dir.join("profiles/Renamed.yml").exists());
+        assert!(store.get("llama.cpp", &key, "Original").is_some());
+        assert!(store.get("llama.cpp", &key, "Renamed").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rolling_back_a_fallback_name_removes_its_legacy_record() {
+        let (root, model, mut store) = fixture();
+        let entry = key("llama.cpp", &model.profile_key(), "Renamed");
+        store.instances.insert(
+            entry.clone(),
+            Instance { values: BTreeMap::new(), favorite: false, custom: true },
+        );
+        store.fallback.insert(entry.clone());
+        store.save_legacy().unwrap();
+
+        let _ = store.rollback_new_profile(&entry, io::Error::other("rename failed"));
+
+        assert!(!store.legacy_path.exists());
+        let reloaded = ProfileStore::load(store.legacy_path.clone(), &[model]);
+        assert!(reloaded.get("llama.cpp", &entry.1, "Renamed").is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 
