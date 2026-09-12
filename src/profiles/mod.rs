@@ -71,17 +71,48 @@ pub fn resolve_options(
                 .unwrap_or_else(|| default.clone());
             let value = backend.clamp_to_model(spec.key, value, model);
             let value = backend.normalize_legacy(spec.key, value);
+            // Keep invalid saved values editable, but canonicalize valid enums
+            // and numbers exactly as interactive editing does.
+            let value = validate_value(backend, model, spec, &value).unwrap_or(value);
 
             OptionItem {
-                key: spec.key.to_string(),
+                spec,
                 value,
                 default,
                 range: backend.effective_kind(spec, model).range_label(),
-                cli: spec.cli.to_string(),
-                description: spec.description.to_string(),
             }
         })
         .collect()
+}
+
+/// Validate resolved options at every launch boundary. Invalid saved values
+/// remain visible for correction rather than silently changing the user's run.
+pub fn validate_options(
+    backend: &dyn RuntimeBackend,
+    model: &Model,
+    options: &[OptionItem],
+) -> Result<(), String> {
+    for option in options {
+        let spec = backend
+            .schema()
+            .spec(option.spec.key)
+            .ok_or_else(|| format!("unknown option: {}", option.spec.key))?;
+        validate_value(backend, model, spec, &option.value)
+            .map_err(|error| format!("{}: {error}", option.spec.key))?;
+    }
+    Ok(())
+}
+
+fn validate_value(
+    backend: &dyn RuntimeBackend,
+    model: &Model,
+    spec: &registry::OptionSpec,
+    value: &str,
+) -> Result<String, String> {
+    if let Some(token) = backend.schema().matching_omit_token(spec.key, value) {
+        return Ok(token.into());
+    }
+    backend.effective_kind(spec, model).validate(value)
 }
 
 /// The fully-resolved current values for a (runtime, model, profile), including
@@ -95,7 +126,7 @@ pub fn current_values(
 ) -> BTreeMap<String, String> {
     resolve_options(backend, model, profile, store, defaults)
         .into_iter()
-        .map(|o| (o.key, o.value))
+        .map(|o| (o.spec.key.to_string(), o.value))
         .collect()
 }
 
@@ -144,6 +175,9 @@ mod tests {
 
     fn model() -> Model {
         Model {
+            entry: crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf {
+                remote: None,
+            }),
             id: "test-model".into(),
             name: "x.gguf".into(),
             path: "/tmp/x.gguf".into(),
@@ -161,9 +195,7 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
-            flm: None,
             runtime: crate::runtime::llama_cpp::NAME.into(),
-            remote: None,
         }
     }
 
@@ -176,7 +208,80 @@ mod tests {
     }
 
     fn value_of(opts: &[OptionItem], key: &str) -> String {
-        opts.iter().find(|o| o.key == key).unwrap().value.clone()
+        opts.iter().find(|o| o.spec.key == key).unwrap().value.clone()
+    }
+
+    #[test]
+    fn invalid_saved_values_stay_editable_but_cannot_launch() {
+        let backend = backend();
+        let model = model();
+        for (key, value) in [
+            ("temperature", "NaN"),
+            ("port", "70000"),
+            ("top-k", "-2"),
+            ("flash-attn", "sometimes"),
+        ] {
+            let mut store = empty_store();
+            assert!(
+                store
+                    .set_value(
+                        "llama.cpp",
+                        &model.profile_key(),
+                        "Default",
+                        key,
+                        value.into(),
+                        &BTreeMap::new(),
+                    )
+                    .is_err()
+            );
+            let options = resolve_options(
+                &backend,
+                &model,
+                &profile("Default"),
+                &store,
+                &Defaults::default(),
+            );
+            assert_eq!(value_of(&options, key), value);
+            assert!(validate_options(&backend, &model, &options).unwrap_err().starts_with(key));
+        }
+    }
+
+    #[test]
+    fn saved_sentinels_and_legacy_enums_are_validated_after_normalization() {
+        let backend = backend();
+        let model = model();
+        let mut store = empty_store();
+        for (key, value) in
+            [("temperature", " DEFAULT "), ("flash-attn", "true"), ("reasoning", "OFF")]
+        {
+            assert!(
+                store
+                    .set_value(
+                        "llama.cpp",
+                        &model.profile_key(),
+                        "Default",
+                        key,
+                        value.into(),
+                        &BTreeMap::new(),
+                    )
+                    .is_err()
+            );
+        }
+        let options =
+            resolve_options(&backend, &model, &profile("Default"), &store, &Defaults::default());
+        validate_options(&backend, &model, &options).unwrap();
+        assert_eq!(value_of(&options, "temperature"), "default");
+        assert_eq!(value_of(&options, "flash-attn"), "on");
+        assert_eq!(value_of(&options, "reasoning"), "off");
+    }
+
+    #[test]
+    fn model_context_does_not_wrap_into_a_negative_bound() {
+        let backend = backend();
+        let model = model_with_ctx(Some(u64::MAX));
+        let kind = backend.effective_kind(backend.schema().spec("ctx-size").unwrap(), &model);
+        assert!(kind.validate("4096").is_ok());
+        assert_eq!(backend.clamp_to_model("ctx-size", "4096".into(), &model), "4096");
     }
 
     #[test]
@@ -368,7 +473,18 @@ mod tests {
         let m = model_with_ctx(Some(262144));
         let mut store = empty_store();
         let base = resolved_values(&backend(), &profile("Default"), &m, &Defaults::default());
-        store.set_value("llama.cpp", "/tmp/x.gguf", "Default", "temperature", "0.5".into(), &base);
+        assert!(
+            store
+                .set_value(
+                    "llama.cpp",
+                    "/tmp/x.gguf",
+                    "Default",
+                    "temperature",
+                    "0.5".into(),
+                    &base
+                )
+                .is_err()
+        );
         let opts =
             resolve_options(&backend(), &m, &profile("Default"), &store, &Defaults::default());
         assert_eq!(value_of(&opts, "temperature"), "0.5");

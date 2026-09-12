@@ -296,7 +296,7 @@ fn save_repositories(root: &Path, fresh: Vec<Repository>, sort: Sort) -> Result<
 /// Promote one transient search result into the persistent online catalogue.
 pub fn save_selected_repository(root: &Path, model: &Model, sort: Sort) -> Result<()> {
     ensure_root(root);
-    let remote = model.remote.as_ref().context("selected model is not a Hub repository")?;
+    let remote = model.remote().context("selected model is not a Hub repository")?;
     if remote.file.is_some() {
         anyhow::bail!("selected model is a Hub artifact, not a repository");
     }
@@ -446,6 +446,20 @@ fn artifacts_with_cache(
             reconcile_link(&catalog_dir.join("model.gguf"), &local_path);
         }
         result.push(Model {
+            entry: crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf {
+                remote: Some(RemoteModel {
+                    repo: detail.repository.id.clone(),
+                    revision: detail.repository.sha.clone(),
+                    file: Some(file.rfilename.clone()),
+                    blobs,
+                    mtp_file: mtp.map(|companion| companion.rfilename.clone()),
+                    dflash_file: dflash.map(|companion| companion.rfilename.clone()),
+                    projector_file: projector.map(|companion| companion.rfilename.clone()),
+                    downloads: detail.repository.downloads,
+                    likes: detail.repository.likes,
+                    gated: detail.repository.gated,
+                }),
+            }),
             id: format!("hf:{}/{}", detail.repository.id, file.rfilename),
             name: display,
             path: local_path,
@@ -472,20 +486,7 @@ fn artifacts_with_cache(
                 .as_ref()
                 .and_then(|gguf| gguf.chat_template.as_ref())
                 .is_some(),
-            flm: None,
             runtime: crate::runtime::llama_cpp::NAME.into(),
-            remote: Some(RemoteModel {
-                repo: detail.repository.id.clone(),
-                revision: detail.repository.sha.clone(),
-                file: Some(file.rfilename.clone()),
-                blobs,
-                mtp_file: mtp.map(|companion| companion.rfilename.clone()),
-                dflash_file: dflash.map(|companion| companion.rfilename.clone()),
-                projector_file: projector.map(|companion| companion.rfilename.clone()),
-                downloads: detail.repository.downloads,
-                likes: detail.repository.likes,
-                gated: detail.repository.gated,
-            }),
         });
     }
     result
@@ -493,6 +494,20 @@ fn artifacts_with_cache(
 
 fn repository_directory(root: &Path, repository: &Repository) -> Model {
     Model {
+        entry: crate::domain::CatalogEntry::Directory {
+            repository: Some(RemoteModel {
+                repo: repository.id.clone(),
+                revision: repository.sha.clone(),
+                file: None,
+                blobs: Vec::new(),
+                mtp_file: None,
+                dflash_file: None,
+                projector_file: None,
+                downloads: repository.downloads,
+                likes: repository.likes,
+                gated: repository.gated,
+            }),
+        },
         id: format!("hf:{}", repository.id),
         name: repository.id.clone(),
         path: PathBuf::new(),
@@ -510,25 +525,13 @@ fn repository_directory(root: &Path, repository: &Repository) -> Model {
         context_length: None,
         modified: None,
         has_chat_template: false,
-        flm: None,
         runtime: crate::runtime::llama_cpp::NAME.into(),
-        remote: Some(RemoteModel {
-            repo: repository.id.clone(),
-            revision: repository.sha.clone(),
-            file: None,
-            blobs: Vec::new(),
-            mtp_file: None,
-            dflash_file: None,
-            projector_file: None,
-            downloads: repository.downloads,
-            likes: repository.likes,
-            gated: repository.gated,
-        }),
     }
 }
 
 fn directory(path: &[&str]) -> Model {
     Model {
+        entry: crate::domain::CatalogEntry::Directory { repository: None },
         id: String::new(),
         name: path.last().copied().unwrap_or_default().into(),
         path: PathBuf::new(),
@@ -546,9 +549,7 @@ fn directory(path: &[&str]) -> Model {
         context_length: None,
         modified: None,
         has_chat_template: false,
-        flm: None,
         runtime: crate::runtime::llama_cpp::NAME.into(),
-        remote: None,
     }
 }
 
@@ -920,7 +921,7 @@ pub fn deletion(model: &Model, catalog: &[Model]) -> Option<Deletion> {
 }
 
 fn deletion_in(hub: &Path, model: &Model, catalog: &[Model]) -> Option<Deletion> {
-    let remote = model.remote.as_ref()?;
+    let remote = model.remote()?;
     remote.file.as_ref()?; // a repository directory node stores nothing itself
     let repo_dir = hub.join(format!("models--{}", remote.repo.replace('/', "--")));
     if !repo_dir.is_dir() {
@@ -960,7 +961,7 @@ fn deletion_in(hub: &Path, model: &Model, catalog: &[Model]) -> Option<Deletion>
     let siblings: Vec<&RemoteModel> = catalog
         .iter()
         .filter(|other| other.id != model.id)
-        .filter_map(|other| other.remote.as_ref())
+        .filter_map(|other| other.remote())
         .filter(|other| other.repo == remote.repo)
         .filter(|other| other.file.as_ref().is_some_and(|file| snapshot.join(file).exists()))
         .collect();
@@ -1208,17 +1209,12 @@ fn sanitize(raw: &str) -> String {
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value)?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
+    crate::persistence::write_atomic(path, &bytes)
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if fs::read(path).is_ok_and(|current| current == bytes) {
-        return Ok(());
-    }
-    let tmp = path.with_extension("yml.tmp");
-    fs::write(&tmp, bytes).and_then(|_| fs::rename(&tmp, path))
+    crate::persistence::write_if_changed(path, bytes)
 }
 
 #[cfg(unix)]
@@ -1451,7 +1447,7 @@ mod tests {
         let cached = load_cached(&root);
         let repositories = cached
             .iter()
-            .filter_map(|model| model.remote.as_ref().map(|remote| remote.repo.as_str()))
+            .filter_map(|model| model.remote().map(|remote| remote.repo.as_str()))
             .collect::<Vec<_>>();
         assert_eq!(repositories, vec!["owner/selected"]);
         assert_eq!(cached_sort(&root), Sort::Popular);
@@ -1520,7 +1516,7 @@ mod tests {
         assert_eq!(repository.display_label(), "owner/repo");
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].size_bytes, 21);
-        let remote = models[0].remote.as_ref().unwrap();
+        let remote = models[0].remote().unwrap();
         assert_eq!(remote.blobs.len(), 4);
         assert_eq!(remote.mtp_file.as_deref(), Some("mtp-model.gguf"));
         assert_eq!(remote.projector_file.as_deref(), Some("mmproj-BF16.gguf"));
@@ -1579,7 +1575,7 @@ mod tests {
         // projectors are companions.
         assert_eq!(models.len(), 2);
         for model in &models {
-            let remote = model.remote.as_ref().unwrap();
+            let remote = model.remote().unwrap();
             assert_eq!(remote.dflash_file.as_deref(), Some("dflash-kquant.gguf"));
             assert_eq!(remote.projector_file.as_deref(), Some("mmproj-Muse-Glimmer-30B-BF16.gguf"));
             assert!(model.supports_dflash());
@@ -1685,14 +1681,14 @@ mod tests {
         let repositories = fetch(&root, &Request::Repositories(Sort::Trending)).unwrap();
         let repo = repositories
             .iter()
-            .find_map(|model| model.remote.as_ref().map(|remote| remote.repo.clone()))
+            .find_map(|model| model.remote().map(|remote| remote.repo.clone()))
             .expect("trending repository");
         let details = fetch(&root, &Request::Repository(repo.clone())).unwrap();
         assert!(details.iter().any(|model| {
-            model.remote.as_ref().is_some_and(|remote| remote.repo == repo && remote.file.is_some())
+            model.remote().is_some_and(|remote| remote.repo == repo && remote.file.is_some())
         }));
         assert!(details.iter().any(|model| {
-            model.remote.as_ref().is_some_and(|remote| {
+            model.remote().is_some_and(|remote| {
                 remote.repo == repo && remote.file.is_some() && !remote.blobs.is_empty()
             })
         }));
@@ -1703,7 +1699,7 @@ mod tests {
         .unwrap();
         assert!(searched.iter().any(|model| {
             model
-                .remote
+                .remote()
                 .as_ref()
                 .is_some_and(|remote| remote.repo.to_ascii_lowercase().contains("qwen"))
         }));
@@ -1717,7 +1713,7 @@ mod tests {
         )
         .unwrap();
         assert!(author_search.iter().any(|model| {
-            model.remote.as_ref().is_some_and(|remote| {
+            model.remote().is_some_and(|remote| {
                 remote.repo.starts_with("unsloth/")
                     && remote.repo.to_ascii_lowercase().contains("gemma-4")
             })
@@ -1725,10 +1721,8 @@ mod tests {
 
         clear_cached_layout(&root).unwrap();
         let popular = fetch(&root, &Request::Repositories(Sort::Popular)).unwrap();
-        let likes: Vec<u64> = popular
-            .iter()
-            .filter_map(|model| model.remote.as_ref().map(|remote| remote.likes))
-            .collect();
+        let likes: Vec<u64> =
+            popular.iter().filter_map(|model| model.remote().map(|remote| remote.likes)).collect();
         assert!(likes.windows(2).all(|pair| pair[0] >= pair[1]));
         assert_eq!(cached_sort(&root), Sort::Popular);
 
@@ -1736,7 +1730,7 @@ mod tests {
         let downloaded = fetch(&root, &Request::Repositories(Sort::Downloads)).unwrap();
         let downloads: Vec<u64> = downloaded
             .iter()
-            .filter_map(|model| model.remote.as_ref().map(|remote| remote.downloads))
+            .filter_map(|model| model.remote().map(|remote| remote.downloads))
             .collect();
         assert!(downloads.windows(2).all(|pair| pair[0] >= pair[1]));
         assert_eq!(cached_sort(&root), Sort::Downloads);
@@ -1770,6 +1764,27 @@ mod tests {
             .join("snapshots/abc")
             .join(file);
         Model {
+            entry: crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf {
+                remote: Some(RemoteModel {
+                    repo: repo.into(),
+                    revision: Some("abc".into()),
+                    file: Some(file.into()),
+                    blobs: blobs
+                        .iter()
+                        .map(|(name, oid, size)| RemoteBlob {
+                            oid: (*oid).into(),
+                            size_bytes: *size as u64,
+                            file: (*name).into(),
+                        })
+                        .collect(),
+                    mtp_file: None,
+                    dflash_file: None,
+                    projector_file: Some("mmproj.gguf".into()),
+                    downloads: 0,
+                    likes: 0,
+                    gated: false,
+                }),
+            }),
             id: format!("hf:{repo}/{file}"),
             name: file.into(),
             path: snapshot.clone(),
@@ -1787,27 +1802,7 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
-            flm: None,
             runtime: crate::runtime::llama_cpp::NAME.into(),
-            remote: Some(RemoteModel {
-                repo: repo.into(),
-                revision: Some("abc".into()),
-                file: Some(file.into()),
-                blobs: blobs
-                    .iter()
-                    .map(|(name, oid, size)| RemoteBlob {
-                        oid: (*oid).into(),
-                        size_bytes: *size as u64,
-                        file: (*name).into(),
-                    })
-                    .collect(),
-                mtp_file: None,
-                dflash_file: None,
-                projector_file: Some("mmproj.gguf".into()),
-                downloads: 0,
-                likes: 0,
-                gated: false,
-            }),
         }
     }
 
@@ -1964,7 +1959,12 @@ mod tests {
         fs::write(&fresh_blob, vec![0_u8; 99]).unwrap();
 
         let mut model = artifact(&hub, "owner/repo", "model-Q4.gguf", &[on_disk]);
-        let remote = model.remote.as_mut().unwrap();
+        let crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf {
+            remote: Some(remote),
+        }) = &mut model.entry
+        else {
+            panic!("expected a remote GGUF")
+        };
         remote.revision = Some("def".into());
         remote.blobs[0].oid = "cc".repeat(32);
 

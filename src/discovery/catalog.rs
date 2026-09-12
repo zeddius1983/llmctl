@@ -305,6 +305,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(&source, b"GGUF").unwrap();
         let mut models = vec![Model {
+            entry: crate::domain::CatalogEntry::Model(crate::domain::ModelSource::Gguf {
+                remote: None,
+            }),
             id: "local:test".into(),
             name: "Test.gguf".into(),
             path: source.clone(),
@@ -322,9 +325,7 @@ mod tests {
             context_length: None,
             modified: None,
             has_chat_template: false,
-            flm: None,
             runtime: crate::runtime::llama_cpp::NAME.into(),
-            remote: None,
         }];
         let catalog = root.join("catalog");
         reconcile(&catalog, &mut models);

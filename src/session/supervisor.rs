@@ -9,7 +9,7 @@
 use std::fs::File;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 use anyhow::{Context, Result};
 
@@ -27,65 +27,42 @@ pub struct Spawned {
 
 /// Abstract process lifecycle so the UI never spawns directly (ADR-005).
 pub trait SessionSupervisor {
-    fn spawn(&self, spec: &LaunchSpec) -> Result<Spawned>;
+    fn spawn(&mut self, spec: &LaunchSpec) -> Result<Spawned>;
+    /// Reap only children owned by this supervisor, without waiting.
+    fn reap(&mut self) {}
     /// Graceful stop: SIGTERM to the process group.
     fn stop(&self, pid: i32) -> Result<()>;
     /// Forceful stop: SIGKILL to the process group.
     fn kill(&self, pid: i32) -> Result<()>;
 }
 
-/// Spawns detached child processes and rediscovers them on restart.
-pub struct DetachedSupervisor;
+/// Owns detached children until they exit; never changes signal dispositions.
+#[derive(Default)]
+pub struct DetachedSupervisor {
+    children: Vec<Child>,
+}
 
 impl DetachedSupervisor {
     pub fn new() -> Self {
-        // Reap detached children automatically: with SIGCHLD ignored the kernel
-        // does not leave zombies for processes we deliberately don't `wait` on.
-        // SAFETY: setting a signal disposition to SIG_IGN has no preconditions.
-        unsafe {
-            libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+        Self::default()
+    }
+}
+
+impl Drop for DetachedSupervisor {
+    fn drop(&mut self) {
+        // A manager can be dropped while the application stays alive. Transfer
+        // wait ownership without terminating its servers or blocking shutdown.
+        // At process exit the OS reparents any servers still running.
+        for mut child in std::mem::take(&mut self.children) {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
         }
-        Self
     }
-}
-
-/// Run `f` with `SIGCHLD` temporarily restored to its default disposition.
-///
-/// [`DetachedSupervisor::new`] sets `SIGCHLD` to `SIG_IGN` so detached servers
-/// are reaped without llmctl ever waiting on them. The cost is that anything in
-/// the standard library which *does* wait breaks, because `wait()` then fails
-/// with `ECHILD`:
-///
-/// * `Command::output()` reports an error for a process that ran perfectly well
-///   — silently, if the caller treats failure as "no output";
-/// * `Command::spawn()` panics outright (`wait() should either return Ok or
-///   panic`) when exec fails, since it reaps the failed child to read its errno.
-///
-/// The previous disposition is restored rather than assumed, and restoring
-/// `SIG_IGN` also reaps anything that exited during the call, so the window
-/// leaves no zombie behind.
-fn with_default_sigchld<T>(f: impl FnOnce() -> T) -> T {
-    // SAFETY: setting a signal disposition is async-signal-safe and has no
-    // preconditions. llmctl spawns processes only from the main thread, so
-    // there is no window where another thread relies on the disposition.
-    let previous = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
-    let result = f();
-    if previous != libc::SIG_ERR {
-        unsafe { libc::signal(libc::SIGCHLD, previous) };
-    }
-    result
-}
-
-/// Run `command` to completion and capture its output, whatever `SIGCHLD`
-/// disposition is currently installed. Any code that reads a subprocess's
-/// output *after* the session manager exists must go through here — see
-/// [`with_default_sigchld`] for why.
-pub fn output(command: &mut std::process::Command) -> std::io::Result<std::process::Output> {
-    with_default_sigchld(|| command.output())
 }
 
 impl SessionSupervisor for DetachedSupervisor {
-    fn spawn(&self, spec: &LaunchSpec) -> Result<Spawned> {
+    fn spawn(&mut self, spec: &LaunchSpec) -> Result<Spawned> {
         let (program, args) = spec.argv.split_first().context("empty command")?;
 
         if let Some(parent) = spec.log_file.parent() {
@@ -113,13 +90,21 @@ impl SessionSupervisor for DetachedSupervisor {
             });
         }
 
-        // Not a bare `cmd.spawn()`: an exec failure (a binary that has since been
-        // moved or uninstalled) makes std reap the failed child to read its
-        // errno, which panics under our `SIG_IGN` disposition instead of
-        // returning the error the caller is ready to report.
-        let child = with_default_sigchld(|| cmd.spawn())
-            .with_context(|| format!("spawning {}", program))?;
-        Ok(Spawned { pid: child.id() as i32 })
+        self.reap();
+        let child = cmd.spawn().with_context(|| format!("spawning {}", program))?;
+        let pid = child.id() as i32;
+        self.children.push(child);
+        Ok(Spawned { pid })
+    }
+
+    fn reap(&mut self) {
+        self.children.retain_mut(|child| match child.try_wait() {
+            Ok(Some(_)) => false,
+            Ok(None) => true,
+            // ECHILD means this handle can no longer be waited on. Other
+            // transient errors are retried on the next tick.
+            Err(error) => error.raw_os_error() != Some(libc::ECHILD),
+        });
     }
 
     fn stop(&self, pid: i32) -> Result<()> {
@@ -185,18 +170,74 @@ mod tests {
         assert_eq!(base64(b"hello"), "aGVsbG8=");
     }
 
-    /// End-to-end check of the real spawn → liveness → signal path. Ignored by
-    /// default (spawns a process and sets a process-wide SIGCHLD disposition);
-    /// run manually with `cargo test -- --ignored`.
+    fn test_log(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("llmctl-{name}-{}.log", std::process::id()))
+    }
+
     #[test]
-    #[ignore = "spawns a real process; run with --ignored"]
+    fn output_capture_and_failed_exec_work_while_a_supervisor_exists() {
+        let log_file = test_log("child-capture");
+        let mut sup = DetachedSupervisor::new();
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..8 {
+                        let output =
+                            Command::new("sh").args(["-c", "printf captured"]).output().unwrap();
+                        assert!(output.status.success());
+                        assert_eq!(output.stdout, b"captured");
+                    }
+                })
+            })
+            .collect();
+        for _ in 0..8 {
+            assert!(
+                sup.spawn(&LaunchSpec {
+                    argv: vec!["/nonexistent/llmctl-missing-server".into()],
+                    log_file: log_file.clone(),
+                })
+                .is_err()
+            );
+            sup.reap();
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(sup.children.is_empty());
+        std::fs::remove_file(log_file).unwrap();
+    }
+
+    #[test]
+    fn dropping_a_supervisor_leaves_its_server_alive_and_eventually_reaps_it() {
+        let log_file = test_log("child-drop");
+        let mut sup = DetachedSupervisor::new();
+        let spawned = sup
+            .spawn(&LaunchSpec {
+                argv: vec!["sleep".into(), "30".into()],
+                log_file: log_file.clone(),
+            })
+            .unwrap();
+        drop(sup);
+        assert!(crate::session::proc::is_alive(spawned.pid));
+        signal_session(spawned.pid, libc::SIGKILL).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let proc_path = PathBuf::from(format!("/proc/{}", spawned.pid));
+        while proc_path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!proc_path.exists(), "background owner must reap the exited server");
+        std::fs::remove_file(log_file).unwrap();
+    }
+
+    /// End-to-end check of the real spawn → liveness → signal path.
+    #[test]
     fn detached_process_is_alive_then_dies_on_kill() {
         use crate::session::proc;
         use std::time::Duration;
 
         let dir = std::env::temp_dir().join("llmctl-supervisor-test");
         std::fs::create_dir_all(&dir).unwrap();
-        let sup = DetachedSupervisor::new();
+        let mut sup = DetachedSupervisor::new();
         let spec =
             LaunchSpec { argv: vec!["sleep".into(), "30".into()], log_file: dir.join("s.log") };
 
@@ -208,12 +249,15 @@ mod tests {
         sup.kill(spawned.pid).expect("kill group");
         let mut dead = false;
         for _ in 0..40 {
-            if !proc::is_alive(spawned.pid) {
+            sup.reap();
+            if !Path::new(&format!("/proc/{}", spawned.pid)).exists() {
                 dead = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(dead, "process should be gone after SIGKILL");
+        assert!(dead, "process must be reaped after SIGKILL");
+        assert!(sup.children.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

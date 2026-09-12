@@ -315,11 +315,17 @@ pub struct SessionManager {
     log_dir: PathBuf,
     supervisor: Box<dyn SessionSupervisor>,
     pub sessions: Vec<Session>,
+    persistence_errors: Vec<String>,
+    health_checks: health::HealthChecks,
 }
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 impl SessionManager {
+    pub fn take_persistence_errors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.persistence_errors)
+    }
+
     /// Construct the manager, then rediscover sessions left running by a
     /// previous llmctl run (pruning any that are no longer alive).
     pub fn new(dir: PathBuf, log_dir: PathBuf) -> Self {
@@ -328,24 +334,19 @@ impl SessionManager {
             log_dir,
             supervisor: Box::new(DetachedSupervisor::new()),
             sessions: Vec::new(),
+            persistence_errors: Vec::new(),
+            health_checks: health::HealthChecks::default(),
         };
         mgr.rediscover();
         mgr
     }
 
     /// A manager whose supervisor never spawns, for tests about bookkeeping.
-    ///
-    /// Constructing a [`DetachedSupervisor`] sets `SIGCHLD` to `SIG_IGN` for the
-    /// whole process, so any test that merely wants a `SessionManager` struct
-    /// breaks child reaping for whatever else `cargo test` is running in
-    /// parallel at that moment — `Command::output` fails, `Command::spawn`
-    /// panics. Tests that do need real processes are `#[ignore]`d and run
-    /// single-threaded; these take a supervisor that touches no signals.
     #[cfg(test)]
-    fn without_supervisor(dir: PathBuf, log_dir: PathBuf) -> Self {
+    pub(crate) fn without_supervisor(dir: PathBuf, log_dir: PathBuf) -> Self {
         struct NeverSpawns;
         impl SessionSupervisor for NeverSpawns {
-            fn spawn(&self, _spec: &LaunchSpec) -> Result<supervisor::Spawned> {
+            fn spawn(&mut self, _spec: &LaunchSpec) -> Result<supervisor::Spawned> {
                 Err(anyhow!("this test's supervisor does not spawn"))
             }
             fn stop(&self, _pid: i32) -> Result<()> {
@@ -355,8 +356,14 @@ impl SessionManager {
                 Ok(())
             }
         }
-        let mut mgr =
-            Self { dir, log_dir, supervisor: Box::new(NeverSpawns), sessions: Vec::new() };
+        let mut mgr = Self {
+            dir,
+            log_dir,
+            supervisor: Box::new(NeverSpawns),
+            sessions: Vec::new(),
+            persistence_errors: Vec::new(),
+            health_checks: health::HealthChecks::default(),
+        };
         mgr.rediscover();
         mgr
     }
@@ -369,11 +376,12 @@ impl SessionManager {
             let alive =
                 proc::is_alive(record.pid) && proc::cmdline_matches(record.pid, &record.model_path);
             if alive {
-                let status = match health::probe(&record.host, record.port, &record.health_path) {
-                    Health::Ready => SessionStatus::Running,
-                    _ if download_percent(&record).is_some() => SessionStatus::Downloading,
-                    _ => SessionStatus::Starting,
+                let status = if download_percent(&record).is_some() {
+                    SessionStatus::Downloading
+                } else {
+                    SessionStatus::Starting
                 };
+                self.health_checks.request(probe_key(&record));
                 self.sessions.push(Session::new(record, status));
             } else {
                 record.delete(&self.dir);
@@ -415,7 +423,12 @@ impl SessionManager {
             download: req.download,
             started_unix: now_unix(),
         };
-        record.save(&self.dir);
+        if let Err(error) = record.save(&self.dir) {
+            self.persistence_errors.push(format!(
+                "{} (PID {}) is tracked in memory but its session record was not saved: {error}",
+                record.name, record.pid
+            ));
+        }
         let status = if download_percent(&record).is_some() {
             SessionStatus::Downloading
         } else {
@@ -528,7 +541,12 @@ impl SessionManager {
             if real != pid {
                 let s = &mut self.sessions[idx];
                 s.record.pid = real;
-                s.record.save(&self.dir);
+                if let Err(error) = s.record.save(&self.dir) {
+                    self.persistence_errors.push(format!(
+                        "Could not save PID {} for {}: {error}",
+                        s.record.pid, s.record.name
+                    ));
+                }
             }
             return Some(real);
         }
@@ -537,9 +555,27 @@ impl SessionManager {
         (proc::is_alive(pid) && proc::cmdline_matches(pid, &model_path)).then_some(pid)
     }
 
+    pub fn poll_health(&mut self) {
+        self.supervisor.reap();
+        for (key, health) in self.health_checks.poll() {
+            if health != Health::Ready {
+                continue;
+            }
+            if let Some(session) = self.sessions.iter_mut().find(|session| {
+                probe_key(&session.record) == key
+                    && !session.status.is_terminal()
+                    && session.restart_pending.is_none()
+            }) {
+                session.status = SessionStatus::Running;
+                session.download_percent = None;
+            }
+        }
+    }
+
     /// Refresh live status and resource usage for every session. Cheap enough
     /// to call on the periodic UI tick.
     pub fn refresh(&mut self) {
+        self.poll_health();
         for idx in 0..self.sessions.len() {
             // A restart in flight owns this session until its replacement is up:
             // the old pid is on its way out and the new one does not exist yet,
@@ -564,12 +600,9 @@ impl SessionManager {
                 continue;
             };
 
-            let host = self.sessions[idx].record.host.clone();
-            let port = self.sessions[idx].record.port;
             let prev = self.sessions[idx].last_cpu;
             let was_running = self.sessions[idx].status == SessionStatus::Running;
             let progress = download_percent(&self.sessions[idx].record);
-            let health_path = self.sessions[idx].record.health_path.clone();
 
             let rss = proc::rss_bytes(pid);
             let sample = proc::cpu_sample(pid);
@@ -584,8 +617,10 @@ impl SessionManager {
             // does cost something: servers that log each connection (FastFlowLM
             // logs four lines per request) fill their own log with llmctl's
             // health checks. Probe only while readiness is still in question.
-            let health =
-                if was_running { Health::Ready } else { health::probe(&host, port, &health_path) };
+            if !was_running {
+                self.health_checks.request(probe_key(&self.sessions[idx].record));
+            }
+            let health = if was_running { Health::Ready } else { Health::Loading };
 
             let s = &mut self.sessions[idx];
             s.rss_bytes = rss;
@@ -678,6 +713,7 @@ impl SessionManager {
     /// A session that stays `Restarting` is one whose old process will not die;
     /// that is reported by showing it, not by inventing an outcome.
     pub fn poll_restarts(&mut self) -> Vec<String> {
+        self.supervisor.reap();
         let mut errors = Vec::new();
         for idx in 0..self.sessions.len() {
             let Some((old_pid, kill_at, escalated)) = self.sessions[idx]
@@ -731,14 +767,20 @@ impl SessionManager {
         let spawned = self.supervisor.spawn(&spec)?;
 
         let session = &mut self.sessions[idx];
-        session.record.delete(&self.dir); // remove the old id's file
+        let old_record = session.record.clone();
         session.record.id = id;
         session.record.pid = spawned.pid;
         session.record.port = port;
         session.record.command = command;
         session.record.log_file = log_file;
         session.record.started_unix = now_unix();
-        session.record.save(&self.dir);
+        match session.record.save(&self.dir) {
+            Ok(()) => old_record.delete(&self.dir),
+            Err(error) => self.persistence_errors.push(format!(
+                "{} restarted (PID {}) but its session record was not saved: {error}",
+                session.record.name, session.record.pid
+            )),
+        }
         session.download_percent = download_percent(&session.record);
         session.status = if session.download_percent.is_some() {
             SessionStatus::Downloading
@@ -794,6 +836,16 @@ impl SessionManager {
     }
 }
 
+fn probe_key(record: &SessionRecord) -> health::ProbeKey {
+    health::ProbeKey {
+        session: record.id.clone(),
+        pid: record.pid,
+        host: record.host.clone(),
+        port: record.port,
+        path: record.health_path.clone(),
+    }
+}
+
 /// Seconds since the Unix epoch.
 fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -830,10 +882,10 @@ fn slug(s: &str) -> String {
 
 /// Replace the value following `--port` in an argv (used on restart).
 fn set_port_arg(argv: &mut [String], port: u16) {
-    if let Some(i) = argv.iter().position(|a| a == "--port") {
-        if let Some(v) = argv.get_mut(i + 1) {
-            *v = port.to_string();
-        }
+    if let Some(i) = argv.iter().position(|a| a == "--port")
+        && let Some(v) = argv.get_mut(i + 1)
+    {
+        *v = port.to_string();
     }
 }
 
@@ -853,8 +905,47 @@ pub fn format_uptime(secs: u64) -> String {
 mod tests {
     use super::*;
 
-    /// The pane beside the session list reads this buffer, so what goes in is
-    /// what a terminal would have shown — and only the tail of it.
+    #[test]
+    fn a_failed_record_write_keeps_the_launched_session_manageable() {
+        struct FakeSpawner;
+        impl SessionSupervisor for FakeSpawner {
+            fn spawn(&mut self, _: &LaunchSpec) -> Result<supervisor::Spawned> {
+                Ok(supervisor::Spawned { pid: i32::MAX })
+            }
+            fn stop(&self, _: i32) -> Result<()> {
+                Ok(())
+            }
+            fn kill(&self, _: i32) -> Result<()> {
+                Ok(())
+            }
+        }
+        let root =
+            std::env::temp_dir().join(format!("llmctl-record-failure-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut manager = SessionManager::without_supervisor(root.join("missing"), root.clone());
+        manager.supervisor = Box::new(FakeSpawner);
+        let index = manager
+            .launch(LaunchRequest {
+                runtime: "llama.cpp".into(),
+                model: "model".into(),
+                model_path: "model".into(),
+                command: Command { argv: vec!["fake".into(), "--port".into(), "18934".into()] },
+                health_path: "/health".into(),
+                download: None,
+                profile: "Default".into(),
+                size_bytes: None,
+                device: None,
+                host: "127.0.0.1".into(),
+                port: 18934,
+            })
+            .unwrap();
+        assert_eq!(manager.sessions[index].record.pid, i32::MAX);
+        assert_eq!(manager.sessions[index].status, SessionStatus::Starting);
+        assert_eq!(manager.take_persistence_errors().len(), 1);
+        assert!(manager.take_persistence_errors().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn the_log_tail_keeps_the_last_lines_as_a_terminal_would_show_them() {
         let mut recent = VecDeque::new();
@@ -1005,22 +1096,19 @@ mod tests {
         assert_eq!(session_status_label(SessionStatus::Starting, None), "Starting");
     }
 
-    fn opt(key: &str, value: &str, cli: &str) -> crate::domain::OptionItem {
+    fn opt(key: &str, value: &str) -> crate::domain::OptionItem {
         crate::domain::OptionItem {
-            key: key.into(),
+            spec: crate::runtime::llama_cpp::SCHEMA.spec(key).unwrap(),
             value: value.into(),
             default: String::new(),
             range: None,
-            cli: cli.into(),
-            description: String::new(),
         }
     }
 
     /// Full pipeline against a real HTTP server that answers `/health` with 200:
     /// launch → Starting/Running → rediscover (new manager) → stop → Stopped →
-    /// remove. Ignored by default (spawns processes); run with `--ignored`.
+    /// remove. Uses a local Python HTTP server.
     #[test]
-    #[ignore = "spawns real processes; run with --ignored"]
     fn launch_lifecycle_with_fake_server() {
         use std::thread::sleep;
         use std::time::Duration;
@@ -1053,14 +1141,13 @@ mod tests {
         std::fs::set_permissions(&server, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
 
-        let command = Command::build_local(
-            &server.display().to_string(),
-            "/models/fake.gguf",
-            None,
-            None,
-            &crate::runtime::llama_cpp::SCHEMA,
-            &[opt("host", "127.0.0.1", "--host"), opt("port", "18900", "--port")],
-        );
+        let command = crate::runtime::llama_cpp::command::LocalCommand {
+            binary: &server.display().to_string(),
+            model_path: "/models/fake.gguf",
+            draft_path: None,
+            projector_path: None,
+        }
+        .build(&[opt("host", "127.0.0.1"), opt("port", "18900")]);
         let req = LaunchRequest {
             runtime: "llama.cpp".into(),
             model: "fake.gguf".into(),
@@ -1132,7 +1219,6 @@ mod tests {
     /// alive: on the AMD NPU the second process loses the race for the hardware
     /// context, and on any runtime it can be pushed off its own port.
     #[test]
-    #[ignore = "spawns real processes; run with --ignored --test-threads=1"]
     fn restart_waits_for_the_old_process_before_respawning() {
         use std::thread::sleep;
         use std::time::Duration;
@@ -1195,7 +1281,6 @@ mod tests {
 
     /// With nothing left alive to wait for, the first poll respawns immediately.
     #[test]
-    #[ignore = "spawns real processes; run with --ignored --test-threads=1"]
     fn restarting_a_dead_session_respawns_on_the_first_poll() {
         use std::thread::sleep;
         use std::time::Duration;
@@ -1249,8 +1334,7 @@ mod tests {
     /// A replacement that cannot be spawned at all reports the failure instead
     /// of leaving the session stuck in `Restarting`. The refusal comes from the
     /// supervisor here rather than from a real failed exec — that path is
-    /// covered by the `#[ignore]`d restart tests, which get a process to
-    /// themselves.
+    /// covered by the supervisor tests.
     #[test]
     fn a_replacement_that_cannot_spawn_is_reported() {
         let base = std::env::temp_dir().join(format!("llmctl-restart-bad-{}", std::process::id()));

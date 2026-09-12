@@ -27,7 +27,6 @@ use crate::profiles::templates::Template;
 use crate::runtime::{CatalogCtx, Deletion, LaunchContext, RuntimeBackend, tree_bytes};
 use crate::session::command::Command;
 use crate::session::record::{DownloadBlob, DownloadRecord};
-use crate::session::supervisor;
 use crate::session::throughput::{Phase, Sample};
 
 pub const NAME: &str = "FastFlowLM";
@@ -308,6 +307,37 @@ impl FlmBackend {
 }
 
 impl RuntimeBackend for FlmBackend {
+    fn id(&self) -> super::RuntimeId {
+        super::RuntimeId(NAME.into())
+    }
+
+    fn download_available(&self, model: &Model) -> bool {
+        model.flm().is_some_and(|flm| !flm.installed)
+    }
+
+    fn model_transfer(&self, model: &Model) -> Option<super::ModelTransfer> {
+        if model.flm()?.installed {
+            return None;
+        }
+        Some(super::ModelTransfer {
+            runtime: self.id(),
+            model: Box::new(model.clone()),
+            targets: model_dir(model).into_iter().collect(),
+            run: |model, cancelled, progress| {
+                download(model, cancelled, progress)
+                    .map(|outcome| match outcome {
+                        DownloadOutcome::Downloaded(path) => {
+                            crate::discovery::online::DownloadResult::Downloaded(path)
+                        }
+                        DownloadOutcome::Cancelled => {
+                            crate::discovery::online::DownloadResult::Cancelled
+                        }
+                    })
+                    .map_err(anyhow::Error::msg)
+            },
+        })
+    }
+
     fn descriptor(&self) -> &Runtime {
         &self.runtime
     }
@@ -358,9 +388,9 @@ impl RuntimeBackend for FlmBackend {
         // A directory is named after the repository, not the tag. Two installed
         // tags resolving to one directory would make this a shared deletion;
         // the catalog has no such pair today, but do not find out the hard way.
-        let tag = model.flm.as_ref().map(|flm| flm.tag.as_str());
+        let tag = model.flm().map(|flm| flm.tag.as_str());
         if catalog.iter().any(|other| {
-            other.flm.as_ref().is_some_and(|flm| flm.installed && Some(flm.tag.as_str()) != tag)
+            other.flm().is_some_and(|flm| flm.installed && Some(flm.tag.as_str()) != tag)
                 && model_dir(other).as_ref() == Some(&dir)
         }) {
             return None;
@@ -371,7 +401,9 @@ impl RuntimeBackend for FlmBackend {
     /// `ctx-len` is bounded by the model's trained context.
     fn effective_kind(&self, spec: &OptionSpec, model: &Model) -> OptionKind {
         match (spec.key, model.context_length) {
-            ("ctx-len", Some(ctx)) => OptionKind::Int { min: Some(0), max: Some(ctx as i64) },
+            ("ctx-len", Some(ctx)) => {
+                OptionKind::Int { min: Some(0), max: Some(i64::try_from(ctx).unwrap_or(i64::MAX)) }
+            }
             _ => spec.kind,
         }
     }
@@ -385,7 +417,7 @@ impl RuntimeBackend for FlmBackend {
                 Some(ctx) => ctx.to_string(),
                 None => spec.default.to_string(),
             },
-            "prefill-chunk-len" => match model.flm.as_ref().and_then(|f| f.max_prefill_len) {
+            "prefill-chunk-len" => match model.flm().and_then(|f| f.max_prefill_len) {
                 Some(len) => len.to_string(),
                 None => crate::profiles::registry::DEFAULT.to_string(),
             },
@@ -404,7 +436,7 @@ impl RuntimeBackend for FlmBackend {
             return value;
         }
         match (model.context_length, value.parse::<i64>()) {
-            (Some(ctx), Ok(v)) if v > ctx as i64 => ctx.to_string(),
+            (Some(ctx), Ok(v)) if v > i64::try_from(ctx).unwrap_or(i64::MAX) => ctx.to_string(),
             _ => value,
         }
     }
@@ -415,7 +447,7 @@ impl RuntimeBackend for FlmBackend {
     /// and it keeps the detached session's log readable.
     fn build_command(&self, ctx: &LaunchContext) -> Command {
         let mut argv =
-            vec![ctx.binary.to_string(), "serve".into(), tag(ctx.model), "--quiet".into()];
+            vec![ctx.binary.to_string(), "serve".into(), tag(ctx.model()), "--quiet".into()];
         Command::append_options(&mut argv, &SCHEMA, ctx.options);
         Command { argv }
     }
@@ -423,11 +455,11 @@ impl RuntimeBackend for FlmBackend {
     /// `flm run <tag>` is FastFlowLM's interactive mode. Server-only options
     /// (the endpoint, the queue, CORS) are meaningless there.
     fn chat_argv(&self, ctx: &LaunchContext) -> Option<Vec<String>> {
-        let mut argv = vec![ctx.binary.to_string(), "run".into(), tag(ctx.model)];
+        let mut argv = vec![ctx.binary.to_string(), "run".into(), tag(ctx.model())];
         let options: Vec<OptionItem> = ctx
             .options
             .iter()
-            .filter(|o| !matches!(o.key.as_str(), "host" | "port" | "q-len" | "socket" | "cors"))
+            .filter(|o| !matches!(o.spec.key, "host" | "port" | "q-len" | "socket" | "cors"))
             .cloned()
             .collect();
         Command::append_options(&mut argv, &SCHEMA, &options);
@@ -443,9 +475,9 @@ impl RuntimeBackend for FlmBackend {
     /// server options are meaningless; and `asr`/`embed`/`img-pre-resize` only
     /// load extra models that the benchmark does not exercise.
     fn bench_argv(&self, ctx: &LaunchContext) -> Option<Vec<String>> {
-        let mut argv = vec![ctx.binary.to_string(), "bench".into(), tag(ctx.model)];
+        let mut argv = vec![ctx.binary.to_string(), "bench".into(), tag(ctx.model())];
         let options: Vec<OptionItem> =
-            ctx.options.iter().filter(|o| o.key == "pmode").cloned().collect();
+            ctx.options.iter().filter(|o| o.spec.key == "pmode").cloned().collect();
         Command::append_options(&mut argv, &SCHEMA, &options);
         Some(argv)
     }
@@ -458,7 +490,7 @@ impl RuntimeBackend for FlmBackend {
 
     /// The tag, which is what appears in `flm serve <tag>`.
     fn process_token(&self, ctx: &LaunchContext) -> String {
-        tag(ctx.model)
+        tag(ctx.model())
     }
 
     /// Launching a model that isn't downloaded lets `flm serve` fetch it
@@ -473,11 +505,11 @@ impl RuntimeBackend for FlmBackend {
     /// The `Downloading` state ends when the health probe reports ready, so the
     /// sentinel never strands a session.
     fn launch_download(&self, ctx: &LaunchContext) -> Option<DownloadRecord> {
-        let flm = ctx.model.flm.as_ref()?;
+        let flm = ctx.model().flm()?;
         if flm.installed {
             return None;
         }
-        let blobs = expected_files(ctx.model)?
+        let blobs = expected_files(ctx.model())?
             .into_iter()
             .map(|(path, expected_bytes)| DownloadBlob {
                 complete_file: path.with_extension("llmctl-never-complete"),
@@ -511,7 +543,7 @@ impl RuntimeBackend for FlmBackend {
 /// The tag to serve. Falls back to the display name so a malformed catalog
 /// entry still produces a runnable-looking command rather than an empty one.
 fn tag(model: &Model) -> String {
-    model.flm.as_ref().map(|f| f.tag.clone()).unwrap_or_else(|| model.name.clone())
+    model.flm().map(|f| f.tag.clone()).unwrap_or_else(|| model.name.clone())
 }
 
 /// Where `flm` keeps a model's files. `flm` names the directory after the
@@ -523,7 +555,7 @@ pub fn model_dir(model: &Model) -> Option<PathBuf> {
 /// [`model_dir`] against a given root, so the guards below can be tested
 /// without an environment variable the rest of the suite also reads.
 fn model_dir_in(root: &Path, model: &Model) -> Option<PathBuf> {
-    let flm = model.flm.as_ref()?;
+    let flm = model.flm()?;
     let name = repo_dir_name(&flm.repo)?;
     // Only an absolute root locates storage. An empty one — `FLM_MODEL_PATH`
     // set to nothing, or no home directory to resolve — makes the join below a
@@ -572,13 +604,8 @@ fn strip_preamble(output: &str) -> &str {
 }
 
 /// Run `flm <args…>` and return stdout with the banner stripped.
-///
-/// Goes through [`supervisor::output`] because the catalog is re-read while
-/// llmctl is running — after the session supervisor has set `SIGCHLD` to
-/// `SIG_IGN`, which would otherwise make every one of these calls fail to reap
-/// and come back empty.
 fn run(binary: &Path, args: &[&str]) -> Option<String> {
-    let output = supervisor::output(ProcCommand::new(binary).args(args)).ok()?;
+    let output = ProcCommand::new(binary).args(args).output().ok()?;
     if !output.status.success() {
         debug!(?args, status = ?output.status, "flm invocation failed");
         return None;
@@ -759,6 +786,19 @@ impl Entry {
         let mut catalog_path = group.to_vec();
         catalog_path.push(self.name.clone());
         Model {
+            entry: crate::domain::CatalogEntry::Model(crate::domain::ModelSource::FastFlowLm(
+                FlmModel {
+                    tag: self.name.clone(),
+                    installed: self.installed,
+                    repo,
+                    revision: self.revision(),
+                    files: self.files.clone(),
+                    labels: self.label.clone(),
+                    vlm: self.vlm,
+                    asr: self.asr,
+                    max_prefill_len: self.max_prefill_len,
+                },
+            )),
             id: format!("flm:{}", self.name),
             name: self.name.clone(),
             // Only an installed model has a local path; a catalog entry that
@@ -781,18 +821,6 @@ impl Entry {
             context_length: self.default_context_length,
             modified: None,
             has_chat_template: true,
-            remote: None,
-            flm: Some(FlmModel {
-                tag: self.name.clone(),
-                installed: self.installed,
-                repo,
-                revision: self.revision(),
-                files: self.files.clone(),
-                labels: self.label.clone(),
-                vlm: self.vlm,
-                asr: self.asr,
-                max_prefill_len: self.max_prefill_len,
-            }),
             runtime: NAME.to_string(),
         }
     }
@@ -867,7 +895,7 @@ pub fn download(
     cancelled: &AtomicBool,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<DownloadOutcome, String> {
-    let flm = model.flm.as_ref().ok_or("not a FastFlowLM model")?;
+    let flm = model.flm().ok_or("not a FastFlowLM model")?;
     let dir = model_dir(model).ok_or("could not resolve the FastFlowLM model directory")?;
 
     let sizes = file_sizes(&flm.repo, &flm.revision, &flm.files)?;
@@ -947,7 +975,7 @@ fn file_sizes(repo: &str, revision: &str, files: &[String]) -> Result<Vec<(Strin
 /// The expected files and their sizes, for tracking a download llmctl does not
 /// perform itself (see [`FlmBackend::launch_download`]).
 pub fn expected_files(model: &Model) -> Option<Vec<(PathBuf, u64)>> {
-    let flm = model.flm.as_ref()?;
+    let flm = model.flm()?;
     let dir = model_dir(model)?;
     let sizes = file_sizes(&flm.repo, &flm.revision, &flm.files).ok()?;
     Some(sizes.into_iter().map(|(file, size)| (dir.join(file), size)).collect())
@@ -1062,7 +1090,7 @@ mod tests {
 
         // ...but the two arrangements still describe the same set of models.
         let tags = |models: &[Model]| -> std::collections::BTreeSet<String> {
-            models.iter().filter_map(|m| m.flm.as_ref()).map(|f| f.tag.clone()).collect()
+            models.iter().filter_map(|m| m.flm()).map(|f| f.tag.clone()).collect()
         };
         assert_eq!(tags(&categories), tags(&flat), "an arrangement lost models");
 
@@ -1279,16 +1307,49 @@ mod tests {
         assert_eq!(SCHEMA.omit_token("host"), None);
         assert_eq!(SCHEMA.omit_token("port"), None);
         assert_eq!(SCHEMA.omit_token("pmode"), Some(crate::profiles::registry::DEFAULT));
+        assert!(SCHEMA.uses_sentinel("pmode"));
     }
 
-    fn opt(key: &str, value: &str, cli: &str) -> OptionItem {
+    #[test]
+    fn all_resolved_defaults_pass_launch_validation() {
+        let backend = FlmBackend {
+            runtime: Runtime {
+                name: NAME.into(),
+                description: String::new(),
+                version: None,
+                binary_path: None,
+                bench_path: None,
+                formats: vec![],
+                devices: vec![],
+            },
+            npu_ready: true,
+            npu_problem: None,
+            catalog_cache: Mutex::new(None),
+        };
+        let model =
+            entries()[0].to_model(&local("reasoning"), Path::new("/models"), Path::new("/cfg"));
+        let defaults = Defaults::default();
+        let options = SPECS
+            .iter()
+            .map(|spec| {
+                let value = backend.spec_default(spec, &model, &defaults);
+                OptionItem { spec, default: value.clone(), value, range: None }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            options.iter().find(|option| option.spec.key == "pmode").unwrap().value,
+            crate::profiles::registry::DEFAULT
+        );
+        crate::profiles::validate_options(&backend, &model, &options).unwrap();
+    }
+
+    fn opt(key: &str, value: &str) -> OptionItem {
         OptionItem {
-            key: key.into(),
+            spec: SCHEMA.spec(key).unwrap(),
             value: value.into(),
             default: String::new(),
             range: None,
-            cli: cli.into(),
-            description: String::new(),
         }
     }
 
@@ -1311,12 +1372,13 @@ mod tests {
         let model =
             entries()[0].to_model(&local("reasoning"), Path::new("/models"), Path::new("/cfg"));
         let options = vec![
-            opt("ctx-len", "8192", "--ctx-len"),
-            opt("pmode", crate::profiles::registry::DEFAULT, "--pmode"),
-            opt("host", "127.0.0.1", "--host"),
-            opt("port", "52625", "--port"),
+            opt("ctx-len", "8192"),
+            opt("pmode", crate::profiles::registry::DEFAULT),
+            opt("host", "127.0.0.1"),
+            opt("port", "52625"),
         ];
-        let ctx = LaunchContext { binary: "flm", model: &model, options: &options };
+        let ctx =
+            LaunchContext::new("flm", &model, &options).expect("selected model is launchable");
         let argv = backend.build_command(&ctx).argv;
 
         assert_eq!(argv[..4], ["flm", "serve", "qwen3:4b", "--quiet"]);
@@ -1347,12 +1409,9 @@ mod tests {
         };
         let model =
             entries()[0].to_model(&local("reasoning"), Path::new("/models"), Path::new("/cfg"));
-        let options = vec![
-            opt("ctx-len", "8192", "--ctx-len"),
-            opt("host", "127.0.0.1", "--host"),
-            opt("port", "52625", "--port"),
-        ];
-        let ctx = LaunchContext { binary: "flm", model: &model, options: &options };
+        let options = vec![opt("ctx-len", "8192"), opt("host", "127.0.0.1"), opt("port", "52625")];
+        let ctx =
+            LaunchContext::new("flm", &model, &options).expect("selected model is launchable");
         let argv = backend.chat_argv(&ctx).unwrap();
 
         assert_eq!(argv[..3], ["flm", "run", "qwen3:4b"]);
@@ -1378,12 +1437,9 @@ mod tests {
         };
         let model =
             entries()[0].to_model(&local("reasoning"), Path::new("/models"), Path::new("/cfg"));
-        let options = vec![
-            opt("pmode", "turbo", "--pmode"),
-            opt("ctx-len", "8192", "--ctx-len"),
-            opt("port", "52625", "--port"),
-        ];
-        let ctx = LaunchContext { binary: "flm", model: &model, options: &options };
+        let options = vec![opt("pmode", "turbo"), opt("ctx-len", "8192"), opt("port", "52625")];
+        let ctx =
+            LaunchContext::new("flm", &model, &options).expect("selected model is launchable");
         let argv = backend.bench_argv(&ctx).unwrap();
 
         assert_eq!(argv, ["flm", "bench", "qwen3:4b", "--pmode", "turbo"]);
@@ -1416,12 +1472,7 @@ mod tests {
     /// wait for `/v1/models` to answer, confirm llmctl tracked the *server*
     /// process rather than any launcher wrapper in front of it, then stop it and
     /// confirm the process is really gone.
-    ///
-    /// Must run single-threaded: constructing a `SessionManager` sets `SIGCHLD`
-    /// to `SIG_IGN` process-wide (see `DetachedSupervisor::new`), which makes
-    /// any concurrent `Command::output()` — and therefore any concurrent
-    /// discovery — fail to reap its child. `App::new` respects the same ordering
-    /// by discovering runtimes before it builds the manager.
+    /// Run single-threaded because the NPU admits only one client.
     #[test]
     #[ignore = "launches a real NPU server; run with --ignored --test-threads=1"]
     fn launch_lifecycle_on_the_npu() {
@@ -1443,13 +1494,11 @@ mod tests {
         let model = entry.to_model(&local("chat"), &model_root(), Path::new("/tmp"));
 
         let port = 52999;
-        let options = vec![
-            opt("host", "127.0.0.1", "--host"),
-            opt("port", &port.to_string(), "--port"),
-            opt("ctx-len", "2048", "--ctx-len"),
-        ];
+        let options =
+            vec![opt("host", "127.0.0.1"), opt("port", &port.to_string()), opt("ctx-len", "2048")];
         let binary = binary.display().to_string();
-        let ctx = LaunchContext { binary: &binary, model: &model, options: &options };
+        let ctx =
+            LaunchContext::new(&binary, &model, &options).expect("selected model is launchable");
 
         let base = std::env::temp_dir().join(format!("llmctl-flm-{}", std::process::id()));
         let sessions_dir = base.join("sessions");
@@ -1490,7 +1539,7 @@ mod tests {
         let pid = mgr.sessions[idx].record.pid;
         assert_eq!(crate::session::proc::comm(pid).as_deref(), Some("flm"));
         let argv = crate::session::proc::cmdline(pid);
-        assert!(argv.iter().any(|a| a == &model.flm.as_ref().unwrap().tag));
+        assert!(argv.iter().any(|a| a == &model.flm().unwrap().tag));
 
         mgr.stop(idx).expect("stop");
         let mut stopped = false;
@@ -1531,7 +1580,7 @@ mod tests {
         assert!(!models.is_empty());
 
         let tags: std::collections::BTreeSet<_> =
-            models.iter().map(|m| m.flm.as_ref().unwrap().tag.clone()).collect();
+            models.iter().map(|m| m.flm().unwrap().tag.clone()).collect();
         let leaves = std::fs::read_dir(models_dir.join(CATALOG_ROOT)).unwrap().count();
         // One directory per tag, not per (tag, group) pair — several models are
         // rendered under multiple capability labels.
@@ -1615,12 +1664,7 @@ mod tests {
         // The scratch file is gone and flm accepts the model.
         assert!(!partial.exists(), "the partial file outlived the download");
         let binary = backend.descriptor().binary_path.clone().unwrap();
-        // Via the supervisor helper: an earlier test in the same (single-threaded)
-        // run may have set SIGCHLD to SIG_IGN, which makes a bare `output()` fail
-        // to reap. See `session::supervisor::with_default_sigchld`.
-        let check =
-            crate::session::supervisor::output(ProcCommand::new(&binary).args(["check", &tag]))
-                .unwrap();
+        let check = ProcCommand::new(&binary).args(["check", &tag]).output().unwrap();
         assert!(check.status.success(), "flm check rejected the downloaded model");
         assert!(
             backend.catalog().iter().any(|e| e.name == tag && e.installed),
@@ -1664,7 +1708,7 @@ mod tests {
         };
 
         let tags = |models: &[Model]| -> std::collections::BTreeSet<String> {
-            models.iter().map(|m| m.flm.as_ref().unwrap().tag.clone()).collect()
+            models.iter().map(|m| m.flm().unwrap().tag.clone()).collect()
         };
         let categories = backend.models(&ctx(0));
         let flat = backend.models(&ctx(FLAT_VIEW));

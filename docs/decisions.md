@@ -998,3 +998,33 @@ app people keep in a narrow split beside a server log.
 **Consequences:** The help overlay is ~44 rows of content and is clipped at
 24 rows, which is now a supported size: the sections past Options do not fit.
 Either it scrolls or it lays out in two columns when the terminal is short.
+
+
+## ADR-019: Explicit state and resource ownership at runtime boundaries
+
+**Context:** Runtime catalogs and modal state were coordinated through unrelated
+fields, resolved options cloned static metadata, and command constructors relied
+on positional arguments. Blocking scans/readiness probes ran on the input loop.
+Detached sessions changed SIGCHLD for the entire process, interfering with
+subprocess capture and failed exec handling.
+
+**Decision:** Keep the synchronous terminal loop and use standard worker threads
+for scans and readiness. Catalog workers serialize per runtime and coalesce
+requests; readiness workers are bounded and identify the exact session process
+and endpoint. Split browser, transfer, session-view, and modal state into owners,
+with one active input modal. Use explicit catalog entry/source variants behind a
+compatibility DTO, stable runtime IDs, and backend-owned transfer capabilities.
+
+The supervisor retains and reaps its own `Child` handles. It never changes
+SIGCHLD; dropping it hands remaining waits to background threads without killing
+servers. Runtime command constructors accept named requests, and resolved option
+rows borrow static domain metadata while owning model-specific values/defaults.
+Profile/session writes report errors and use atomic replacement; numeric values
+are validated before launch, including values loaded from disk.
+
+**Consequences:** Existing profile keys and cache formats remain readable. Local
+process lifecycle tests can run in parallel; inference/hardware/network tests
+remain opt-in. Initial discovery still runs before the first frame, and the UI
+may briefly display its previous catalog while a refresh is pending. No Tokio
+runtime or supervisor daemon is required. Formatting, build, tests, and strict
+Clippy checks run in CI to preserve the verified baseline.

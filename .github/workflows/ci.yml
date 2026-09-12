@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust tools
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: cargo +stable fmt --check
+      - name: Build without warnings
+        run: cargo +stable build --locked
+        env:
+          RUSTFLAGS: -D warnings
+      - name: Test
+        run: cargo +stable test --locked
+      - name: Clippy
+        run: cargo +stable clippy --locked --all-targets -- -D warnings

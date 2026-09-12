@@ -1,13 +1,14 @@
 //! Core domain types shared across the app. Pure data, no I/O.
-//!
-//! Phase 0 populates these with static stub data so the panes render. Phases
-//! 1–2 replace the stubs with real discovery and profile/option stores.
+
+pub mod options;
+mod wire;
 
 use std::path::PathBuf;
+use wire::ModelFile;
 
 use serde::{Deserialize, Serialize};
 
-/// An inference backend (MVP: only llama.cpp).
+/// A discovered inference backend.
 #[derive(Debug, Clone)]
 pub struct Runtime {
     pub name: String,
@@ -21,9 +22,12 @@ pub struct Runtime {
     pub devices: Vec<String>,
 }
 
-/// A discovered GGUF model. Serializable so the scanner can cache results.
+/// Shared catalog metadata with an explicit directory or model payload.
+/// The wire representation stays compatible with older scan caches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "ModelFile", into = "ModelFile")]
 pub struct Model {
+    pub entry: CatalogEntry,
     /// Stable catalog identity, distinct from the display filename.
     #[serde(default)]
     pub id: String,
@@ -67,23 +71,24 @@ pub struct Model {
     /// Last-modified time, seconds since the Unix epoch (cache invalidation).
     pub modified: Option<u64>,
     pub has_chat_template: bool,
-    /// Hugging Face identity for a lazily-discovered online entry. A missing
-    /// `file` represents a repository directory; a file makes this a
-    /// launchable remote GGUF leaf even before it has a local cache path.
-    #[serde(default)]
-    pub remote: Option<RemoteModel>,
-    /// FastFlowLM catalog identity. Present for every entry the `flm` catalog
-    /// knows about, installed or not.
-    #[serde(default)]
-    pub flm: Option<FlmModel>,
     /// Which runtime owns this model. Determines the profile-store namespace,
     /// so profiles never leak between runtimes.
-    #[serde(default = "default_runtime")]
     pub runtime: String,
 }
 
-fn default_runtime() -> String {
-    crate::runtime::llama_cpp::NAME.to_string()
+/// A directory can carry repository metadata, but never a launchable source.
+#[derive(Debug, Clone)]
+pub enum CatalogEntry {
+    Directory { repository: Option<RemoteModel> },
+    Model(ModelSource),
+}
+
+/// A GGUF may keep its remote identity after being cached locally. FastFlowLM
+/// has its own tag-addressed identity; both identities cannot coexist.
+#[derive(Debug, Clone)]
+pub enum ModelSource {
+    Gguf { remote: Option<RemoteModel> },
+    FastFlowLm(FlmModel),
 }
 
 fn main_revision() -> String {
@@ -173,16 +178,15 @@ pub struct Profile {
     pub favorite: bool,
 }
 
-/// One editable launch option, with the metadata shown in the Info pane.
+/// One editable launch option. Static schema metadata is shared; the value,
+/// resolved default, and range belong to this model/profile instance.
 #[derive(Debug, Clone)]
 pub struct OptionItem {
-    pub key: String,
+    pub spec: &'static options::OptionSpec,
     pub value: String,
     pub default: String,
     /// Human-readable allowed range, e.g. "0.0 – 2.0" (None for free-form).
     pub range: Option<String>,
-    pub cli: String,
-    pub description: String,
 }
 
 impl Runtime {
@@ -199,9 +203,22 @@ impl Model {
     /// FastFlowLM identities are what distinguish "a real model you don't have
     /// yet" from "a folder".
     pub fn is_catalog_dir(&self) -> bool {
-        self.path.as_os_str().is_empty()
-            && self.remote.as_ref().and_then(|remote| remote.file.as_ref()).is_none()
-            && self.flm.is_none()
+        matches!(self.entry, CatalogEntry::Directory { .. })
+    }
+
+    pub fn remote(&self) -> Option<&RemoteModel> {
+        match &self.entry {
+            CatalogEntry::Directory { repository } => repository.as_ref(),
+            CatalogEntry::Model(ModelSource::Gguf { remote }) => remote.as_ref(),
+            CatalogEntry::Model(ModelSource::FastFlowLm(_)) => None,
+        }
+    }
+
+    pub fn flm(&self) -> Option<&FlmModel> {
+        match &self.entry {
+            CatalogEntry::Model(ModelSource::FastFlowLm(flm)) => Some(flm),
+            _ => None,
+        }
     }
 
     pub fn is_model(&self) -> bool {
@@ -214,10 +231,10 @@ impl Model {
     /// `catalog_path`: the same model is rendered under every capability label
     /// it carries, and all of those views must share one set of profiles.
     pub fn profile_key(&self) -> String {
-        if let Some(flm) = &self.flm {
+        if let Some(flm) = self.flm() {
             return format!("flm:{}", flm.tag);
         }
-        match &self.remote {
+        match self.remote() {
             Some(remote) => match &remote.file {
                 Some(file) => format!("hf:{}/{}", remote.repo, file),
                 None => format!("hf:{}", remote.repo),
@@ -233,19 +250,19 @@ impl Model {
     pub fn supports_mtp(&self) -> bool {
         self.has_mtp
             || self.mtp_path.is_some()
-            || self.remote.as_ref().is_some_and(|remote| remote.mtp_file.is_some())
+            || self.remote().is_some_and(|remote| remote.mtp_file.is_some())
     }
 
     /// Whether a dFlash draft companion is paired with this model, cached
     /// locally or still only named by the remote repository.
     pub fn supports_dflash(&self) -> bool {
         self.dflash_path.is_some()
-            || self.remote.as_ref().is_some_and(|remote| remote.dflash_file.is_some())
+            || self.remote().is_some_and(|remote| remote.dflash_file.is_some())
     }
 
     pub fn supports_multimodal(&self) -> bool {
         self.projector_path.is_some()
-            || self.remote.as_ref().is_some_and(|remote| remote.projector_file.is_some())
+            || self.remote().is_some_and(|remote| remote.projector_file.is_some())
     }
 }
 
@@ -254,7 +271,7 @@ pub fn format_unix_date(secs: u64) -> String {
     // days since epoch → civil date (Howard Hinnant's algorithm).
     let z = (secs / 86_400) as i64 + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as i64; // [0, 146096]
+    let doe = z - era * 146_097; // [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
     let year = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]

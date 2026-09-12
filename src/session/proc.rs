@@ -57,7 +57,7 @@ pub fn find_server(binary: &str, model_path: &str, port: u16) -> Option<i32> {
             continue;
         }
         let args = cmdline(pid);
-        if args.iter().any(|a| a == model_path) && args.iter().any(|a| *a == port) {
+        if args.iter().any(|a| a == model_path) && args.contains(&port) {
             best = Some(best.map_or(pid, |b| b.min(pid)));
         }
     }

@@ -50,20 +50,20 @@ a runtime = a module under `src/runtime/` + one entry in `runtime::discover`.
 ```
 src/
   main.rs        entry: XDG paths, file tracing, launch TUI
-  app/           App state, event loop, navigation, prompts, actions
+  app/           App coordination, browser/download/session-view/modal state, catalog workers
   config/        Config (first-run config.toml generation) + XDG Paths resolution
-  domain/        pure types (Runtime, Model, FlmModel, Profile, OptionItem), helpers
+  domain/        pure types, options.rs (static metadata + validation), wire.rs (cache compatibility)
   discovery/     catalog.rs (source parsing + managed tree), gguf.rs (header parser),
                  models.rs (scan+cache), online.rs (lazy Hugging Face catalog),
                  hf.rs (shared Hub transfer: Range resume, tree API, URLs)
   runtime/       mod.rs (RuntimeBackend trait, CatalogCtx, LaunchContext, discover),
-                 llama_cpp.rs (llama-server: discovery, option table, argv, /health),
+                 llama_cpp.rs (discovery, option table, /health), llama_cpp/command.rs (named requests),
                  flm.rs (FastFlowLM: flm discovery+validate, catalog, options,
                  resumable Hub downloads)
-  profiles/      registry.rs (generic option model + OptionSchema), templates.rs
+  profiles/      registry.rs (OptionSchema + CLI rules), templates.rs
                  (Template type; tables live with the backends), store.rs
                  (per-model YAML), mod.rs (resolution layering)
-  session/       command.rs (builder), supervisor.rs (DetachedSupervisor: setsid/signals),
+  session/       command.rs (argv/display), supervisor.rs (owned children, setsid/signals),
                  record.rs (session-<id>.json), proc.rs (/proc), health.rs (/health), mod.rs (SessionManager)
   ui/            ratatui rendering (browser columns, Session Manager, log view, footer, prompts, help)
 docs/            requirements, architecture, decisions (ADRs), roadmap
@@ -99,32 +99,24 @@ legacy profile migration), `~/.cache/llmctl/` (models.json, llama-server.help.tx
 ## Coding standards
 
 - Match the style of surrounding code (naming, comment density, idioms).
-- `cargo build` must be **warning-free**; run `cargo fmt`. Use `#[allow(dead_code)]`
+- `cargo build` must be **warning-free**; run `cargo fmt` and
+  `cargo clippy --locked --all-targets -- -D warnings`. CI also runs these checks
+  and the default test suite. Use `#[allow(dead_code)]`
   with a note (e.g. "used in Phase N") only for genuinely forward-looking fields.
 - Unit-test pure logic (resolution, validation, parsing). The TUI is smoke-tested
   via a PTY driver (`$CLAUDE_JOB_DIR/tmp/drive.py`); per-key delays matter, and
   escape sequences (Home/End/arrows) get split by the driver — rely on unit tests
   for those.
-- Tests needing real binaries, hardware, or spawned processes are `#[ignore]`d
-  with a reason and run via `cargo test -- --ignored --test-threads=1` (see the
-  FastFlowLM discovery and launch-lifecycle tests in `src/runtime/flm.rs`).
-  **Single-threaded is required:** building a `SessionManager` sets `SIGCHLD` to
-  `SIG_IGN` process-wide, which makes any concurrent `Command::output()` fail to
-  reap its child. The same ordering constraint is why `App::new` discovers
-  runtimes before constructing the manager — and why a test that only needs the
-  struct takes `SessionManager::without_supervisor`, which touches no signals.
-  Never construct the real supervisor from a test that runs in the default
-  (parallel) suite.
-- Reading a subprocess's output at runtime must go through
-  `session::supervisor::output`. The supervisor sets `SIGCHLD` to `SIG_IGN` so
-  detached servers self-reap, which makes a plain `Command::output()` fail to
-  `wait()` — silently, if the caller treats an error as "no output". The same
-  trap bites `Command::spawn()`, which *panics* when exec fails because it reaps
-  the failed child to read its errno; `DetachedSupervisor::spawn` wraps it in
-  `supervisor::with_default_sigchld` for that reason. Anything in std that waits
-  on a child belongs inside that helper. This applies to tests too — a
-  single-threaded `--ignored` run inherits the disposition from whichever test
-  built a `SessionManager` first.
+- Tests needing installed inference binaries, hardware, or downloads are
+  `#[ignore]`d with a reason and run via
+  `cargo test -- --ignored --test-threads=1`. The NPU admits one client at a time.
+  Local process lifecycle tests using `sleep` and a Python HTTP server run in
+  the default suite. Bookkeeping tests use `SessionManager::without_supervisor`.
+- The supervisor owns its `Child` handles and reaps only those children through
+  `try_wait`; it never changes the process-wide SIGCHLD disposition. Subprocess
+  discovery and foreground commands use standard `Command::output`/`status`.
+  Dropping a supervisor transfers remaining waits to background threads without
+  killing servers; exiting llmctl leaves detached servers running.
 - Logs go to a **file** under the state dir, never stderr (it corrupts the TUI).
 - Keep `domain/` IO-free. Discovery/process/IO lives in `discovery/`, `runtime/`,
   `profiles/`, and `session/`.
