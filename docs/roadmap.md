@@ -77,6 +77,14 @@ a live tail of the selected session's log, fed by the lines that refresh already
 reads (ADR-017). Below 80x24 llmctl draws the size it needs instead of an
 interface (ADR-018). See [release notes](release-notes-v0.5.0.md).
 
+**v0.5.1 — reliability, responsiveness, and safer persistence** — makes profile,
+download, and session-record writes atomic; validates saved numeric options at
+the launch boundary; moves catalog refreshes and readiness probes off the input
+loop; and explicitly owns detached child processes without changing the
+process-wide SIGCHLD policy. It also fixes interrupted Hugging Face retries,
+FastFlowLM default-profile launches, catalog/profile recovery, and Session
+Manager alignment. See [release notes](release-notes-v0.5.1.md).
+
 Branching: each remaining phase is built on its own `feature/<task>` branch.
 When a batch is ready to ship, the feature branches merge into a release umbrella
 (e.g. **`feature/v0.1.0`**), which then merges to `main` and is tagged. (Early
@@ -297,10 +305,10 @@ takes the whole width and `l` opens the log full screen instead. Below
 80x24 the interface is replaced by the size it needs (ADR-018), which is where
 degrading stops being worth it.
 
-## Rust design refactoring series
+### v0.5.1 — reliability and Rust design refactoring
 
-Each step is implemented, tested, committed, and published as its own PR.
-Later branches build on the previous step; merge in this order.
+Merged to `main` through PR #37. Each step was implemented, tested, and reviewed
+on its own branch before the consolidated merge.
 
 1. Persistence errors and atomic record writes — implemented on `bugfix/persistence-errors`.
 2. Numeric validation and persisted option validation — implemented on `bugfix/numeric-validation`.
