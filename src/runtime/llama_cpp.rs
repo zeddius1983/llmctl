@@ -660,8 +660,8 @@ impl RuntimeBackend for LlamaCppBackend {
         }
     }
 
-    /// `llama-cli` beside `llama-server`, in conversation mode. Server-only
-    /// options (the endpoint) are dropped.
+    /// `llama-cli` beside `llama-server`. Chat is the CLI's default; newer
+    /// builds reject the old `-cnv` switch. Server endpoint options are dropped.
     fn chat_argv(&self, ctx: &LaunchContext) -> Option<Vec<String>> {
         let binary = cli_binary(ctx.binary)?;
         let options: Vec<OptionItem> = ctx
@@ -672,9 +672,7 @@ impl RuntimeBackend for LlamaCppBackend {
             .collect();
         let sub = LaunchContext::new(&binary, ctx.model(), &options)
             .expect("selected model is launchable");
-        let mut argv = self.build_command(&sub).argv;
-        argv.push("-cnv".into());
-        Some(argv)
+        Some(self.build_command(&sub).argv)
     }
 
     fn bench_argv(&self, ctx: &LaunchContext) -> Option<Vec<String>> {
@@ -1235,6 +1233,42 @@ mod tests {
             has_chat_template: false,
             runtime: NAME.into(),
         }
+    }
+
+    #[test]
+    fn chat_uses_cli_defaults_and_preserves_model_options_without_server_endpoint() {
+        let backend = test_backend();
+        let model = test_model();
+        let options: Vec<OptionItem> = [
+            ("ctx-size", "8192"),
+            ("temperature", "0.7"),
+            ("chat-template", "chatml"),
+            ("host", "127.0.0.1"),
+            ("port", "8000"),
+        ]
+        .into_iter()
+        .map(|(key, value)| OptionItem {
+            spec: SCHEMA.spec(key).unwrap(),
+            value: value.into(),
+            default: String::new(),
+            range: None,
+        })
+        .collect();
+        let ctx = LaunchContext::new("/bin/llama-server", &model, &options).unwrap();
+        assert_eq!(
+            backend.chat_argv(&ctx).unwrap(),
+            [
+                "/bin/llama-cli",
+                "-m",
+                "/m/model.gguf",
+                "--ctx-size",
+                "8192",
+                "--temp",
+                "0.7",
+                "--chat-template",
+                "chatml",
+            ]
+        );
     }
 
     #[test]
