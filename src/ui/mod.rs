@@ -1028,7 +1028,7 @@ fn render_session_monitor(frame: &mut Frame, area: Rect, app: &App) {
         let width = usize::from(area.width.saturating_sub(2));
         (
             session_pane_block(SessionPane::Monitor),
-            monitor::monitor_lines(session, &app.sessions.host, width),
+            monitor::monitor_lines(session, &app.sessions.host, width, std::time::Instant::now()),
         )
     } else if let Some(download) = app.selected_model_download() {
         (pane_block("Detail", false), download_detail_lines(download))

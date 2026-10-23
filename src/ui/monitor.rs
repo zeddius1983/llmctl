@@ -1,104 +1,111 @@
 //! The Session Manager's Monitor: the selected session's live figures beside
 //! the list, in the column the Detail pane used to hold.
 //!
-//! Tiles pair a current value with a minute of history, then bars show how
-//! full the machine is, then the requests the server last reported. Everything
-//! is built as text — sparklines and bars are block characters — so the layout
-//! is a pure function of the session and the host reading, testable without a
-//! terminal.
+//! A header names the session, an activity line says what it is doing this
+//! second, boxed tiles pair a current value with its recent history, and bars
+//! show how full the context and the machine are. Everything is built as text —
+//! borders, sparklines and bars are box-drawing and block characters — so the
+//! layout is a pure function of the session and the host reading, testable
+//! without a terminal.
+
+use std::time::Instant;
 
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 
-use super::{ACCENT, pad_left, pad_right, status_color, truncate_right};
+use super::{ACCENT, pad_right, status_color, truncate_right};
 use crate::session::host::HostMonitor;
-use crate::session::throughput::{Phase, RATE_WIDTH, Sample, format_rate};
+use crate::session::throughput::{Activity, Phase, format_rate};
 use crate::session::{Session, format_uptime};
 
 /// Eighths of a cell, lowest first.
 const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-/// The narrowest a tile is worth drawing: a label, a value, and enough history
-/// to see a trend in.
+/// The narrowest a tile is worth drawing: its border, a value, and enough
+/// history to see a trend in.
 const MIN_TILE: usize = 18;
 /// Space between two tiles on one row.
-const TILE_GAP: usize = 2;
+const TILE_GAP: usize = 1;
 /// The least of the model name the header keeps, wrapping rather than
 /// truncating it to nothing.
 const MIN_NAME: usize = 8;
-/// Requests listed under "Recent".
-const RECENT_ROWS: usize = 5;
 const GIB: f64 = (1u64 << 30) as f64;
-/// Columns one phase of a request row takes after its label: six digits of
-/// tokens, ` @ `, and the rate.
-const REQUEST_HALF: usize = 6 + 3 + RATE_WIDTH;
+const BORDER: Color = Color::DarkGray;
 
 /// One tile: what it measures, its current value, and its history scaled
-/// against `ceiling`.
+/// against `ceiling`. A live tile is showing a request still in progress.
 struct Tile {
     label: &'static str,
     value: String,
     history: Vec<Option<f64>>,
     ceiling: Option<f64>,
+    live: bool,
 }
 
-pub(super) fn monitor_lines(session: &Session, host: &HostMonitor, width: usize) -> Text<'static> {
-    let mut lines = vec![header(session, width), Line::raw("")];
+impl Tile {
+    fn new(
+        label: &'static str,
+        value: String,
+        history: Vec<Option<f64>>,
+        ceiling: Option<f64>,
+    ) -> Self {
+        Self { label, value, history, ceiling, live: false }
+    }
+}
 
-    let decode = session.throughput.rates(Phase::Decode);
-    let prefill = session.throughput.rates(Phase::Prefill);
-    lines.push(section("Session"));
+pub(super) fn monitor_lines(
+    session: &Session,
+    host: &HostMonitor,
+    width: usize,
+    now: Instant,
+) -> Text<'static> {
+    let mut lines = vec![header(session, width)];
+    if let Some(activity) = session.throughput.activity(now) {
+        lines.push(activity_line(activity, width));
+    }
+    lines.push(Line::raw(""));
+
+    let speed = |label, phase| {
+        let history = session.throughput.rates(phase);
+        let current = session.throughput.current(phase, now);
+        Tile {
+            label,
+            value: current.map_or("—".into(), |(r, _)| format!("{} t/s", format_rate(r))),
+            ceiling: peak(&history),
+            history,
+            live: current.is_some_and(|(_, live)| live),
+        }
+    };
     lines.extend(tiles(
         &[
-            Tile {
-                label: "Decode",
-                value: rate(session.throughput.rate(Phase::Decode)),
-                ceiling: peak(&decode),
-                history: decode,
-            },
-            Tile {
-                label: "Prefill",
-                value: rate(session.throughput.rate(Phase::Prefill)),
-                ceiling: peak(&prefill),
-                history: prefill,
-            },
-            Tile {
-                label: "CPU",
-                value: session.cpu_percent.map_or("—".into(), |c| format!("{c:.0}%")),
-                history: session.cpu_history.values(),
+            speed("Decode", Phase::Decode),
+            speed("Prefill", Phase::Prefill),
+            Tile::new(
+                "CPU",
+                session.cpu_percent.map_or("—".into(), |c| format!("{c:.0}%")),
+                session.cpu_history.values(),
                 // A server on many cores goes past 100%; the scale follows it.
-                ceiling: Some(session.cpu_history.max().unwrap_or(0.0).max(100.0)),
-            },
-            Tile {
-                label: "Memory",
-                value: session
-                    .rss_bytes
-                    .map_or("—".into(), |b| format!("{:.1} GiB", b as f64 / GIB)),
-                history: session.rss_history.values(),
-                ceiling: session.rss_history.max(),
-            },
+                Some(session.cpu_history.max().unwrap_or(0.0).max(100.0)),
+            ),
+            Tile::new(
+                "Memory",
+                session.rss_bytes.map_or("—".into(), |b| format!("{:.1} GiB", b as f64 / GIB)),
+                session.rss_history.values(),
+                session.rss_history.max(),
+            ),
         ],
         width,
         Color::Cyan,
     ));
-    lines.push(Line::raw(""));
-    lines.extend(context_fill(session, width));
+    let context = context_fill(session, width);
+    if !context.is_empty() {
+        lines.push(Line::raw(""));
+        lines.extend(context);
+    }
 
     let machine = machine_lines(host, width);
     if !machine.is_empty() {
         lines.push(Line::raw(""));
         lines.extend(machine);
-    }
-
-    let requests = session.throughput.requests();
-    if !requests.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::from(vec![
-            "Recent requests".bold(),
-            Span::styled("  tokens @ t/s", Style::default().fg(Color::DarkGray)),
-        ]));
-        for request in requests.iter().take(RECENT_ROWS) {
-            lines.push(request_line(request.prefill, request.decode));
-        }
     }
     Text::from(lines)
 }
@@ -139,6 +146,37 @@ fn header(session: &Session, width: usize) -> Line<'static> {
     Line::from(before)
 }
 
+/// What the server is doing this second, from its own progress reports:
+///
+/// - `▶ Reading  2.0K tok  ██████░░  76%  274 t/s` (the prompt)
+/// - `▶ Generating  865 tokens  29.75 t/s`
+/// - `○ Idle`
+fn activity_line(activity: Activity, width: usize) -> Line<'static> {
+    match activity {
+        Activity::Idle => Line::styled("○ Idle", Style::default().fg(Color::Gray)),
+        Activity::Generating(live) => Line::from(vec![
+            Span::styled("▶ Generating", Style::default().fg(Color::Green).bold()),
+            Span::styled(format!("  {} tokens  ", live.tokens), Style::default().fg(Color::Gray)),
+            Span::raw(format!("{} t/s", format_rate(live.rate))).bold(),
+        ]),
+        Activity::Reading(live) => {
+            let progress = live.progress.unwrap_or(0.0);
+            let lead = format!("  {} tok  ", tokens(live.tokens));
+            let tail = format!("  {:.0}%  {} t/s", progress * 100.0, format_rate(live.rate));
+            let label = "▶ Reading";
+            let room = width.saturating_sub(label.chars().count() + lead.len() + tail.len());
+            let (filled, empty) = bar(progress, room.min(24));
+            Line::from(vec![
+                Span::styled(label, Style::default().fg(Color::Cyan).bold()),
+                Span::styled(lead, Style::default().fg(Color::Gray)),
+                Span::styled(filled, Style::default().fg(Color::Cyan)),
+                Span::styled(empty, Style::default().fg(BORDER)),
+                Span::raw(tail).bold(),
+            ])
+        }
+    }
+}
+
 /// `Context fill          9.8K / 16K  61%` over a bar the pane's width: how
 /// much of its context the last finished request occupied. Nothing until the
 /// server has said how large the context is.
@@ -162,7 +200,7 @@ fn context_fill(session: &Session, width: usize) -> Vec<Line<'static>> {
         ]),
         Line::from(vec![
             Span::styled(filled, Style::default().fg(color)),
-            Span::styled(empty, Style::default().fg(Color::DarkGray)),
+            Span::styled(empty, Style::default().fg(BORDER)),
         ]),
     ]
 }
@@ -192,29 +230,35 @@ fn machine_lines(host: &HostMonitor, width: usize) -> Vec<Line<'static>> {
             "GPU".bold(),
             Span::styled(
                 format!(" · {}{more} · system-wide", gpu.name),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             ),
         ]));
         lines.extend(tiles(
             &[
-                Tile {
-                    label: "Busy",
-                    value: gpu.busy_percent.map_or("—".into(), |b| format!("{b:.0}%")),
-                    history: host.gpu_busy.values(),
-                    ceiling: Some(100.0),
-                },
-                Tile {
-                    label: "Power",
-                    value: gpu.power_w.map_or("—".into(), |w| format!("{w:.0} W")),
-                    history: host.gpu_power.values(),
-                    ceiling: host.gpu_power.max(),
-                },
-                Tile {
-                    label: "Temp",
-                    value: gpu.temp_c.map_or("—".into(), |t| format!("{t:.0} °C")),
-                    history: host.gpu_temp.values(),
-                    ceiling: Some(100.0),
-                },
+                Tile::new(
+                    "Busy",
+                    gpu.busy_percent.map_or("—".into(), |b| format!("{b:.0}%")),
+                    host.gpu_busy.values(),
+                    Some(100.0),
+                ),
+                Tile::new(
+                    "Clock",
+                    gpu.clock_mhz.map_or("—".into(), |mhz| format!("{mhz:.0} MHz")),
+                    host.gpu_clock.values(),
+                    host.gpu_clock.max(),
+                ),
+                Tile::new(
+                    "Power",
+                    gpu.power_w.map_or("—".into(), |w| format!("{w:.0} W")),
+                    host.gpu_power.values(),
+                    host.gpu_power.max(),
+                ),
+                Tile::new(
+                    "Temp",
+                    gpu.temp_c.map_or("—".into(), |t| format!("{t:.0} °C")),
+                    host.gpu_temp.values(),
+                    Some(100.0),
+                ),
             ],
             width,
             Color::LightMagenta,
@@ -230,52 +274,72 @@ fn machine_lines(host: &HostMonitor, width: usize) -> Vec<Line<'static>> {
         }
     }
     if let Some(memory) = host.memory {
-        if lines.is_empty() {
-            lines.push(section("Machine"));
-        }
         lines.push(gauge("RAM", memory.used(), memory.total, width));
     }
     lines
 }
 
-fn section(title: &str) -> Line<'static> {
-    Line::from(title.to_string().bold())
-}
-
-/// Lay tiles out two to a row when the pane has room, else one, with a blank
-/// row between rows so one tile's sparkline does not run into the next tile's
-/// heading. `color` draws the sparklines; each section has its own, so the
-/// session's history and the machine's read as separate groups.
+/// Lay tiles out as bordered boxes, two to a row when the pane has room, else
+/// one:
+///
+/// ```text
+/// ╭ Decode ● ──────╮ ╭ Prefill ───────╮
+/// │ 29.75 t/s      │ │ 58.95 t/s      │
+/// │      ▃▅▆█▇▆▅▆▇ │ │       ▂▃▅▃▂▆▇▅ │
+/// ╰────────────────╯ ╰────────────────╯
+/// ```
+///
+/// `color` draws the sparklines; each section has its own, so the session's
+/// history and the machine's read as separate groups. A live tile — a request
+/// in progress — marks its title and shows its value in green.
 fn tiles(tiles: &[Tile], width: usize, color: Color) -> Vec<Line<'static>> {
     let per_row = if width >= 2 * MIN_TILE + TILE_GAP { 2 } else { 1 };
     let tile_width = if per_row == 2 { (width - TILE_GAP) / 2 } else { width };
+    // Inside the border and a space of padding either side.
+    let inner = tile_width.saturating_sub(4);
+    let border = Style::default().fg(BORDER);
     let mut lines = Vec::new();
-    for (n, row) in tiles.chunks(per_row).enumerate() {
-        if n > 0 {
-            lines.push(Line::raw(""));
-        }
-        let mut heading = Vec::new();
-        let mut history = Vec::new();
+    for row in tiles.chunks(per_row) {
+        let mut rows: [Vec<Span<'static>>; 4] = Default::default();
         for (i, tile) in row.iter().enumerate() {
             if i > 0 {
-                heading.push(Span::raw(" ".repeat(TILE_GAP)));
-                history.push(Span::raw(" ".repeat(TILE_GAP)));
+                for spans in &mut rows {
+                    spans.push(Span::raw(" ".repeat(TILE_GAP)));
+                }
             }
-            let value =
-                truncate_right(&tile.value, tile_width.saturating_sub(tile.label.len() + 1));
-            let label_width = tile_width.saturating_sub(value.chars().count());
-            heading.push(Span::styled(
-                pad_right(tile.label, label_width),
-                Style::default().fg(Color::Gray),
+            let mut title =
+                vec![Span::styled(format!(" {} ", tile.label), Style::default().fg(Color::Gray))];
+            if tile.live {
+                title.push(Span::styled("● ", Style::default().fg(Color::Green)));
+            }
+            let title_width: usize = title.iter().map(Span::width).sum();
+            rows[0].push(Span::styled("╭", border));
+            rows[0].extend(title);
+            rows[0].push(Span::styled(
+                format!("{}╮", "─".repeat(tile_width.saturating_sub(2 + title_width))),
+                border,
             ));
-            heading.push(Span::raw(value).bold());
-            history.push(Span::styled(
-                spark(&tile.history, tile_width, tile.ceiling),
+
+            let value = truncate_right(&tile.value, inner);
+            let value_style =
+                if tile.live { Style::default().fg(Color::Green) } else { Style::default() };
+            rows[1].push(Span::styled("│ ", border));
+            rows[1].push(Span::styled(pad_right(&value, inner), value_style.bold()));
+            rows[1].push(Span::styled(" │", border));
+
+            rows[2].push(Span::styled("│ ", border));
+            rows[2].push(Span::styled(
+                spark(&tile.history, inner, tile.ceiling),
                 Style::default().fg(color),
             ));
+            rows[2].push(Span::styled(" │", border));
+
+            rows[3].push(Span::styled(
+                format!("╰{}╯", "─".repeat(tile_width.saturating_sub(2))),
+                border,
+            ));
         }
-        lines.push(Line::from(heading));
-        lines.push(Line::from(history));
+        lines.extend(rows.into_iter().map(Line::from));
     }
     lines
 }
@@ -291,38 +355,9 @@ fn gauge(label: &str, used: u64, total: u64, width: usize) -> Line<'static> {
     Line::from(vec![
         Span::styled(label, Style::default().fg(Color::Gray)),
         Span::styled(filled, Style::default().fg(color)),
-        Span::styled(empty, Style::default().fg(Color::DarkGray)),
+        Span::styled(empty, Style::default().fg(BORDER)),
         Span::raw(figure),
     ])
-}
-
-/// `pp    339 @   211   tg     53 @ 39.10` — tokens at tokens per second, the
-/// units in the section heading so a row fits the narrowest pane.
-fn request_line(prefill: Option<Sample>, decode: Option<Sample>) -> Line<'static> {
-    let half = |label: &str, sample: Option<Sample>| -> Vec<Span<'static>> {
-        let label = Span::styled(format!("{label} "), Style::default().fg(Color::DarkGray));
-        let Some(sample) = sample else {
-            return vec![
-                label,
-                Span::styled(pad_left("—", REQUEST_HALF), Style::default().fg(Color::DarkGray)),
-            ];
-        };
-        let rate = sample.rate().map_or("—".into(), format_rate);
-        vec![
-            label,
-            Span::raw(pad_left(&sample.tokens.to_string(), 6)),
-            Span::styled(" @ ", Style::default().fg(Color::DarkGray)),
-            Span::raw(pad_left(&rate, RATE_WIDTH)),
-        ]
-    };
-    let mut spans = half("pp", prefill);
-    spans.push(Span::raw("   "));
-    spans.extend(half("tg", decode));
-    Line::from(spans)
-}
-
-fn rate(rate: Option<f64>) -> String {
-    rate.map_or("—".into(), |r| format!("{} t/s", format_rate(r)))
 }
 
 fn peak(values: &[Option<f64>]) -> Option<f64> {
@@ -392,23 +427,30 @@ mod tests {
         assert_eq!(bar(0.5, 10).0.chars().count(), 5);
     }
 
+    fn text_of(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
     #[test]
-    fn tiles_pair_up_when_there_is_room_and_never_overrun_the_pane() {
+    fn boxed_tiles_pair_up_when_there_is_room_and_keep_their_borders_square() {
         let tile = |label| Tile {
             label,
             value: "211.40 t/s".into(),
             history: vec![Some(1.0); 80],
             ceiling: Some(2.0),
+            live: label == "Decode",
         };
         let four = [tile("Decode"), tile("Prefill"), tile("CPU"), tile("Memory")];
         for width in [MIN_TILE, 30, 2 * MIN_TILE + TILE_GAP, 42, 60, 90] {
             let lines = tiles(&four, width, Color::Cyan);
             let paired = width >= 2 * MIN_TILE + TILE_GAP;
-            // Two lines a row, and a blank between rows.
-            assert_eq!(lines.len(), if paired { 5 } else { 11 }, "{width}");
-            for line in &lines {
-                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                assert!(text.width() <= width, "{width}: {text:?} is {} wide", text.width());
+            // Four lines a row of boxes.
+            assert_eq!(lines.len(), if paired { 8 } else { 16 }, "{width}");
+            for row in lines.chunks(4) {
+                let widths: Vec<usize> = row.iter().map(|l| text_of(l).width()).collect();
+                assert!(widths.iter().all(|w| *w == widths[0]), "{width}: ragged box {widths:?}");
+                assert!(widths[0] <= width, "{width}: {:?} overruns", text_of(&row[0]));
+                assert!(text_of(&row[0]).starts_with('╭') && text_of(&row[3]).ends_with('╯'));
             }
         }
     }
@@ -417,15 +459,15 @@ mod tests {
     const NARROWEST: usize = super::super::MIN_DETAIL_WIDTH as usize - 2;
 
     #[test]
-    fn a_request_row_fits_the_narrowest_pane() {
-        let big = |phase, tokens| Some(Sample { phase, tokens, seconds: 0.001 });
-        for (prefill, decode) in [
-            (big(Phase::Prefill, 999_999), big(Phase::Decode, 999_999)),
-            (big(Phase::Prefill, 12), None),
-            (None, big(Phase::Decode, 7)),
+    fn the_activity_line_fits_the_narrowest_pane() {
+        use crate::session::throughput::Live;
+        let live = |phase, progress| Live { phase, tokens: 131_072, rate: 99_999.0, progress };
+        for activity in [
+            Activity::Idle,
+            Activity::Generating(live(Phase::Decode, None)),
+            Activity::Reading(live(Phase::Prefill, Some(0.76))),
         ] {
-            let line = request_line(prefill, decode);
-            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            let text = text_of(&activity_line(activity, NARROWEST));
             assert!(text.width() <= NARROWEST, "{text:?} is {} wide", text.width());
         }
     }

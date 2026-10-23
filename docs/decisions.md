@@ -1072,14 +1072,16 @@ swaps it for the log tail. The pane is titled ` Monitor │ Log ` with the view 
 screen highlighted, so the key reads as a switch between two named views. A
 download keeps its facts there.
 
-*Layout.* One header line, as `strata monitor` heads its view: `● Running ·
+*Layout.* Tiles are boxed, with the title in the border, so the pane reads as
+panels rather than loose text. One header line, as `strata monitor` heads its view: `● Running ·
 http://127.0.0.1:8000/v1 · gemma-4-e4b 16K · 38m 32s`. That is status, the
 endpoint (what one copies out to point a client at the server), the model with
 its context size, and uptime. The model name truncates first when the pane is
 narrow. The compute backend is a column of the row beside it, and the PID is to
-become one. Next come the session tiles, the context-fill bar, the machine's
-GPU tiles and memory bars, and the recent requests. The log path and command
-are left out: `L` and `y` reach them. Each tile group draws its sparklines in its own
+become one. Next come the activity line, the session tiles, the context-fill
+bar, and the machine's GPU tiles and memory bars. The log path and command are
+left out: `L` and `y` reach them. A list of recent requests was tried and
+dropped; it belongs in a Requests view. Each tile group draws its sparklines in its own
 colour, with blank rows between tile rows.
 
 *Sources.* Everything comes from what llmctl can read without a vendor tool or
@@ -1090,6 +1092,16 @@ a server feature:
   a prefill followed by a decode into one request. Both runtimes report them in
   that order.
 - Per-session CPU and RSS come from `/proc`, as before.
+- Live progress comes from the log as well. While a request runs, llama.cpp
+  prints `prompt processing, n_tokens = 2048, progress = 0.76, t = 7.47 s /
+  274.25 tokens per second`, then `n_gen = 865, tg = 34.99 t/s, tg_3s = 29.75
+  t/s` (older builds: `n_decoded = …, tg = …`), about every three seconds.
+  These drive the activity line (Reading / Generating / Idle) and the live
+  decode and prefill tiles. The three-second `tg_3s` is preferred over `tg`,
+  which averages back to the start of the request. A live reading lapses after
+  ten seconds without another, so a cancelled request cannot leave a session
+  looking busy. A runtime that never reports progress (FastFlowLM) shows no
+  activity line rather than a false Idle.
 - Context size and use come from the log too, through a second per-runtime
   parser beside the throughput one (`runtime::context_parser`).
   - llama.cpp gives the per-slot size at load (`n_ctx_slot = 16384`) and the
@@ -1121,5 +1133,5 @@ and one below that.
 
 **Consequences:** No new dependencies, endpoints, or launch flags. llama.cpp's
 `/slots` (serving state) and NVIDIA are follow-ups. A short terminal clips the
-Monitor from the bottom, so the recent requests go last. The other views Strata offers
+Monitor from the bottom, so the machine's bars go last. The other views Strata offers
 (Requests, Connect, Engine, …) are on the roadmap.

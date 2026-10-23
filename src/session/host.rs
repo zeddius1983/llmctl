@@ -29,6 +29,8 @@ pub struct GpuSample {
     pub gtt: Option<(u64, u64)>,
     pub temp_c: Option<f64>,
     pub power_w: Option<f64>,
+    /// Shader clock, which drops to idle within a second of the work stopping.
+    pub clock_mhz: Option<f64>,
 }
 
 /// Physical memory, from `/proc/meminfo`.
@@ -53,6 +55,7 @@ pub struct HostMonitor {
     pub gpu_busy: Series,
     pub gpu_temp: Series,
     pub gpu_power: Series,
+    pub gpu_clock: Series,
     pub memory: Option<MemInfo>,
 }
 
@@ -71,6 +74,7 @@ impl HostMonitor {
         self.gpu_busy.push(gpu.and_then(|g| g.busy_percent));
         self.gpu_temp.push(gpu.and_then(|g| g.temp_c));
         self.gpu_power.push(gpu.and_then(|g| g.power_w));
+        self.gpu_clock.push(gpu.and_then(|g| g.clock_mhz));
         self.memory = meminfo.and_then(parse_meminfo);
     }
 }
@@ -123,9 +127,10 @@ fn read_amdgpu(device: &Path) -> Option<GpuSample> {
         busy_percent: Some(busy),
         vram: pair("mem_info_vram_used", "mem_info_vram_total"),
         gtt: pair("mem_info_gtt_used", "mem_info_gtt_total"),
-        // hwmon reports millidegrees and microwatts. `power1_average` is the
+        // hwmon reports millidegrees, microwatts and hertz. `power1_average` is the
         // smoothed figure; newer kernels on some parts only have the instant.
         temp_c: hwmon_value("temp1_input").map(|milli| milli / 1000.0),
+        clock_mhz: hwmon_value("freq1_input").map(|hz| hz / 1_000_000.0),
         power_w: hwmon_value("power1_average")
             .or_else(|| hwmon_value("power1_input"))
             .map(|micro| micro / 1_000_000.0),
@@ -186,6 +191,7 @@ mod tests {
         write(&device.join("uevent"), "DRIVER=amdgpu\nPCI_ID=1002:1586\n");
         write(&device.join("hwmon/hwmon7/temp1_input"), "64000\n");
         write(&device.join("hwmon/hwmon7/power1_input"), "118077000\n");
+        write(&device.join("hwmon/hwmon7/freq1_input"), "2788000000\n");
         std::fs::create_dir_all(drm.join("card1-DP-1")).unwrap();
 
         let mut host = HostMonitor::default();
@@ -197,6 +203,7 @@ mod tests {
         assert_eq!(gpu.gtt, Some((43_423_322_112, 133_143_986_176)));
         assert_eq!(gpu.temp_c, Some(64.0));
         assert_eq!(gpu.power_w, Some(118.077), "power1_input stands in for a missing average");
+        assert_eq!(gpu.clock_mhz, Some(2788.0));
         assert_eq!(host.gpu_busy.last(), Some(94.0));
         assert_eq!(host.memory, None, "no meminfo, no RAM figure");
 

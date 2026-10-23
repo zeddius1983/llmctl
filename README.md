@@ -183,16 +183,21 @@ between them.
 
 - **Header.** One line: status, endpoint, model with its context size, and
   uptime (`● Running · http://127.0.0.1:8000/v1 · gemma-4-e4b 16K · 38m 32s`).
-- **Session tiles.** Decode and prefill rates, CPU, and resident memory, each
-  with a sparkline. The rate sparklines have one point per request; CPU and
-  memory have one per second over the last minute.
-- **GPU** (AMD, read from `amdgpu` sysfs). Load, power, and temperature, plus
-  VRAM/GTT bars. These figures cover the whole machine and are labelled
-  system-wide, so two servers on one GPU show the same numbers.
+- **Activity.** What the server is doing this second:
+  `▶ Reading 2.0K tok ███░ 76% 274 t/s`, `▶ Generating 865 tokens 29.75 t/s`,
+  or `○ Idle`. It comes from the progress lines llama.cpp prints every few
+  seconds during a request. FastFlowLM reports only finished requests, so it
+  has no activity line.
+- **Tiles.** Boxed tiles for decode, prefill, CPU and memory. While a request
+  runs, its tile shows the live rate in green with a `●` beside the title.
+  The rate sparklines advance with every progress report; CPU and memory
+  sample once a second over the last minute.
 - **Context fill.** How much of the context the last request occupied, read from
   the server's log: llama.cpp's slot lines, FastFlowLM's KV usage.
+- **GPU** (AMD, read from `amdgpu` sysfs). Busy, clock, power and temperature
+  tiles, plus VRAM/GTT bars. These figures cover the whole machine and are
+  labelled system-wide, so two servers on one GPU show the same numbers.
 - **RAM bar** for system memory.
-- **Recent requests.** Token counts and rates for the last few requests.
 
 llmctl samples the machine only while a session is live.
 

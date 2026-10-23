@@ -445,28 +445,36 @@ pub fn templates_for(runtime: &str) -> &'static [Template] {
     }
 }
 
-/// How to read per-request rates out of a runtime's log, identified only by
-/// name.
+/// What a runtime's log says about its requests, one reader per kind of fact.
+pub struct LogParsers {
+    /// A finished request's rates.
+    pub throughput: fn(&str) -> Vec<crate::session::throughput::Sample>,
+    /// Context size and use.
+    pub context: fn(&str) -> Vec<crate::session::context::Reading>,
+    /// A request in progress.
+    pub live: fn(&str) -> Option<crate::session::throughput::Live>,
+}
+
+/// How to read a runtime's log, identified only by name.
 ///
 /// The same exception as [`templates_for`], for the same reason: session
 /// records are read off disk at startup, long before any backend is in hand,
 /// and they carry the runtime's name rather than a handle to it. Everywhere a
 /// backend *is* available, dispatch goes through the trait.
-pub fn throughput_parser(runtime: &str) -> fn(&str) -> Vec<crate::session::throughput::Sample> {
+pub fn log_parsers(runtime: &str) -> LogParsers {
     match runtime {
-        flm::NAME => flm::parse_throughput,
-        llama_cpp::NAME => llama_cpp::parse_throughput,
-        _ => |_| Vec::new(),
-    }
-}
-
-/// How to read context size and use out of a runtime's log, identified only by
-/// name — for the same reason as [`throughput_parser`].
-pub fn context_parser(runtime: &str) -> fn(&str) -> Vec<crate::session::context::Reading> {
-    match runtime {
-        flm::NAME => flm::parse_context,
-        llama_cpp::NAME => llama_cpp::parse_context,
-        _ => |_| Vec::new(),
+        flm::NAME => LogParsers {
+            throughput: flm::parse_throughput,
+            context: flm::parse_context,
+            // `flm serve` reports a request only once it has finished.
+            live: |_| None,
+        },
+        llama_cpp::NAME => LogParsers {
+            throughput: llama_cpp::parse_throughput,
+            context: llama_cpp::parse_context,
+            live: llama_cpp::parse_live,
+        },
+        _ => LogParsers { throughput: |_| Vec::new(), context: |_| Vec::new(), live: |_| None },
     }
 }
 

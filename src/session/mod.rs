@@ -633,8 +633,7 @@ impl SessionManager {
             let sample = proc::cpu_sample(pid);
             // The server already timed its own requests; read what it wrote
             // rather than timing anything here (see `session::throughput`).
-            let parse = crate::runtime::throughput_parser(&self.sessions[idx].record.runtime);
-            let parse_context = crate::runtime::context_parser(&self.sessions[idx].record.runtime);
+            let parse = crate::runtime::log_parsers(&self.sessions[idx].record.runtime);
             let log_file = self.sessions[idx].record.log_file.clone();
             let appended = self.sessions[idx].log_tail.poll(&log_file);
             // Once a session is Running its status no longer depends on the
@@ -651,11 +650,19 @@ impl SessionManager {
             let s = &mut self.sessions[idx];
             s.rss_bytes = rss;
             s.download_percent = progress;
-            for measurement in appended.iter().flat_map(|line| parse(line)) {
-                s.throughput.record(measurement);
-            }
-            for reading in appended.iter().flat_map(|line| parse_context(line)) {
-                s.context.record(reading);
+            // In log order: a request's progress lines come before its summary,
+            // and the summary is what ends it.
+            let now = Instant::now();
+            for line in &appended {
+                if let Some(live) = (parse.live)(line) {
+                    s.throughput.record_live(live, now);
+                }
+                for measurement in (parse.throughput)(line) {
+                    s.throughput.record(measurement);
+                }
+                for reading in (parse.context)(line) {
+                    s.context.record(reading);
+                }
             }
             remember(&mut s.recent, &appended);
             if let Some(now) = sample {

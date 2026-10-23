@@ -344,9 +344,12 @@ llmctl has the first and, in the log tail, the sixth.
       `amdgpu` busy/power/temperature, VRAM/GTT/RAM bars, recent requests
 - [x] One-line header (status · endpoint · model + context size · uptime) and
       a context-fill bar, both from the server's log
-- [ ] Serving state from `/slots` (Idle / Generating, busy slots), sampled
-      through a background worker like the health probe. llama.cpp and Strata
-      both answer it; FastFlowLM does not
+- [x] Live activity (Reading with progress / Generating / Idle) and live
+      decode/prefill rates from llama.cpp's progress lines; boxed tiles; GPU
+      clock tile; the Recent requests list removed for a future Requests view
+- [ ] Busy-slot count across parallel requests (`/slots`, through a background
+      worker like the health probe). The log's activity follows whichever
+      slot reported last
 - [ ] PID as a Session Manager column (dropped from the Monitor)
 - [ ] NVIDIA via NVML or `nvidia-smi` behind the same sampler; a GPU picker
       when there are several (today: the one with the most VRAM)
