@@ -1,9 +1,9 @@
 //! The Session Manager's Monitor: the selected session's live figures beside
 //! the list, in the column the Detail pane used to hold.
 //!
-//! A header names the session, an activity line says what it is doing this
-//! second, boxed tiles pair a current value with its recent history, and bars
-//! show how full the context and the machine are. Everything is built as text —
+//! A header names the session and says what it is doing this second, boxed
+//! tiles pair a current value with its recent history, and bars show how full
+//! the context and the machine are. Everything is built as text —
 //! borders, sparklines and bars are box-drawing and block characters — so the
 //! layout is a pure function of the session and the host reading, testable
 //! without a terminal.
@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span, Text};
 use super::{ACCENT, pad_right, status_color, truncate_right};
 use crate::session::host::HostMonitor;
 use crate::session::throughput::{Activity, Phase, format_rate};
-use crate::session::{Session, format_uptime};
+use crate::session::{Session, SessionStatus, format_uptime};
 
 /// Eighths of a cell, lowest first.
 const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -25,8 +25,8 @@ const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'
 const MIN_TILE: usize = 18;
 /// Space between two tiles on one row.
 const TILE_GAP: usize = 1;
-/// The least of the model name the header keeps, wrapping rather than
-/// truncating it to nothing.
+/// The least of the model name the header keeps; with less room than this it
+/// leaves the name out.
 const MIN_NAME: usize = 8;
 const GIB: f64 = (1u64 << 30) as f64;
 const BORDER: Color = Color::DarkGray;
@@ -58,11 +58,7 @@ pub(super) fn monitor_lines(
     width: usize,
     now: Instant,
 ) -> Text<'static> {
-    let mut lines = vec![header(session, width)];
-    if let Some(activity) = session.throughput.activity(now) {
-        lines.push(activity_line(activity, width));
-    }
-    lines.push(Line::raw(""));
+    let mut lines = vec![header(session, width, now), Line::raw("")];
 
     let speed = |label, phase| {
         let history = session.throughput.rates(phase);
@@ -113,67 +109,95 @@ pub(super) fn monitor_lines(
 /// `● Running · http://127.0.0.1:8000/v1 · gemma-4-e4b-it 16K · 38m 32s`
 ///
 /// Everything identifying the session on one line, as `strata monitor` heads
-/// its view. The compute backend and the profile are columns of the row beside
+/// its view. While a request runs, its progress stands in for the status — see
+/// [`status`]. The compute backend and the profile are columns of the row beside
 /// it; the context size appears once a log line has stated it, and the uptime
 /// while there is a process to have one.
 ///
 /// The model name gives way when the pane is narrow — it is the one part that
 /// is long, and the list beside it carries it in full.
-fn header(session: &Session, width: usize) -> Line<'static> {
+fn header(session: &Session, width: usize, now: Instant) -> Line<'static> {
     let r = &session.record;
     let dot = || Span::styled(" · ", Style::default().fg(Color::DarkGray));
-    let mut before = vec![
-        Span::styled(
+    let lead = vec![
+        status(session, now),
+        dot(),
+        Span::styled(r.endpoint(), Style::default().fg(Color::Cyan).bold()),
+    ];
+    let size = session
+        .context
+        .size
+        .map(|size| Span::styled(tokens(size), Style::default().fg(Color::Gray)));
+    let uptime = session
+        .uptime_secs()
+        .map(|uptime| Span::styled(format_uptime(uptime), Style::default().fg(Color::Gray)));
+
+    // Narrow panes shed what the list beside them already shows: first room
+    // for the name, then the uptime, then the name itself. Only a pane too
+    // narrow even for that wraps.
+    for (keep_uptime, keep_name) in [(true, true), (false, true), (false, false)] {
+        let mut tail = Vec::new();
+        if let Some(size) = &size {
+            if keep_name {
+                tail.push(Span::raw(" "));
+            } else {
+                tail.push(dot());
+            }
+            tail.push(size.clone());
+        }
+        if keep_uptime && let Some(uptime) = &uptime {
+            tail.push(dot());
+            tail.push(uptime.clone());
+        }
+        let taken: usize = lead.iter().chain(&tail).map(Span::width).sum::<usize>()
+            + if keep_name { dot().width() } else { 0 };
+        let room = width.saturating_sub(taken);
+        if keep_name && room < MIN_NAME {
+            continue;
+        }
+        let mut line = lead.clone();
+        if keep_name {
+            line.push(dot());
+            line.push(Span::styled(
+                truncate_right(&r.name, room.max(MIN_NAME)),
+                Style::default().fg(ACCENT).bold(),
+            ));
+        }
+        line.extend(tail);
+        return Line::from(line);
+    }
+    unreachable!("the last arrangement always returns")
+}
+
+/// The session's status, or — while a request runs — what it is doing, from
+/// the server's own progress reports:
+///
+/// - `▶ Reading 76%` while it processes a prompt;
+/// - `▶ Generating 781 tokens` while it generates;
+/// - `● Running` between requests, as for every other status.
+///
+/// No rate: the Decode and Prefill tiles beside it carry that, live.
+fn status(session: &Session, now: Instant) -> Span<'static> {
+    let activity = match session.status {
+        SessionStatus::Running => session.throughput.activity(now),
+        _ => None,
+    };
+    match activity {
+        Some(Activity::Generating(live)) => Span::styled(
+            format!("▶ Generating {} tokens", live.tokens),
+            Style::default().fg(Color::Green).bold(),
+        ),
+        Some(Activity::Reading(live)) => Span::styled(
+            match live.progress {
+                Some(progress) => format!("▶ Reading {:.0}%", progress * 100.0),
+                None => "▶ Reading".into(),
+            },
+            Style::default().fg(Color::Cyan).bold(),
+        ),
+        Some(Activity::Idle) | None => Span::styled(
             format!("{} {}", session.status.glyph(), session.status_label()),
             Style::default().fg(status_color(session.status)),
         ),
-        dot(),
-        Span::styled(r.endpoint(), Style::default().fg(Color::Cyan).bold()),
-        dot(),
-    ];
-    let mut after = Vec::new();
-    if let Some(size) = session.context.size {
-        after.push(Span::styled(format!(" {}", tokens(size)), Style::default().fg(Color::Gray)));
-    }
-    if let Some(uptime) = session.uptime_secs() {
-        after.push(dot());
-        after.push(Span::styled(format_uptime(uptime), Style::default().fg(Color::Gray)));
-    }
-    let taken: usize = before.iter().chain(&after).map(Span::width).sum();
-    let name = truncate_right(&r.name, width.saturating_sub(taken).max(MIN_NAME));
-    before.push(Span::styled(name, Style::default().fg(ACCENT).bold()));
-    before.extend(after);
-    Line::from(before)
-}
-
-/// What the server is doing this second, from its own progress reports:
-///
-/// - `▶ Reading  2.0K tok  ██████░░  76%  274 t/s` (the prompt)
-/// - `▶ Generating  865 tokens  29.75 t/s`
-/// - `○ Idle`
-fn activity_line(activity: Activity, width: usize) -> Line<'static> {
-    match activity {
-        Activity::Idle => Line::styled("○ Idle", Style::default().fg(Color::Gray)),
-        Activity::Generating(live) => Line::from(vec![
-            Span::styled("▶ Generating", Style::default().fg(Color::Green).bold()),
-            Span::styled(format!("  {} tokens  ", live.tokens), Style::default().fg(Color::Gray)),
-            Span::raw(format!("{} t/s", format_rate(live.rate))).bold(),
-        ]),
-        Activity::Reading(live) => {
-            let progress = live.progress.unwrap_or(0.0);
-            let lead = format!("  {} tok  ", tokens(live.tokens));
-            let tail = format!("  {:.0}%  {} t/s", progress * 100.0, format_rate(live.rate));
-            let label = "▶ Reading";
-            let room = width.saturating_sub(label.chars().count() + lead.len() + tail.len());
-            let (filled, empty) = bar(progress, room.min(24));
-            Line::from(vec![
-                Span::styled(label, Style::default().fg(Color::Cyan).bold()),
-                Span::styled(lead, Style::default().fg(Color::Gray)),
-                Span::styled(filled, Style::default().fg(Color::Cyan)),
-                Span::styled(empty, Style::default().fg(BORDER)),
-                Span::raw(tail).bold(),
-            ])
-        }
     }
 }
 
@@ -455,21 +479,87 @@ mod tests {
         }
     }
 
-    /// The pane is never narrower than this many columns inside its borders.
-    const NARROWEST: usize = super::super::MIN_DETAIL_WIDTH as usize - 2;
+    fn running_session() -> Session {
+        use crate::session::record::SessionRecord;
+        Session::probe(
+            SessionRecord {
+                id: "1".into(),
+                name: "gemma".into(),
+                runtime: "llama.cpp".into(),
+                model: "m".into(),
+                model_path: "m".into(),
+                profile: "Default".into(),
+                size_bytes: None,
+                device: None,
+                pid: 1,
+                host: "127.0.0.1".into(),
+                port: 8000,
+                command: Vec::new(),
+                health_path: "/health".into(),
+                log_file: "/dev/null".into(),
+                download: None,
+                started_unix: 0,
+            },
+            SessionStatus::Running,
+            Default::default(),
+        )
+    }
 
     #[test]
-    fn the_activity_line_fits_the_narrowest_pane() {
+    fn the_header_sheds_what_the_list_shows_rather_than_wrap() {
+        use crate::session::context::Reading;
         use crate::session::throughput::Live;
-        let live = |phase, progress| Live { phase, tokens: 131_072, rate: 99_999.0, progress };
-        for activity in [
-            Activity::Idle,
-            Activity::Generating(live(Phase::Decode, None)),
-            Activity::Reading(live(Phase::Prefill, Some(0.76))),
-        ] {
-            let text = text_of(&activity_line(activity, NARROWEST));
-            assert!(text.width() <= NARROWEST, "{text:?} is {} wide", text.width());
+        let now = Instant::now();
+        let mut session = running_session();
+        session.record.name = "nvidia-nemotron-3-5-bolt-74b-a9b-ud-q3_k_xl".into();
+        session.context.record(Reading::Size(64_512));
+        let generating = Live { phase: Phase::Decode, tokens: 215, rate: 35.0, progress: None };
+        session.throughput.record_live(generating, now);
+
+        let wide = text_of(&header(&session, 120, now));
+        assert!(wide.contains("nvidia-nemotron-3-5-bolt"), "a wide pane keeps the name: {wide}");
+        // From where status, endpoint and size fit at all: below that the
+        // line wraps, which a pane that narrow cannot avoid.
+        for width in [56, 62, 70, 90, 120] {
+            let line = text_of(&header(&session, width, now));
+            assert!(line.width() <= width, "{width}: {line:?} is {} wide", line.width());
+            assert!(
+                line.starts_with("▶ Generating 215 tokens · http://127.0.0.1:8000/v1"),
+                "{line}"
+            );
+            assert!(line.contains("63K"), "the context size stays: {line}");
         }
+    }
+
+    #[test]
+    fn a_request_in_progress_stands_in_for_the_status() {
+        use crate::session::throughput::{Live, Sample};
+        let now = Instant::now();
+        let mut session = running_session();
+        assert_eq!(
+            status(&session, now).content,
+            "● Running",
+            "a runtime that never reports progress"
+        );
+
+        let reading =
+            Live { phase: Phase::Prefill, tokens: 2048, rate: 274.0, progress: Some(0.76) };
+        session.throughput.record_live(reading, now);
+        assert_eq!(status(&session, now).content, "▶ Reading 76%");
+
+        let generating = Live { phase: Phase::Decode, tokens: 781, rate: 29.75, progress: None };
+        session.throughput.record_live(generating, now);
+        assert_eq!(status(&session, now).content, "▶ Generating 781 tokens", "and no rate");
+
+        session.throughput.record(Sample { phase: Phase::Decode, tokens: 931, seconds: 26.9 });
+        assert_eq!(status(&session, now).content, "● Running", "between requests");
+
+        session.throughput.record_live(generating, now);
+        session.status = SessionStatus::Stopped;
+        assert!(
+            !status(&session, now).content.contains("Generating"),
+            "only a running session is busy"
+        );
     }
 
     #[test]

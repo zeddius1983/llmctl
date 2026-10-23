@@ -11,6 +11,8 @@
 //! ```
 //! Columns slide left as the user drills in (`l`/`→`) and right on `h`/`←`.
 
+use std::time::Instant;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -682,7 +684,9 @@ impl Column {
     /// Always something: a column that vanished when a session had no figure
     /// for it would shift every column after it out of line with the rows above
     /// and below, which is the whole point of having columns.
-    fn cell(self, session: &Session) -> String {
+    ///
+    /// `now` decides whether a request still in progress counts as live.
+    fn cell(self, session: &Session, now: Instant) -> String {
         match self {
             // Truncated rather than allowed to widen the column: a long profile
             // name must not shift every row below it.
@@ -692,8 +696,8 @@ impl Column {
             Column::Port => format!(":{}", session.record.port),
             Column::Size => session.record.size_bytes.map(human_size).unwrap_or(MISSING.into()),
             Column::Device => session.record.device.clone().unwrap_or(MISSING.into()),
-            Column::Decode => rate_cell("tg", session, Phase::Decode),
-            Column::Prefill => rate_cell("pp", session, Phase::Prefill),
+            Column::Decode => rate_cell("tg", session, Phase::Decode, now),
+            Column::Prefill => rate_cell("pp", session, Phase::Prefill, now),
             Column::Uptime => session.uptime_secs().map(format_uptime).unwrap_or(MISSING.into()),
         }
     }
@@ -726,8 +730,9 @@ impl Column {
 ///
 /// A session that has served nothing yet shows the shape of the number rather
 /// than a blank, so a fresh server sits in the same columns as a busy one.
-fn rate_cell(label: &str, session: &Session, phase: Phase) -> String {
-    let value = session.throughput.rate(phase).map(format_rate).unwrap_or_else(|| {
+fn rate_cell(label: &str, session: &Session, phase: Phase, now: Instant) -> String {
+    let current = session.throughput.current(phase, now).map(|(rate, _)| rate);
+    let value = current.map(format_rate).unwrap_or_else(|| {
         match phase {
             // Decode is reported to two decimals and prefill whole, so their
             // placeholders differ too — each is the shape of what will replace it.
@@ -774,7 +779,14 @@ fn row_plan(width: usize, longest: usize) -> (usize, Vec<Column>) {
 }
 
 /// One session row: status, model, then the columns the pane agreed on.
-fn session_row(session: &Session, name_width: usize, columns: &[Column]) -> Line<'static> {
+/// One session's row. A rate column showing a request still in progress is
+/// green, as its tile in the Monitor is; everything else is dim.
+fn session_row(
+    session: &Session,
+    name_width: usize,
+    columns: &[Column],
+    now: Instant,
+) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
             format!("{} ", session.status.glyph()),
@@ -783,9 +795,16 @@ fn session_row(session: &Session, name_width: usize, columns: &[Column]) -> Line
         Span::raw(pad_right(&truncate_right(&session.record.name, name_width), name_width)),
     ];
     for column in columns {
+        let live = match column {
+            Column::Decode => session.throughput.current(Phase::Decode, now),
+            Column::Prefill => session.throughput.current(Phase::Prefill, now),
+            _ => None,
+        }
+        .is_some_and(|(_, live)| live);
+        spans.push(Span::raw(" ".repeat(COL_GAP)));
         spans.push(Span::styled(
-            format!("{}{}", " ".repeat(COL_GAP), column.pad(&column.cell(session))),
-            Style::default().fg(Color::DarkGray),
+            column.pad(&column.cell(session, now)),
+            Style::default().fg(if live { Color::Green } else { Color::DarkGray }),
         ));
     }
     spans.push(Span::raw(" ".repeat(ROW_RIGHT_PADDING)));
@@ -878,6 +897,7 @@ fn session_items(
     let longest = sessions.iter().map(|session| session.record.name.width()).max().unwrap_or(0);
     let (name_width, columns) = row_plan(width, longest);
     let indent = " ".repeat(SESSION_INDENT);
+    let now = Instant::now();
     let items = rows
         .iter()
         .map(|row| match row {
@@ -887,7 +907,7 @@ fn session_items(
             ))),
             SessionListRow::Session(index) => {
                 let mut spans = vec![Span::raw(indent.clone())];
-                spans.extend(session_row(&sessions[*index], name_width, &columns).spans);
+                spans.extend(session_row(&sessions[*index], name_width, &columns, now).spans);
                 ListItem::new(Line::from(spans))
             }
         })
@@ -1028,7 +1048,7 @@ fn render_session_monitor(frame: &mut Frame, area: Rect, app: &App) {
         let width = usize::from(area.width.saturating_sub(2));
         (
             session_pane_block(SessionPane::Monitor),
-            monitor::monitor_lines(session, &app.sessions.host, width, std::time::Instant::now()),
+            monitor::monitor_lines(session, &app.sessions.host, width, Instant::now()),
         )
     } else if let Some(download) = app.selected_model_download() {
         (pane_block("Detail", false), download_detail_lines(download))
@@ -1985,7 +2005,7 @@ mod tests {
         sessions
             .iter()
             .map(|session| {
-                super::session_row(session, name_width, &columns)
+                super::session_row(session, name_width, &columns, std::time::Instant::now())
                     .spans
                     .iter()
                     .map(|span| span.content.to_string())
@@ -1999,6 +2019,28 @@ mod tests {
     }
 
     /// The point of the columns: they line up regardless of name length.
+    /// The list's rate columns follow a request in progress, as the Monitor
+    /// does, and fall back to the last finished one when it ends.
+    #[test]
+    fn rate_columns_show_a_request_in_progress() {
+        use crate::session::throughput::{Live, Phase, Sample};
+        use unicode_width::UnicodeWidthStr;
+        let mut session = probe_session("qwen", true);
+        let finished = rows_text(std::slice::from_ref(&session), 160).remove(0);
+        assert!(finished.contains("tg 67.73 t/s"), "{finished}");
+
+        let live = Live { phase: Phase::Decode, tokens: 865, rate: 29.75, progress: None };
+        session.throughput.record_live(live, std::time::Instant::now());
+        let running = rows_text(std::slice::from_ref(&session), 160).remove(0);
+        assert!(running.contains("tg 29.75 t/s"), "{running}");
+        assert!(running.contains("pp  1425 t/s"), "prefill keeps its last figure: {running}");
+        assert_eq!(running.width(), finished.width(), "a live figure keeps the columns in line");
+
+        session.throughput.record(Sample { phase: Phase::Decode, tokens: 931, seconds: 26.92 });
+        let done = rows_text(std::slice::from_ref(&session), 160).remove(0);
+        assert!(done.contains("tg 34.58 t/s"), "{done}");
+    }
+
     #[test]
     fn session_columns_align_across_rows() {
         // A pane wide enough for every column. The last row has served

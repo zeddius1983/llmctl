@@ -1078,7 +1078,8 @@ http://127.0.0.1:8000/v1 · gemma-4-e4b 16K · 38m 32s`. That is status, the
 endpoint (what one copies out to point a client at the server), the model with
 its context size, and uptime. The model name truncates first when the pane is
 narrow. The compute backend is a column of the row beside it, and the PID is to
-become one. Next come the activity line, the session tiles, the context-fill
+become one. A narrow pane sheds the uptime and then the name, which the list
+shows, before it wraps. Next come the session tiles, the context-fill
 bar, and the machine's GPU tiles and memory bars. The log path and command are
 left out: `L` and `y` reach them. A list of recent requests was tried and
 dropped; it belongs in a Requests view. Each tile group draws its sparklines in its own
@@ -1096,12 +1097,14 @@ a server feature:
   prints `prompt processing, n_tokens = 2048, progress = 0.76, t = 7.47 s /
   274.25 tokens per second`, then `n_gen = 865, tg = 34.99 t/s, tg_3s = 29.75
   t/s` (older builds: `n_decoded = …, tg = …`), about every three seconds.
-  These drive the activity line (Reading / Generating / Idle) and the live
-  decode and prefill tiles. The three-second `tg_3s` is preferred over `tg`,
+  These drive the header's status (`▶ Reading 76%` / `▶ Generating 781
+  tokens` in place of `● Running`, with no rate), the live
+  decode and prefill tiles, and the Session Manager's `tg`/`pp` columns, which
+  show a live figure in green. The three-second `tg_3s` is preferred over `tg`,
   which averages back to the start of the request. A live reading lapses after
   ten seconds without another, so a cancelled request cannot leave a session
-  looking busy. A runtime that never reports progress (FastFlowLM) shows no
-  activity line rather than a false Idle.
+  looking busy. A runtime that never reports progress (FastFlowLM) keeps its
+  plain status.
 - Context size and use come from the log too, through a second per-runtime
   parser beside the throughput one (`runtime::context_parser`).
   - llama.cpp gives the per-slot size at load (`n_ctx_slot = 16384`) and the

@@ -171,9 +171,11 @@ overlay.
 Each session shows its speed, read from the timings the server already writes to
 its own log — nothing to enable, and it works for sessions llmctl rediscovered
 after a restart. `tg` is token generation (decode) and `pp` is prompt processing
-(prefill), each the runtime's own figure for its most recent request rather than
-an average llmctl computed — only the server knows how much of the elapsed time
-was work rather than idling.
+(prefill), each the runtime's own figure rather than an average llmctl computed —
+only the server knows how much of the elapsed time was work rather than idling.
+While a llama.cpp request runs, the figure is its live progress report (decode
+over the last three seconds) and shows in green. Otherwise it is the most recent
+finished request.
 
 ### Session monitor
 
@@ -183,11 +185,11 @@ between them.
 
 - **Header.** One line: status, endpoint, model with its context size, and
   uptime (`● Running · http://127.0.0.1:8000/v1 · gemma-4-e4b 16K · 38m 32s`).
-- **Activity.** What the server is doing this second:
-  `▶ Reading 2.0K tok ███░ 76% 274 t/s`, `▶ Generating 865 tokens 29.75 t/s`,
-  or `○ Idle`. It comes from the progress lines llama.cpp prints every few
-  seconds during a request. FastFlowLM reports only finished requests, so it
-  has no activity line.
+  While a llama.cpp request runs, its progress replaces the status:
+  `▶ Reading 76%` for the prompt, then `▶ Generating 781 tokens`. It comes from
+  the progress lines llama.cpp prints every few seconds. FastFlowLM reports
+  only finished requests, so its status stays `● Running`. A narrow pane drops
+  the uptime and then the model name, both of which the list shows.
 - **Tiles.** Boxed tiles for decode, prefill, CPU and memory. While a request
   runs, its tile shows the live rate in green with a `●` beside the title.
   The rate sparklines advance with every progress report; CPU and memory
