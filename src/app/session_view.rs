@@ -14,7 +14,7 @@ pub struct SessionViewState {
 impl Default for SessionViewState {
     fn default() -> Self {
         Self {
-            pane: SessionPane::Detail,
+            pane: SessionPane::Monitor,
             detail_pane_visible: true,
             selection: ListState::default(),
             log_lines: vec![],

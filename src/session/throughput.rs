@@ -35,11 +35,24 @@ impl Sample {
     }
 }
 
-/// The latest rates a session has reported.
+/// How many finished measurements a session keeps for the Monitor.
+const RECENT_LEN: usize = 60;
+
+/// The latest rates a session has reported, and the measurements before them.
 #[derive(Default)]
 pub struct Throughput {
     last_prefill: Option<Sample>,
     last_decode: Option<Sample>,
+    /// Oldest first, both phases interleaved as the server reported them.
+    recent: std::collections::VecDeque<Sample>,
+}
+
+/// One request as the server summarized it: its prompt processing and its
+/// generation, either of which a runtime may not have reported.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Request {
+    pub prefill: Option<Sample>,
+    pub decode: Option<Sample>,
 }
 
 impl Throughput {
@@ -53,6 +66,43 @@ impl Throughput {
             Phase::Prefill => self.last_prefill = Some(sample),
             Phase::Decode => self.last_decode = Some(sample),
         }
+        if self.recent.len() == RECENT_LEN {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(sample);
+    }
+
+    /// The rates of the recent measurements for `phase`, oldest first — one per
+    /// request, not per second, so an idle server's history does not decay.
+    pub fn rates(&self, phase: Phase) -> Vec<Option<f64>> {
+        self.recent.iter().filter(|s| s.phase == phase).map(Sample::rate).collect()
+    }
+
+    /// The recent requests, newest first.
+    ///
+    /// Both runtimes report a request's prefill before its decode, so a
+    /// prefill followed by a decode is one request. Anything else stands alone
+    /// rather than being paired with a neighbour it did not belong to.
+    pub fn requests(&self) -> Vec<Request> {
+        let mut requests = Vec::new();
+        let mut pending: Option<Sample> = None;
+        for &sample in &self.recent {
+            match sample.phase {
+                Phase::Prefill => {
+                    if let Some(prefill) = pending.replace(sample) {
+                        requests.push(Request { prefill: Some(prefill), decode: None });
+                    }
+                }
+                Phase::Decode => {
+                    requests.push(Request { prefill: pending.take(), decode: Some(sample) })
+                }
+            }
+        }
+        if let Some(prefill) = pending {
+            requests.push(Request { prefill: Some(prefill), decode: None });
+        }
+        requests.reverse();
+        requests
     }
 
     /// The last finished measurement for `phase`.
@@ -109,6 +159,38 @@ mod tests {
 
     fn sample(phase: Phase, tokens: u64, seconds: f64) -> Sample {
         Sample { phase, tokens, seconds }
+    }
+
+    #[test]
+    fn recent_measurements_pair_into_requests_newest_first() {
+        let mut throughput = Throughput::default();
+        throughput.record(sample(Phase::Prefill, 339, 1.6));
+        throughput.record(sample(Phase::Decode, 53, 1.35));
+        // A prefill whose decode never came (a cancelled request) stands alone.
+        throughput.record(sample(Phase::Prefill, 18, 0.2));
+        throughput.record(sample(Phase::Prefill, 40, 0.4));
+        throughput.record(sample(Phase::Decode, 6, 0.2));
+
+        let requests = throughput.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].prefill.map(|s| s.tokens), Some(40));
+        assert_eq!(requests[0].decode.map(|s| s.tokens), Some(6));
+        assert_eq!(
+            requests[1],
+            Request { prefill: Some(sample(Phase::Prefill, 18, 0.2)), decode: None }
+        );
+        assert_eq!(requests[2].decode.map(|s| s.tokens), Some(53));
+
+        assert_eq!(throughput.rates(Phase::Decode), vec![Some(53.0 / 1.35), Some(30.0)]);
+    }
+
+    #[test]
+    fn the_history_is_bounded() {
+        let mut throughput = Throughput::default();
+        for _ in 0..RECENT_LEN + 10 {
+            throughput.record(sample(Phase::Decode, 10, 1.0));
+        }
+        assert_eq!(throughput.rates(Phase::Decode).len(), RECENT_LEN);
     }
 
     #[test]

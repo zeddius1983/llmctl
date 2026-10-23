@@ -171,8 +171,8 @@ impl Selector {
 /// What the right-hand column of the Session Manager shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionPane {
-    /// The selected job's facts.
-    Detail,
+    /// The selected session's live figures (a download's facts).
+    Monitor,
     /// A live tail of the selected session's log.
     Log,
 }
@@ -1161,7 +1161,7 @@ impl App {
             KeyCode::Char('c') => self.copy_endpoint(),
             KeyCode::Char('y') => self.yank_session_command(),
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => self.toggle_session_pane(),
-            KeyCode::Char('h') | KeyCode::Left => self.session_view.pane = SessionPane::Detail,
+            KeyCode::Char('h') | KeyCode::Left => self.session_view.pane = SessionPane::Monitor,
             KeyCode::Char('L') => self.open_logs(),
             KeyCode::F(5) => {
                 self.sessions.rediscover();
@@ -1797,8 +1797,8 @@ impl App {
             return;
         }
         self.session_view.pane = match self.session_view.pane {
-            SessionPane::Detail => SessionPane::Log,
-            SessionPane::Log => SessionPane::Detail,
+            SessionPane::Monitor => SessionPane::Log,
+            SessionPane::Log => SessionPane::Monitor,
         };
     }
 

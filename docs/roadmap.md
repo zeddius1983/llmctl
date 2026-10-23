@@ -335,17 +335,26 @@ on its own branch before the consolidated merge.
       now follows its longest row, so a two-column layout has that much less to
       find.
 
-### Session Manager Detail pane
-- [ ] Trim the Detail pane, which still restates the row it sits beside. Of the
-      fifteen facts it shows, the columns and the runtime heading already carry
-      nine — status, runtime, model, profile, port, size, backend, uptime, and
-      both rates. Only PID, CPU, memory, endpoint, the per-request tokens and
-      seconds behind each rate, and the command line are its own.
-      The live log tail this entry also proposed is done (ADR-017): `l`/`→`
-      swaps the pane for a tail fed by the lines `SessionManager::refresh`
-      already reads each tick. What is left is deciding what the Detail pane
-      keeps once the log is a keystroke away, and whether a download — which has
-      no log — should show anything else in that column.
+### Session Monitor (ADR-021)
+The Detail pane is replaced by a Monitor modelled on `strata monitor`'s
+Overview: session tiles, system-wide GPU/RAM, recent requests. Strata's monitor
+has seven views (Overview, Serving, Requests, Engine, Hardware, Logs, Connect);
+llmctl has the first and, in the log tail, the sixth.
+- [x] Overview prototype: decode/prefill/CPU/memory tiles with sparklines,
+      `amdgpu` busy/power/temperature, VRAM/GTT/RAM bars, recent requests
+- [x] One-line header (status · endpoint · model + context size · uptime) and
+      a context-fill bar, both from the server's log
+- [ ] Serving state from `/slots` (Idle / Generating, busy slots), sampled
+      through a background worker like the health probe. llama.cpp and Strata
+      both answer it; FastFlowLM does not
+- [ ] PID as a Session Manager column (dropped from the Monitor)
+- [ ] NVIDIA via NVML or `nvidia-smi` behind the same sampler; a GPU picker
+      when there are several (today: the one with the most VRAM)
+- [ ] More views, switched inside the pane: Requests (a table of the parsed
+      samples), Connect (client settings for OpenCode, Claude Code, …), Engine
+      (the command line and `/props`)
+- [ ] A download in that column still shows its facts. Decide whether it
+      deserves a transfer-rate sparkline
 
 ### Diffusion model support
 - [ ] Discover `llama-diffusion-cli` beside `llama-server` and on `$PATH`,

@@ -6,7 +6,10 @@
 //! derivation (`Starting`/`Running`/`Stopped`/`Crashed`), and `/proc` sampling.
 
 pub mod command;
+pub mod context;
 pub mod health;
+pub mod history;
+pub mod host;
 pub mod logtail;
 pub mod proc;
 pub mod record;
@@ -16,12 +19,14 @@ pub mod throughput;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 
 use command::Command;
 use health::Health;
+use history::Series;
+use host::HostMonitor;
 use logtail::LogTail;
 use proc::CpuSample;
 use record::{DownloadRecord, SessionRecord};
@@ -118,6 +123,11 @@ pub struct Session {
     /// Prompt-processing and token-generation rates, and the position in the
     /// server's log they are read from.
     pub throughput: Throughput,
+    /// How full the last request left the context.
+    pub context: context::ContextFill,
+    /// A minute of CPU percentage and resident memory, for the Monitor.
+    pub cpu_history: Series,
+    pub rss_history: Series,
     log_tail: LogTail,
     /// The tail of what the server has written, kept so the Session Manager can
     /// show it without re-reading the file. See [`remember`].
@@ -138,6 +148,9 @@ impl Session {
             requested_stop: false,
             last_cpu: None,
             throughput: Throughput::default(),
+            context: context::ContextFill::default(),
+            cpu_history: Series::default(),
+            rss_history: Series::default(),
             log_tail: LogTail::default(),
             recent: VecDeque::new(),
             restart_pending: None,
@@ -317,7 +330,15 @@ pub struct SessionManager {
     pub sessions: Vec<Session>,
     persistence_errors: Vec<String>,
     health_checks: health::HealthChecks,
+    /// The machine the sessions share: GPU and RAM, for the Monitor.
+    pub host: HostMonitor,
+    /// When the Monitor's histories last took a sample; see [`HISTORY_EVERY`].
+    history_at: Option<Instant>,
 }
+
+/// How often the Monitor's histories take a sample. The refresh tick is four
+/// times faster, which a sparkline a minute long has no use for.
+const HISTORY_EVERY: Duration = Duration::from_secs(1);
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -336,6 +357,8 @@ impl SessionManager {
             sessions: Vec::new(),
             persistence_errors: Vec::new(),
             health_checks: health::HealthChecks::default(),
+            host: HostMonitor::default(),
+            history_at: None,
         };
         mgr.rediscover();
         mgr
@@ -363,6 +386,8 @@ impl SessionManager {
             sessions: Vec::new(),
             persistence_errors: Vec::new(),
             health_checks: health::HealthChecks::default(),
+            host: HostMonitor::default(),
+            history_at: None,
         };
         mgr.rediscover();
         mgr
@@ -609,6 +634,7 @@ impl SessionManager {
             // The server already timed its own requests; read what it wrote
             // rather than timing anything here (see `session::throughput`).
             let parse = crate::runtime::throughput_parser(&self.sessions[idx].record.runtime);
+            let parse_context = crate::runtime::context_parser(&self.sessions[idx].record.runtime);
             let log_file = self.sessions[idx].record.log_file.clone();
             let appended = self.sessions[idx].log_tail.poll(&log_file);
             // Once a session is Running its status no longer depends on the
@@ -628,6 +654,9 @@ impl SessionManager {
             for measurement in appended.iter().flat_map(|line| parse(line)) {
                 s.throughput.record(measurement);
             }
+            for reading in appended.iter().flat_map(|line| parse_context(line)) {
+                s.context.record(reading);
+            }
             remember(&mut s.recent, &appended);
             if let Some(now) = sample {
                 if let Some(prev) = prev {
@@ -643,6 +672,32 @@ impl SessionManager {
                 _ if progress.is_some() => SessionStatus::Downloading,
                 _ => SessionStatus::Starting,
             };
+        }
+        self.sample_history();
+    }
+
+    /// Extend the Monitor's histories, once a second.
+    ///
+    /// The machine is sampled only while some session is live: there is
+    /// nothing to monitor otherwise, and reading `gpu_busy_percent` keeps a
+    /// discrete GPU from runtime-suspending.
+    fn sample_history(&mut self) {
+        let now = Instant::now();
+        if self.history_at.is_some_and(|at| now.duration_since(at) < HISTORY_EVERY) {
+            return;
+        }
+        self.history_at = Some(now);
+        let mut live = false;
+        for s in &mut self.sessions {
+            if s.status.is_terminal() || s.restart_pending.is_some() {
+                continue;
+            }
+            live = true;
+            s.cpu_history.push(s.cpu_percent);
+            s.rss_history.push(s.rss_bytes.map(|bytes| bytes as f64));
+        }
+        if live {
+            self.host.sample();
         }
     }
 

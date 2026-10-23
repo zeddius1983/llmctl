@@ -159,7 +159,7 @@ overlay.
 | `t` | Session manager |
 | `x` / `K` | Stop / kill a server; cancel a download |
 | `R` | Restart a server or resume a download |
-| `l` / `→` | Tail the session's log beside the list (again for Detail) |
+| `l` / `→` | Tail the session's log beside the list (again for the Monitor) |
 | `L` | View the log full screen |
 | `c` | Copy endpoint |
 | **General** | |
@@ -173,13 +173,33 @@ its own log — nothing to enable, and it works for sessions llmctl rediscovered
 after a restart. `tg` is token generation (decode) and `pp` is prompt processing
 (prefill), each the runtime's own figure for its most recent request rather than
 an average llmctl computed — only the server knows how much of the elapsed time
-was work rather than idling. The Detail pane adds the tokens and duration behind
-each.
+was work rather than idling.
+
+### Session monitor
+
+Beside the list, the **Monitor** shows the selected session live. The pane's
+title, ` Monitor │ Log `, highlights the view on screen, and `l` switches
+between them.
+
+- **Header.** One line: status, endpoint, model with its context size, and
+  uptime (`● Running · http://127.0.0.1:8000/v1 · gemma-4-e4b 16K · 38m 32s`).
+- **Session tiles.** Decode and prefill rates, CPU, and resident memory, each
+  with a sparkline. The rate sparklines have one point per request; CPU and
+  memory have one per second over the last minute.
+- **GPU** (AMD, read from `amdgpu` sysfs). Load, power, and temperature, plus
+  VRAM/GTT bars. These figures cover the whole machine and are labelled
+  system-wide, so two servers on one GPU show the same numbers.
+- **Context fill.** How much of the context the last request occupied, read from
+  the server's log: llama.cpp's slot lines, FastFlowLM's KV usage.
+- **RAM bar** for system memory.
+- **Recent requests.** Token counts and rates for the last few requests.
+
+llmctl samples the machine only while a session is live.
 
 Sessions are grouped under the runtime serving them, so "what have I got up on
 the NPU?" is one glance rather than a scan down a backend column. Columns are
 model, profile, port, size, compute backend, `tg`, `pp`, and uptime; a narrow
-pane sheds the least useful first, so the list never wraps and the Detail pane
+pane sheds the least useful first, so the list never wraps and the Monitor
 always has all of them. Within a row nothing is ever omitted — a session that
 has served no requests shows `tg --.-- t/s`, so its columns still line up with
 those of a busy one.

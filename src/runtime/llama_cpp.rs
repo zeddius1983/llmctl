@@ -968,6 +968,30 @@ pub fn parse_throughput(line: &str) -> Vec<Sample> {
     if sample.rate().is_none() { Vec::new() } else { vec![sample] }
 }
 
+/// Context size and use from llama-server's slot lines.
+///
+/// The size is per slot: `load_model: …, n_ctx_slot = 16384` (older builds:
+/// `new slot, n_ctx = 16384`), the context one request can fill however many
+/// slots share the KV cache. The use is the slot's whole context when a
+/// request releases it — `stop processing: n_tokens = 97` (older: `n_past`) —
+/// which counts the cached prefix that `prompt eval` leaves out.
+pub fn parse_context(line: &str) -> Vec<crate::session::context::Reading> {
+    use crate::session::context::Reading;
+    let after = |key: &str| line.split_once(key).and_then(|(_, rest)| leading_number(rest));
+    if line.contains("stop processing:") {
+        if let Some(used) = after("n_tokens =").or_else(|| after("n_past =")) {
+            return vec![Reading::Used(used as u64)];
+        }
+    } else if let Some(size) = after("n_ctx_slot =") {
+        return vec![Reading::Size(size as u64)];
+    } else if line.contains("new slot")
+        && let Some(size) = after("n_ctx =")
+    {
+        return vec![Reading::Size(size as u64)];
+    }
+    Vec::new()
+}
+
 /// The number at the start of `text`, ignoring the spaces llama.cpp pads its
 /// columns with.
 fn leading_number(text: &str) -> Option<f64> {
@@ -1437,6 +1461,34 @@ mod tests {
     #[test]
     fn a_model_whose_file_is_gone_has_nothing_to_delete() {
         assert!(local_deletion(&test_model(), &[test_model()]).is_none());
+    }
+
+    /// Verbatim lines from a real session log (b0-620d222, four slots sharing
+    /// a unified KV cache).
+    #[test]
+    fn context_size_and_use_are_read_from_the_slot_lines() {
+        use crate::session::context::Reading;
+        let load = "0.09.324.355 I srv    load_model: initializing, n_slots = 4, \
+                    n_ctx_slot = 16384, kv_unified = 'true'";
+        assert_eq!(parse_context(load), vec![Reading::Size(16384)]);
+        let release = "20.20.352.451 I slot      release: id  0 | task 2 | stop processing: \
+                       n_tokens = 48, truncated = 0";
+        assert_eq!(parse_context(release), vec![Reading::Used(48)]);
+        // Older builds.
+        assert_eq!(
+            parse_context("slot load_model: id  0 | task -1 | new slot, n_ctx = 8192"),
+            vec![Reading::Size(8192)]
+        );
+        assert_eq!(
+            parse_context(
+                "slot release: id  0 | task 7 | stop processing: n_past = 97, truncated = 0"
+            ),
+            vec![Reading::Used(97)]
+        );
+        // Picking a slot is not finishing a request in it.
+        let select = "20.19.333.318 I slot get_availabl: id  0 | task -1 | selected slot by LRU, \
+                      n_tokens = 0, t_last = -1";
+        assert!(parse_context(select).is_empty());
     }
 
     /// Verbatim lines from a real session log.

@@ -874,6 +874,26 @@ pub fn parse_throughput(line: &str) -> Vec<Sample> {
     .collect()
 }
 
+/// Context size and use from the closing usage chunk, which FastFlowLM fills
+/// with the KV cache's own figures: `active_kv_tokens` of
+/// `max_kv_token_capacity`.
+pub fn parse_context(line: &str) -> Vec<crate::session::context::Reading> {
+    use crate::session::context::Reading;
+    let Some((_, json)) = line.split_once("ChatCompletionChunk:") else { return Vec::new() };
+    let Ok(chunk) = serde_json::from_str::<serde_json::Value>(json.trim()) else {
+        return Vec::new();
+    };
+    let Some(usage) = chunk.get("usage") else { return Vec::new() };
+    let field = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64);
+    [
+        field("max_kv_token_capacity").map(Reading::Size),
+        field("active_kv_tokens").map(Reading::Used),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 /// A tag as a single filesystem-safe path segment (`qwen3:4b` → `qwen3_4b`).
 fn sanitize(tag: &str) -> String {
     tag.chars()
@@ -1258,6 +1278,16 @@ mod tests {
             ["model.q4nx", "tokenizer.json", "config.json"]
         );
         assert_eq!(commit_order(["model.q4nx"]), ["model.q4nx"]);
+    }
+
+    /// A closing chunk's usage, as a real `flm serve` log reports the KV cache.
+    #[test]
+    fn context_size_and_use_are_read_from_the_closing_chunk() {
+        use crate::session::context::Reading;
+        let line = r#"ChatCompletionChunk: {"choices":[],"usage":{"prompt_tokens":299,"completion_tokens":35,"total_tokens":334,"active_kv_tokens":334,"max_kv_token_capacity":32768,"kv_token_occupancy_rate_percentage":1.019287109375}}"#;
+        assert_eq!(parse_context(line), vec![Reading::Size(32768), Reading::Used(334)]);
+        assert!(parse_context(r#"ChatCompletionChunk: {"choices":[]}"#).is_empty());
+        assert!(parse_context("[FLM]  Creating checkpoint at context length 299").is_empty());
     }
 
     /// A verbatim closing chunk from a real `flm serve` log.

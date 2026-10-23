@@ -460,6 +460,16 @@ pub fn throughput_parser(runtime: &str) -> fn(&str) -> Vec<crate::session::throu
     }
 }
 
+/// How to read context size and use out of a runtime's log, identified only by
+/// name — for the same reason as [`throughput_parser`].
+pub fn context_parser(runtime: &str) -> fn(&str) -> Vec<crate::session::context::Reading> {
+    match runtime {
+        flm::NAME => flm::parse_context,
+        llama_cpp::NAME => llama_cpp::parse_context,
+        _ => |_| Vec::new(),
+    }
+}
+
 /// Resolve a binary to an absolute path: honor an explicit path, else search
 /// `$PATH`.
 pub(crate) fn resolve_binary(binary: &str) -> Option<std::path::PathBuf> {

@@ -28,6 +28,8 @@ use crate::domain::human_size;
 use crate::session::throughput::{Phase, format_rate};
 use crate::session::{Session, SessionStatus, format_uptime};
 
+mod monitor;
+
 const ACCENT: Color = Color::Yellow;
 
 // Nerd-font glyphs (Yazi-style), written as escapes so the codepoints survive
@@ -532,7 +534,7 @@ fn status_color(status: SessionStatus) -> Color {
 /// The Session Manager: list of servers on the left, detail on the right.
 /// The narrowest a right-hand column is worth drawing.
 ///
-/// Under this every Detail line wraps into fragments and a log tail shows a few
+/// Under this every Monitor line wraps into fragments and a log tail shows a few
 /// characters per row — the pane stops answering anything and only takes width
 /// from the list, which is the one thing on this screen that must stay legible.
 const MIN_DETAIL_WIDTH: u16 = 44;
@@ -580,7 +582,7 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
             SessionPane::Log if app.selected_server_session().is_some() => {
                 render_session_log(frame, detail, app.selected_server_session())
             }
-            _ => render_session_detail(frame, detail, app),
+            _ => render_session_monitor(frame, detail, app),
         }
     }
 
@@ -601,8 +603,8 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
         }
     } else {
         let pane = match app.session_view.pane {
-            SessionPane::Detail => ("l", "log"),
-            SessionPane::Log => ("l", "detail"),
+            SessionPane::Monitor => ("l", "log"),
+            SessionPane::Log => ("l", "monitor"),
         };
         vec![
             ("x", "stop"),
@@ -653,7 +655,7 @@ const MAX_NAME: usize = 32;
 ///
 /// Deliberately not right-to-left: the uptime sits at the far right but is
 /// worth more than the size or the backend, which never change once a session
-/// is up. The Detail pane carries every one of them regardless.
+/// is up. The Monitor carries every one of them regardless.
 const DROP_ORDER: [Column; 6] = [
     Column::Size,
     Column::Device,
@@ -952,7 +954,7 @@ fn render_download_list(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// A live tail of the selected session's log, in the column the Detail pane
+/// A live tail of the selected session's log, in the column the Monitor
 /// otherwise holds.
 ///
 /// The lines come from the ring buffer [`crate::session::SessionManager::refresh`]
@@ -963,7 +965,7 @@ fn render_download_list(frame: &mut Frame, area: Rect, app: &App) {
 /// It always shows the end of the log. `j`/`k` still move between sessions, so
 /// there is no cursor to scroll it with; `L` opens the log where there is.
 fn render_session_log(frame: &mut Frame, area: Rect, session: Option<&Session>) {
-    let block = pane_block("Log", false);
+    let block = session_pane_block(SessionPane::Log);
     let Some(session) = session else {
         frame.render_widget(block, area);
         return;
@@ -1019,14 +1021,19 @@ fn wrap_hard(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
-fn render_session_detail(frame: &mut Frame, area: Rect, app: &App) {
-    let block = pane_block("Detail", false);
-    let text = if let Some(session) = app.selected_server_session() {
-        session_detail_lines(session)
+/// The column beside the jobs list: the selected session's Monitor, or a
+/// download's facts — a transfer has no server to monitor.
+fn render_session_monitor(frame: &mut Frame, area: Rect, app: &App) {
+    let (block, text) = if let Some(session) = app.selected_server_session() {
+        let width = usize::from(area.width.saturating_sub(2));
+        (
+            session_pane_block(SessionPane::Monitor),
+            monitor::monitor_lines(session, &app.sessions.host, width),
+        )
     } else if let Some(download) = app.selected_model_download() {
-        download_detail_lines(download)
+        (pane_block("Detail", false), download_detail_lines(download))
     } else {
-        frame.render_widget(block, area);
+        frame.render_widget(session_pane_block(SessionPane::Monitor), area);
         return;
     };
     frame.render_widget(Paragraph::new(text).block(block).wrap(Wrap { trim: false }), area);
@@ -1066,69 +1073,6 @@ fn download_detail_lines(download: &ModelDownload) -> Text<'static> {
         ),
         Line::raw(""),
         Line::from(detail),
-    ])
-}
-
-/// One `pp`/`tg` line for the Detail pane: the rate, and the request it came
-/// from — the server's own summary of the last thing it did.
-fn rate_line(label: &str, session: &Session, phase: Phase) -> Line<'static> {
-    let Some(last) = session.throughput.last(phase) else {
-        return kv(label, "—");
-    };
-    let Some(rate) = last.rate() else { return kv(label, "—") };
-    Line::from(vec![
-        Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
-        Span::raw(format!(
-            "{} t/s  ({} tok in {:.2}s)",
-            format_rate(rate),
-            last.tokens,
-            last.seconds
-        )),
-    ])
-}
-
-fn session_detail_lines(session: &Session) -> Text<'static> {
-    let r = &session.record;
-    let color = status_color(session.status);
-    let uptime = session.uptime_secs().map(format_uptime).unwrap_or_else(|| "—".into());
-    let mem = session.rss_bytes.map(human_size).unwrap_or_else(|| "—".into());
-    let cpu = session.cpu_percent.map(|c| format!("{c:.0}%")).unwrap_or_else(|| "—".into());
-    // The row sheds these two first when the pane narrows, so Detail is where
-    // they have to remain readable.
-    let size = r.size_bytes.map(human_size).unwrap_or_else(|| "—".into());
-    let device = r.device.clone().unwrap_or_else(|| "—".into());
-
-    Text::from(vec![
-        Line::from(r.name.clone().bold().fg(ACCENT)),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{} {}", session.status.glyph(), session.status_label()),
-                Style::default().fg(color),
-            ),
-        ]),
-        kv("Runtime", &r.runtime),
-        kv("Model", &r.model),
-        kv("Profile", &r.profile),
-        kv("Size", &size),
-        kv("Backend", &device),
-        Line::raw(""),
-        kv("PID", &r.pid.to_string()),
-        kv("Port", &r.port.to_string()),
-        kv("Uptime", &uptime),
-        kv("Memory", &mem),
-        kv("CPU", &cpu),
-        Line::raw(""),
-        Line::from("Throughput".bold()),
-        rate_line("Prefill", session, Phase::Prefill),
-        rate_line("Decode", session, Phase::Decode),
-        Line::raw(""),
-        kv("Endpoint", &r.endpoint()),
-        kv("Log", &r.log_file.display().to_string()),
-        Line::raw(""),
-        Line::from("Command".bold()),
-        Line::from(crate::session::command::Command { argv: r.command.clone() }.display()),
     ])
 }
 
@@ -1442,6 +1386,31 @@ fn pane_block(title: &str, focused: bool) -> Block<'static> {
         .border_type(BorderType::Rounded)
         .border_style(border_style)
         .title(title)
+}
+
+/// The column beside the session list, titled with both of its views —
+/// ` Monitor │ Log ` — and the one on screen picked out, so `l` reads as a
+/// switch between two named things rather than a key to remember.
+fn session_pane_block(showing: SessionPane) -> Block<'static> {
+    let view = |name: &'static str, pane: SessionPane| {
+        if pane == showing {
+            Span::styled(
+                format!(" {name} "),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(format!(" {name} "), Style::default().fg(Color::DarkGray))
+        }
+    };
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Line::from(vec![
+            view("Monitor", SessionPane::Monitor),
+            Span::styled("│", Style::default().fg(Color::DarkGray)),
+            view("Log", SessionPane::Log),
+        ]))
 }
 
 /// A "key: value" line where the key is dimmed.

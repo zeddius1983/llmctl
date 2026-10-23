@@ -1053,3 +1053,73 @@ remain opt-in. Initial discovery still runs before the first frame, and the UI
 may briefly display its previous catalog while a refresh is pending. No Tokio
 runtime or supervisor daemon is required. Formatting, build, tests, and strict
 Clippy checks run in CI to preserve the verified baseline.
+
+---
+
+## ADR-021: The Session Manager's Monitor replaces the Detail pane
+
+**Status:** Accepted (2026-10-24).
+
+**Context:** The Detail pane beside the session list mostly restated the row it
+sat next to (see the roadmap). `strata monitor` showed what a live view of a
+server could be instead: tiles with a current value and a minute of history,
+then how full the machine is, then the latest requests. It is a full-screen
+monitor fed by Strata's own `/metrics`. llmctl's servers have no such endpoint,
+and the session list should stay visible.
+
+**Decision:** The column beside the list becomes a **Monitor**. `l`/`→` still
+swaps it for the log tail. The pane is titled ` Monitor │ Log ` with the view on
+screen highlighted, so the key reads as a switch between two named views. A
+download keeps its facts there.
+
+*Layout.* One header line, as `strata monitor` heads its view: `● Running ·
+http://127.0.0.1:8000/v1 · gemma-4-e4b 16K · 38m 32s`. That is status, the
+endpoint (what one copies out to point a client at the server), the model with
+its context size, and uptime. The model name truncates first when the pane is
+narrow. The compute backend is a column of the row beside it, and the PID is to
+become one. Next come the session tiles, the context-fill bar, the machine's
+GPU tiles and memory bars, and the recent requests. The log path and command
+are left out: `L` and `y` reach them. Each tile group draws its sparklines in its own
+colour, with blank rows between tile rows.
+
+*Sources.* Everything comes from what llmctl can read without a vendor tool or
+a server feature:
+
+- Per-session rates come from the throughput samples already parsed from the
+  log (ADR-016). `Throughput` now keeps its last sixty measurements and pairs
+  a prefill followed by a decode into one request. Both runtimes report them in
+  that order.
+- Per-session CPU and RSS come from `/proc`, as before.
+- Context size and use come from the log too, through a second per-runtime
+  parser beside the throughput one (`runtime::context_parser`).
+  - llama.cpp gives the per-slot size at load (`n_ctx_slot = 16384`) and the
+    slot's whole context when a request releases it (`stop processing:
+    n_tokens = 97`). That count includes the cached prefix, which the
+    `prompt eval` count leaves out.
+  - FastFlowLM gives both in each closing usage chunk (`active_kv_tokens` of
+    `max_kv_token_capacity`).
+  - No HTTP is needed, and a rediscovered session recovers both when its log
+    is read back.
+- The GPU comes from `amdgpu` sysfs (`gpu_busy_percent`, `mem_info_{vram,gtt}_*`,
+  hwmon temperature and power), and RAM from `/proc/meminfo`.
+
+*Cadence.* The tick stays at 250 ms, but the histories take one sample a second
+(`HISTORY_EVERY`), sixty deep. Rate histories advance per request, not per
+second, so an idle server's sparkline does not decay to zero. The machine is
+sampled only while some session is live, because reading `gpu_busy_percent`
+keeps a discrete GPU from runtime-suspending.
+
+*Honesty.* GPU and RAM figures describe the machine. They are labelled
+system-wide, not apportioned to sessions. A missing reading is a gap in the
+history, never a zero. With several GPUs the Monitor follows the one with the
+most VRAM, which an APU's carve-out never wins.
+
+*Rendering.* The Monitor is text. Sparklines and bars are block characters
+built by pure functions in `ui/monitor.rs`, so widths are unit-tested against
+the narrowest pane rather than eyeballed. Tiles go two to a row from 38 columns
+and one below that.
+
+**Consequences:** No new dependencies, endpoints, or launch flags. llama.cpp's
+`/slots` (serving state) and NVIDIA are follow-ups. A short terminal clips the
+Monitor from the bottom, so the recent requests go last. The other views Strata offers
+(Requests, Connect, Engine, …) are on the roadmap.
