@@ -529,6 +529,31 @@ progress tied to byte growth; the `Downloading` state ends when the health probe
 reports ready. A `DownloadRecord::Directory` variant would express this more
 honestly and is noted as a follow-up.
 
+**Amendment (2026-10-25): updates commit atomically.** The scratch-name scheme
+protected a *fresh* download but not an *update*.
+
+- **What went wrong.** `flm` counts a model as installed once all its files are
+  present under their real names and `config.json`'s `flm_version` meets the
+  catalog's `flm_min_version`. When a new `flm` pins a newer revision, the
+  model reads as not installed and llmctl offers the download. It used to
+  rename each file into place as soon as it finished. The small `config.json`
+  finished first, the new `flm_version` made the directory read as installed
+  over the old weights, and an interrupted transfer left a model that `flm`
+  listed as local, llmctl offered no download for, and `flm serve` died
+  loading. Seen with Qwen3.6-35B-A3B on `flm` 1.0.6.
+- **Atomic commit.** Every changed file is now fetched under its scratch name
+  first, and none is renamed until all are complete, with `config.json` last
+  (`commit_order`). An interrupted update leaves the previous revision
+  intact and loadable.
+- **Detecting unfinished transfers.** A `.llmctl-part` file beside any of a
+  model's files marks the transfer unfinished (`unfinished`), whatever `flm`
+  reports. Such a model offers `d` to resume, and its launch is refused with
+  that instruction. This also recovers directories left behind by the old
+  scheme.
+- **Known limitation.** "Already have it" still means the right size, not the
+  right content. A file that changed between revisions without changing size
+  is not re-fetched. The tree API's LFS `oid` would close that gap.
+
 ---
 
 ## ADR-014: dFlash drafters are directory-scoped companions, downloaded first

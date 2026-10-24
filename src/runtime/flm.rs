@@ -312,11 +312,20 @@ impl RuntimeBackend for FlmBackend {
     }
 
     fn download_available(&self, model: &Model) -> bool {
-        model.flm().is_some_and(|flm| !flm.installed)
+        model.flm().is_some_and(|flm| !flm.installed) || unfinished(model)
+    }
+
+    fn launch_blocker(&self, ctx: &super::LaunchContext) -> Option<String> {
+        // `flm serve` would load whatever is under the real names, which for
+        // an interrupted update is new metadata over old weights, and die.
+        unfinished(ctx.model())
+            .then(|| "its download did not finish; press d on the model to resume it".to_string())
     }
 
     fn model_transfer(&self, model: &Model) -> Option<super::ModelTransfer> {
-        if model.flm()?.installed {
+        // `installed` is `flm`'s word, and an update llmctl did not finish can
+        // leave it saying yes over a mix of two revisions; see [`unfinished`].
+        if model.flm()?.installed && !unfinished(model) {
             return None;
         }
         Some(super::ModelTransfer {
@@ -883,10 +892,13 @@ pub enum DownloadOutcome {
 /// This deliberately does not use `flm pull`: that has no resume, and `flm`
 /// does not reliably recognize a partially-downloaded model, so an interrupted
 /// pull leaves a directory that looks installed but is not. Here every file
-/// lands under a `.part` scratch name and is renamed only once it is
-/// byte-complete, which gives resume at two levels — a half-written file
-/// continues via HTTP `Range`, and a file that already exists at its expected
-/// size is skipped entirely on a later attempt.
+/// lands under a `.llmctl-part` scratch name, and none is renamed until all of
+/// them are byte-complete, `config.json` last (see [`commit_order`]). An
+/// interrupted transfer, update or fresh, therefore leaves the directory as it
+/// was, plus scratch files that mark it [`unfinished`] and resume at two levels.
+/// A half-written file continues via HTTP `Range`, and a file already present
+/// at its expected size, or fully fetched but not yet moved, is not fetched
+/// again.
 ///
 /// Placing the files here is enough: `flm list` then reports the model as
 /// installed and `flm check` validates it.
@@ -920,15 +932,27 @@ pub fn download(
     };
 
     progress(done(&sizes), total);
+    // Fetch everything first, all of it under scratch names, and only then
+    // move it into place. Until the last byte is in, the directory holds
+    // whatever it held before — nothing for a fresh model, the previous
+    // revision, still loadable, for an update — and never a mixture of the two.
+    let mut fetched: Vec<&str> = Vec::new();
     for (file, size) in &sizes {
         if cancelled.load(Ordering::Relaxed) {
             return Ok(DownloadOutcome::Cancelled);
         }
         let complete = dir.join(file);
-        if complete.metadata().is_ok_and(|m| m.len() == *size) {
-            continue; // already have it, byte for byte
-        }
         let partial = partial_path(&dir, file);
+        if complete.metadata().is_ok_and(|m| m.len() == *size) {
+            // Already have it, byte for byte. A scratch copy beside it is a
+            // leftover, and would otherwise mark the model unfinished forever.
+            let _ = std::fs::remove_file(&partial);
+            continue;
+        }
+        if partial.metadata().is_ok_and(|m| m.len() == *size) {
+            fetched.push(file); // fetched by an earlier attempt, never moved
+            continue;
+        }
         let carried = done(&sizes)
             .saturating_sub(partial.metadata().map(|m| m.len().min(*size)).unwrap_or(0));
         let transferred = hf::download_file(
@@ -944,12 +968,43 @@ pub fn download(
         if !transferred {
             return Ok(DownloadOutcome::Cancelled);
         }
-        std::fs::rename(&partial, &complete)
-            .map_err(|err| format!("completing {}: {err}", complete.display()))?;
+        fetched.push(file);
         progress(done(&sizes), total);
     }
 
+    for file in commit_order(fetched) {
+        let complete = dir.join(file);
+        std::fs::rename(partial_path(&dir, file), &complete)
+            .map_err(|err| format!("completing {}: {err}", complete.display()))?;
+    }
     Ok(DownloadOutcome::Downloaded(dir))
+}
+
+/// Whether llmctl left a transfer of this model unfinished: a scratch file
+/// beside one of its files.
+///
+/// `flm` cannot tell. It counts a model as installed once every file is present
+/// under its real name and `config.json`'s `flm_version` meets the catalog's
+/// `flm_min_version`. A fresh download stages everything under scratch names,
+/// so it never looks installed early. An update is another matter: the old
+/// revision's files already sit under the real names, so the directory looks
+/// installed the moment the new `config.json` lands, whatever state the weights
+/// are in.
+fn unfinished(model: &Model) -> bool {
+    model_dir(model).is_some_and(|dir| unfinished_in(&dir, model))
+}
+
+fn unfinished_in(dir: &Path, model: &Model) -> bool {
+    model.flm().is_some_and(|flm| flm.files.iter().any(|file| partial_path(dir, file).exists()))
+}
+
+/// The order a finished transfer moves its files into place: `config.json`
+/// last. Its `flm_version` is what tells `flm` the new revision is installed,
+/// so it must not say so while any other file is still the old revision's.
+fn commit_order<'a>(files: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut files: Vec<&str> = files.into_iter().collect();
+    files.sort_by_key(|file| *file == "config.json");
+    files
 }
 
 /// Scratch name for an in-flight file. Kept beside the real one so a resume
@@ -1169,6 +1224,40 @@ mod tests {
 
         let dir = model_dir_in(Path::new("/srv/flm"), &model).expect("an absolute root resolves");
         assert_eq!(dir.parent(), Some(Path::new("/srv/flm")));
+    }
+
+    /// Regression: an update interrupted after `config.json` was replaced left
+    /// new metadata over the old weights. `flm` reported the model installed,
+    /// so llmctl offered no download, and `flm serve` died loading it.
+    #[test]
+    fn a_scratch_file_marks_a_transfer_unfinished_whatever_flm_says() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("llmctl-flm-unfinished-{nonce}"));
+        let mut entry = entries()[0].clone();
+        entry.installed = true;
+        entry.files = vec!["config.json".into(), "model.q4nx".into()];
+        let model = entry.to_model(&local("reasoning"), &root, Path::new("/cfg"));
+        let dir = model_dir_in(&root, &model).expect("an absolute root resolves");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), b"{\"flm_version\": \"1.0.3\"}").unwrap();
+        std::fs::write(dir.join("model.q4nx"), b"old revision").unwrap();
+        assert!(!unfinished_in(&dir, &model), "a whole model is not unfinished");
+        std::fs::write(partial_path(&dir, "model.q4nx"), b"new revi").unwrap();
+        assert!(unfinished_in(&dir, &model), "a scratch file means a transfer stopped part way");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn config_json_is_moved_into_place_last() {
+        assert_eq!(
+            commit_order(["config.json", "model.q4nx", "tokenizer.json"]),
+            ["model.q4nx", "tokenizer.json", "config.json"]
+        );
+        assert_eq!(commit_order(["model.q4nx"]), ["model.q4nx"]);
     }
 
     /// A verbatim closing chunk from a real `flm serve` log.
