@@ -641,6 +641,7 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
 /// even when its content is shorter.
 const COL_PROFILE: usize = 12; // "[inquisitor]"
 const COL_PORT: usize = 6; // ":65535"
+const COL_PID: usize = 7; // "4194304", the most `pid_max` allows
 const COL_SIZE: usize = 8; // "11.3 GB"
 const COL_DEVICE: usize = 6; // "Vulkan"
 const COL_RATE: usize = 12; // "tg 67.73 t/s"
@@ -654,8 +655,9 @@ const RATE_FIGURE: usize = crate::session::throughput::RATE_WIDTH;
 const MISSING: &str = "—";
 /// Gap between columns. Wide enough that the eye reads the row as columns
 /// rather than as one run of text — the rate cells especially, which already
-/// carry a space inside them.
-const COL_GAP: usize = 4;
+/// carry a space inside them — and no wider: with eight columns, every space
+/// here costs eight that a narrow pane would rather spend on keeping one.
+const COL_GAP: usize = 3;
 /// Keep session metadata clear of the pane's right border.
 const ROW_RIGHT_PADDING: usize = 1;
 /// Below this much room for the model name, a column is not worth its space.
@@ -668,10 +670,11 @@ const MAX_NAME: usize = 32;
 /// Deliberately not right-to-left: the uptime sits at the far right but is
 /// worth more than the size or the backend, which never change once a session
 /// is up. The Monitor carries every one of them regardless.
-const DROP_ORDER: [Column; 6] = [
+const DROP_ORDER: [Column; 7] = [
     Column::Size,
     Column::Device,
     Column::Profile,
+    Column::Pid,
     Column::Prefill,
     Column::Uptime,
     Column::Decode,
@@ -681,6 +684,7 @@ const DROP_ORDER: [Column; 6] = [
 enum Column {
     Profile,
     Port,
+    Pid,
     Size,
     Device,
     Decode,
@@ -704,6 +708,10 @@ impl Column {
                 format!("[{}]", truncate_right(&session.record.profile, COL_PROFILE - 2))
             }
             Column::Port => format!(":{}", session.record.port),
+            // The server's own process, once re-acquired behind any launcher
+            // wrapper. A session that has ended has no process to name.
+            Column::Pid if session.status.is_terminal() => MISSING.into(),
+            Column::Pid => session.record.pid.to_string(),
             Column::Size => session.record.size_bytes.map(human_size).unwrap_or(MISSING.into()),
             Column::Device => session.record.device.clone().unwrap_or(MISSING.into()),
             Column::Decode => rate_cell("tg", session, Phase::Decode, now),
@@ -716,6 +724,7 @@ impl Column {
         match self {
             Column::Profile => COL_PROFILE,
             Column::Port => COL_PORT,
+            Column::Pid => COL_PID,
             Column::Size => COL_SIZE,
             Column::Device => COL_DEVICE,
             Column::Decode | Column::Prefill => COL_RATE,
@@ -728,7 +737,7 @@ impl Column {
     fn pad(self, text: &str) -> String {
         let width = self.width();
         match self {
-            Column::Size | Column::Uptime => pad_left(text, width),
+            Column::Pid | Column::Size | Column::Uptime => pad_left(text, width),
             Column::Decode | Column::Prefill => pad_right(text, width),
             _ => pad_right(text, width),
         }
@@ -761,9 +770,10 @@ fn rate_cell(label: &str, session: &Session, phase: Phase, now: Instant) -> Stri
 /// right edge and gives every row the same column starts regardless of
 /// model-name length.
 fn row_plan(width: usize, longest: usize) -> (usize, Vec<Column>) {
-    const ORDER: [Column; 7] = [
+    const ORDER: [Column; 8] = [
         Column::Profile,
         Column::Port,
+        Column::Pid,
         Column::Size,
         Column::Device,
         Column::Decode,
@@ -1717,7 +1727,7 @@ mod tests {
                 profile: "inquisitor".into(),
                 size_bytes: Some(12_100_000_000),
                 device: Some("ROCm".into()),
-                pid: 1,
+                pid: 474342,
                 host: "127.0.0.1".into(),
                 port: 8001,
                 command: vec![],
@@ -2014,6 +2024,9 @@ mod tests {
         assert!(row.width() <= 60, "{row:?}");
     }
 
+    /// A list pane wide enough for every session column.
+    const WIDE: usize = 132;
+
     /// The rows a pane of `width` draws for these sessions.
     ///
     /// One plan for the set, the way the list does it: rows that sized their
@@ -2072,7 +2085,7 @@ mod tests {
         // A pane wide enough for every column. The last row has served
         // nothing: a session without figures must still line up with one that
         // has them, which is why no column is ever omitted.
-        let width = 120;
+        let width = WIDE;
         let sessions: Vec<_> = [("a", true), ("gpt-oss-20b-q8_0", true), ("fresh", false)]
             .iter()
             .map(|(name, rates)| probe_session(name, *rates))
@@ -2086,7 +2099,7 @@ mod tests {
         // in characters, not bytes: the glyph and the ellipsis are multibyte.
         // Anchored on the labels, since the last row's figures are placeholders
         // — that they still start in the same column is exactly the point.
-        for cell in ["[inquisitor]", ":8001", "11.3 GB", "ROCm", "tg ", "pp ", "2h 34m"] {
+        for cell in ["[inquisitor]", ":8001", "474342", "11.3 GB", "ROCm", "tg ", "pp ", "2h 34m"] {
             let columns: Vec<Option<usize>> = rows
                 .iter()
                 .map(|row| row.find(cell).map(|byte| row[..byte].chars().count()))
@@ -2104,7 +2117,7 @@ mod tests {
     fn wide_characters_are_measured_in_terminal_columns() {
         use unicode_width::UnicodeWidthStr;
 
-        let width = 120;
+        let width = WIDE;
         let mut session = probe_session("通義千問-32B-指令", true);
         // Ten characters, and twice that many columns.
         session.record.profile = "深度思考模式一二三四".into();
@@ -2115,7 +2128,7 @@ mod tests {
         // The profile was cut down to its field rather than allowed to overrun.
         assert!(wide.contains('…'), "{wide:?}");
         // And every column after it starts where it does on an ASCII row.
-        for cell in [":8001", "11.3 GB", "ROCm", "tg ", "pp ", "2h 34m"] {
+        for cell in [":8001", "474342", "11.3 GB", "ROCm", "tg ", "pp ", "2h 34m"] {
             let at = |row: &str| row.find(cell).map(|byte| row[..byte].width());
             assert_eq!(at(&wide), at(&plain), "{cell} drifts: {wide:?}");
         }
@@ -2124,11 +2137,12 @@ mod tests {
     /// The requested order, left to right.
     #[test]
     fn session_columns_are_in_the_documented_order() {
-        let row = row_text(&probe_session("gpt-oss-20b-q8_0", true), 120);
+        let row = row_text(&probe_session("gpt-oss-20b-q8_0", true), WIDE);
         let order = [
             "gpt-oss-20b-q8_0",
             "[inquisitor]",
             ":8001",
+            "474342",
             "11.3 GB",
             "ROCm",
             "tg ",
@@ -2153,11 +2167,21 @@ mod tests {
             assert!(row.chars().count() <= width, "{width}: overflowed with {row:?}");
             row
         };
-        assert!(kept(120).contains("11.3 GB"), "everything fits on a wide pane");
+        let wide = kept(WIDE);
+        assert!(
+            wide.contains("11.3 GB") && wide.contains("474342"),
+            "everything fits on a wide pane"
+        );
         // Narrower: the size and the backend go before the uptime does.
         let tight = kept(80);
         assert!(!tight.contains("11.3 GB") && !tight.contains("ROCm"), "{tight}");
         assert!(tight.contains("2h 34m") && tight.contains("pp "), "{tight}");
+        // The PID outlives the static columns but not the rates.
+        let sized = |row: &str| row.contains("11.3 GB") || row.contains("ROCm");
+        let with_pid =
+            (52..WIDE).find(|w| kept(*w).contains("474342")).expect("a width with a PID");
+        assert!(!sized(&kept(with_pid)), "the PID went before the size or backend");
+        assert!(kept(with_pid).contains("pp "), "the PID went after prefill");
         // Narrower still: only the decode rate survives beside port and uptime.
         let tighter = kept(52);
         assert!(!tighter.contains("pp "), "{tighter}");
@@ -2182,8 +2206,8 @@ mod tests {
         let mut session = probe_session("legacy", true);
         session.record.size_bytes = None;
         session.record.device = None;
-        let row = row_text(&session, 120);
-        let full = row_text(&probe_session("legacy", true), 120);
+        let row = row_text(&session, WIDE);
+        let full = row_text(&probe_session("legacy", true), WIDE);
         assert_eq!(row.chars().count(), full.chars().count(), "{row:?}");
         assert_eq!(row.matches('—').count(), 2, "one dash for each missing cell: {row}");
     }

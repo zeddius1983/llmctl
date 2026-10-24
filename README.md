@@ -205,7 +205,7 @@ llmctl samples the machine only while a session is live.
 
 Sessions are grouped under the runtime serving them, so "what have I got up on
 the NPU?" is one glance rather than a scan down a backend column. Columns are
-model, profile, port, size, compute backend, `tg`, `pp`, and uptime; a narrow
+model, profile, port, PID, size, compute backend, `tg`, `pp`, and uptime; a narrow
 pane sheds the least useful first, so the list never wraps and the Monitor
 always has all of them. Within a row nothing is ever omitted — a session that
 has served no requests shows `tg --.-- t/s`, so its columns still line up with

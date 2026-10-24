@@ -82,7 +82,7 @@ impl SessionStatus {
     }
 
     /// Terminal states are not re-evaluated once reached.
-    fn is_terminal(self) -> bool {
+    pub(crate) fn is_terminal(self) -> bool {
         matches!(self, SessionStatus::Stopped | SessionStatus::Crashed)
     }
 }

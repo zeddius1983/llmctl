@@ -345,12 +345,14 @@ llmctl has the first and, in the log tail, the sixth.
 - [x] One-line header (status · endpoint · model + context size · uptime) and
       a context-fill bar, both from the server's log
 - [x] Live activity in the header's status (Reading with progress /
-      Generating with tokens) and live decode/prefill rates in tiles and list from llama.cpp's progress lines; boxed tiles; GPU
-      clock tile; the Recent requests list removed for a future Requests view
+      Generating with tokens) and live decode/prefill rates in tiles and list,
+      from llama.cpp's progress lines; boxed tiles; GPU clock tile; the Recent
+      requests list removed for a future Requests view
 - [ ] Busy-slot count across parallel requests (`/slots`, through a background
       worker like the health probe). The log's activity follows whichever
       slot reported last
-- [ ] PID as a Session Manager column (dropped from the Monitor)
+- [x] PID as a Session Manager column (dropped from the Monitor); it goes
+      after the profile and before the rates when a narrow pane sheds columns
 - [ ] NVIDIA via NVML or `nvidia-smi` behind the same sampler; a GPU picker
       when there are several (today: the one with the most VRAM)
 - [ ] More views, switched inside the pane: Requests (a table of the parsed
@@ -358,6 +360,26 @@ llmctl has the first and, in the log tail, the sixth.
       (the command line and `/props`)
 - [ ] A download in that column still shows its facts. Decide whether it
       deserves a transfer-rate sparkline
+
+Ideas for the Monitor's lower half, each for its own branch. Everything below
+comes from lines llama.cpp already logs; FastFlowLM gets what its log carries.
+- [ ] Recent requests table: age, slot, live/finished, prompt and generated
+      tokens, pp/tg, context. The running request's row updates live
+- [ ] Prompt cache reuse per request: the slot's `n_tokens` at release minus
+      the tokens `prompt eval` processed, e.g. `cache reused 97%`. A column in
+      the requests table or a tile
+- [ ] Speculative decoding tile: `draft acceptance = 0.44 (703 / 1589), mean
+      len = 4.10`, with a sparkline, to tell whether an MTP/dFlash drafter is
+      paying off
+- [ ] Session totals since start: requests served, prompt and generated
+      tokens, average decode rate
+- [ ] Slots strip: each parallel slot's state from the per-slot live tracking
+      (`0 ▶ 781 tok  1 ○ 1.2K  2 ○ —`), in place of polling `/slots`
+- [ ] Warnings and errors: a count of the server's `W`/`E` log lines and the
+      latest one
+- [ ] FastFlowLM: say why its rate tiles are empty. `flm` logs rates only for
+      streamed requests, and from 1.0.10 only with `stream_options.include_usage`.
+      Upstream: ROCm/FastFlowLM#841
 
 ### Diffusion model support
 - [ ] Discover `llama-diffusion-cli` beside `llama-server` and on `$PATH`,
