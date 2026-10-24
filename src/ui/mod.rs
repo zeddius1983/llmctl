@@ -543,10 +543,20 @@ const MIN_DETAIL_WIDTH: u16 = 44;
 
 /// Split the Session Manager's body into the jobs column and the pane beside
 /// it, which a narrow terminal does without entirely.
+///
+/// The pane takes 43% of the width and two columns more, which is what lets two
+/// of the Monitor's tiles sit side by side with room for a minute of history.
+///
+/// Whether there is a pane at all is decided on the 43% alone, so the extra
+/// columns widen the pane without bringing it onto terminals that had none.
 fn session_panes(body: Rect) -> (Rect, Option<Rect>) {
+    let share = (u32::from(body.width) * 43 / 100) as u16;
+    if share < MIN_DETAIL_WIDTH {
+        return (body, None);
+    }
     let [jobs, detail] =
-        Layout::horizontal([Constraint::Percentage(57), Constraint::Percentage(43)]).areas(body);
-    if detail.width < MIN_DETAIL_WIDTH { (body, None) } else { (jobs, Some(detail)) }
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(share + 2)]).areas(body);
+    (jobs, Some(detail))
 }
 
 fn draw_sessions(frame: &mut Frame, app: &mut App) {

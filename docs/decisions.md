@@ -1137,7 +1137,9 @@ most VRAM, which an APU's carve-out never wins.
 
 *Rendering.* The Monitor is text. Sparklines and bars are block characters
 built by pure functions in `ui/monitor.rs`, so widths are unit-tested against
-the narrowest pane rather than eyeballed. Tiles go two to a row from 38 columns
+the narrowest pane rather than eyeballed. Sparklines are two rows tall
+(`SPARK_ROWS`, sixteen levels); one row of eight flattened every history into a
+strip. Tiles go two to a row from 38 columns
 and one below that.
 
 **Consequences:** No new dependencies, endpoints, or launch flags. llama.cpp's

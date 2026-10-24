@@ -20,6 +20,9 @@ use crate::session::{Session, SessionStatus, format_uptime};
 
 /// Eighths of a cell, lowest first.
 const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// Rows a sparkline is tall. One row has only eight levels, which flattens a
+/// history into a strip; two give sixteen and room to see a trend.
+const SPARK_ROWS: usize = 2;
 /// The narrowest a tile is worth drawing: its border, a value, and enough
 /// history to see a trend in.
 const MIN_TILE: usize = 18;
@@ -324,7 +327,8 @@ fn tiles(tiles: &[Tile], width: usize, color: Color) -> Vec<Line<'static>> {
     let border = Style::default().fg(BORDER);
     let mut lines = Vec::new();
     for row in tiles.chunks(per_row) {
-        let mut rows: [Vec<Span<'static>>; 4] = Default::default();
+        // Top border, value, the sparkline's rows, bottom border.
+        let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new(); 3 + SPARK_ROWS];
         for (i, tile) in row.iter().enumerate() {
             if i > 0 {
                 for spans in &mut rows {
@@ -351,14 +355,16 @@ fn tiles(tiles: &[Tile], width: usize, color: Color) -> Vec<Line<'static>> {
             rows[1].push(Span::styled(pad_right(&value, inner), value_style.bold()));
             rows[1].push(Span::styled(" │", border));
 
-            rows[2].push(Span::styled("│ ", border));
-            rows[2].push(Span::styled(
-                spark(&tile.history, inner, tile.ceiling),
-                Style::default().fg(color),
-            ));
-            rows[2].push(Span::styled(" │", border));
+            for (n, line) in
+                spark(&tile.history, inner, tile.ceiling, SPARK_ROWS).into_iter().enumerate()
+            {
+                let spans = &mut rows[2 + n];
+                spans.push(Span::styled("│ ", border));
+                spans.push(Span::styled(line, Style::default().fg(color)));
+                spans.push(Span::styled(" │", border));
+            }
 
-            rows[3].push(Span::styled(
+            rows[2 + SPARK_ROWS].push(Span::styled(
                 format!("╰{}╯", "─".repeat(tile_width.saturating_sub(2))),
                 border,
             ));
@@ -388,21 +394,34 @@ fn peak(values: &[Option<f64>]) -> Option<f64> {
     values.iter().flatten().copied().reduce(f64::max)
 }
 
-/// The newest `width` samples as a sparkline, right-aligned so the latest is
-/// always at the edge. A gap draws as a space; with no ceiling every measured
-/// sample draws at the floor rather than inventing a scale.
-fn spark(values: &[Option<f64>], width: usize, ceiling: Option<f64>) -> String {
+/// The newest `width` samples as a sparkline `rows` tall, top row first,
+/// right-aligned so the latest is always at the edge.
+///
+/// Each sample fills its column in eighths of a cell from the bottom up, so
+/// `rows` rows give `8 × rows` levels. A measured sample is never less than
+/// the floor (`▁`), so a zero still reads as a reading rather than a gap; a
+/// gap draws as blank. With no ceiling, every measured sample draws at the
+/// floor rather than inventing a scale.
+fn spark(values: &[Option<f64>], width: usize, ceiling: Option<f64>, rows: usize) -> Vec<String> {
     let shown = &values[values.len().saturating_sub(width)..];
-    let mut out = " ".repeat(width - shown.len());
+    let levels = 8 * rows;
+    let mut out = vec![" ".repeat(width - shown.len()); rows];
     for value in shown {
-        out.push(match (value, ceiling) {
-            (None, _) => ' ',
+        let eighths = match (value, ceiling) {
+            (None, _) => 0,
             (Some(v), Some(top)) if top > 0.0 => {
-                let level = (v / top * (SPARK.len() - 1) as f64).round();
-                SPARK[level.clamp(0.0, (SPARK.len() - 1) as f64) as usize]
+                (v / top * levels as f64).round().clamp(1.0, levels as f64) as usize
             }
-            (Some(_), _) => SPARK[0],
-        });
+            (Some(_), _) => 1,
+        };
+        for (row, line) in out.iter_mut().enumerate() {
+            // Eighths held by the rows beneath this one.
+            let below = 8 * (rows - 1 - row);
+            line.push(match eighths.saturating_sub(below).min(8) {
+                0 => ' ',
+                fill => SPARK[fill - 1],
+            });
+        }
     }
     out
 }
@@ -420,19 +439,35 @@ mod tests {
 
     #[test]
     fn a_sparkline_keeps_the_newest_samples_at_the_right_edge() {
-        let values: Vec<Option<f64>> = (0..=7).map(|v| Some(v as f64)).collect();
-        assert_eq!(spark(&values, 8, Some(7.0)), "▁▂▃▄▅▆▇█");
-        assert_eq!(spark(&values, 3, Some(7.0)), "▆▇█", "older samples fall off the left");
-        assert_eq!(spark(&values[..2], 4, Some(7.0)), "  ▁▂", "a short history is right-aligned");
+        let values: Vec<Option<f64>> = (1..=8).map(|v| Some(v as f64)).collect();
+        assert_eq!(spark(&values, 8, Some(8.0), 1), ["▁▂▃▄▅▆▇█"]);
+        assert_eq!(spark(&values, 3, Some(8.0), 1), ["▆▇█"], "older samples fall off the left");
         assert_eq!(
-            spark(&[Some(3.0), None, Some(9.0)], 3, Some(3.0)),
-            "█ █",
+            spark(&values[..2], 4, Some(8.0), 1),
+            ["  ▁▂"],
+            "a short history is right-aligned"
+        );
+        assert_eq!(
+            spark(&[Some(3.0), None, Some(9.0)], 3, Some(3.0), 1),
+            ["█ █"],
             "gaps stay gaps; overshoot clamps"
         );
         assert_eq!(
-            spark(&[Some(0.0), Some(0.0)], 2, Some(0.0)),
-            "▁▁",
+            spark(&[Some(0.0), Some(0.0)], 2, Some(0.0), 1),
+            ["▁▁"],
             "a zero ceiling draws the floor"
+        );
+    }
+
+    #[test]
+    fn a_taller_sparkline_stacks_its_levels_from_the_bottom_row_up() {
+        // Sixteen levels over two rows: a quarter, a half, three quarters, full.
+        let values = [Some(0.0), Some(4.0), Some(8.0), Some(12.0), Some(16.0)];
+        assert_eq!(spark(&values, 5, Some(16.0), 2), ["   ▄█", "▁▄███"]);
+        assert_eq!(
+            spark(&[None, Some(1.0)], 3, Some(16.0), 2),
+            ["   ", "  ▁"],
+            "a gap is blank in every row, a small reading keeps the floor"
         );
     }
 
@@ -468,13 +503,16 @@ mod tests {
         for width in [MIN_TILE, 30, 2 * MIN_TILE + TILE_GAP, 42, 60, 90] {
             let lines = tiles(&four, width, Color::Cyan);
             let paired = width >= 2 * MIN_TILE + TILE_GAP;
-            // Four lines a row of boxes.
-            assert_eq!(lines.len(), if paired { 8 } else { 16 }, "{width}");
-            for row in lines.chunks(4) {
+            // Borders, value, and the sparkline's rows, per row of boxes.
+            let tall = 3 + SPARK_ROWS;
+            assert_eq!(lines.len(), if paired { 2 * tall } else { 4 * tall }, "{width}");
+            for row in lines.chunks(tall) {
                 let widths: Vec<usize> = row.iter().map(|l| text_of(l).width()).collect();
                 assert!(widths.iter().all(|w| *w == widths[0]), "{width}: ragged box {widths:?}");
                 assert!(widths[0] <= width, "{width}: {:?} overruns", text_of(&row[0]));
-                assert!(text_of(&row[0]).starts_with('╭') && text_of(&row[3]).ends_with('╯'));
+                assert!(
+                    text_of(&row[0]).starts_with('╭') && text_of(&row[tall - 1]).ends_with('╯')
+                );
             }
         }
     }
