@@ -391,5 +391,33 @@ on its own branch before the consolidated merge.
   `RuntimeBackend` trait (ADR-011) is the extension point: add a module under
   `src/runtime/` and one entry in `runtime::discover`.
 - macOS / Windows support.
+- **Strata runtime** (Qwen3.8-Flash-Next on one GPU + RAM; ADR-020). Spiked
+  2026-10-24 against Strata 0.2.3.1 and deferred until upstream matures: it
+  releases almost daily, and llmctl would depend on four of its interfaces
+  (`strata install -- … --no-start` flags, `strata serve` flags,
+  `strata models list --json`, top-level run-config keys). Revisit when
+  releases slow down or one of those interfaces is documented as stable.
+  First re-run the spike's probes against the new version. Planned work:
+  - [ ] Session record + trait hook naming the server's process `comm`
+        (`python3.12`, not `strata`) so `find_server` matches comm + derived
+        config path + port; stop must target that process, since SIGTERM to the
+        `podman exec` leader does not reach it
+  - [ ] `src/runtime/strata.rs`: discovery (version past the distrobox banner),
+        option schema split into setup-time (`context`, `kv`, `vision`) and
+        serve-time (`port`, `host`, `parallel`, `mtp`/`drafting`), templates,
+        `strata ▸ local|online ▸ <size>` catalog, `/health` readiness,
+        `device_label` from the config's `backend`, `single_session`
+  - [ ] Launch: prepare with `strata install -- … --mtp on --yes --no-start`
+        (always pass every setup option; setup remembers earlier ones), then
+        copy the base config to `~/.local/state/llmctl/strata/` with `log`,
+        `open_browser`, `mtp`/`drafting` set, then `strata serve --config …`
+  - [ ] Preparation/download of a missing size as a `Downloading` session fed
+        by setup's output
+  - [ ] `parse_throughput` for `prompt N tokens … (R tok/s), M generated …
+        (R tok/s)` (engine log, pointed at the session log)
+  - [ ] Deletion: `models/<SIZE>/`, `packs/<size>/`, base config; `mtp/` and
+        `mmproj-*` only with the last size
+  - [ ] Unit tests (models-list parsing, argv, option split, throughput),
+        an `#[ignore]`d live serve test, README/CLAUDE.md runtime list
 - Supervisor daemon / auto-restart-on-crash (see ADR-005).
 - Chat mode (server mode only for now).

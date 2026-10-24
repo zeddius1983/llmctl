@@ -1053,3 +1053,99 @@ remain opt-in. Initial discovery still runs before the first frame, and the UI
 may briefly display its previous catalog while a refresh is pending. No Tokio
 runtime or supervisor daemon is required. Formatting, build, tests, and strict
 Clippy checks run in CI to preserve the verified baseline.
+
+---
+
+## ADR-020: Strata as a delegating runtime: Strata prepares, llmctl serves
+
+**Status:** Deferred (2026-10-24): the design is agreed, but implementation
+waits until Strata's CLI settles (see the roadmap's *Deferred* section). Derived
+from a spike against Strata Terminal 0.2.3.1 (build 0.1.48.1) in the
+`strata-box` distrobox on Strix Halo, with an installed Q2_0. Re-check every
+probed fact below against the Strata version current when work resumes.
+
+**Context:** [Strata](https://github.com/Niko1221/Strata) serves one model
+family, Qwen3.8-Flash-Next (125B MoE), in about fifteen sizes (Q2_0, IQ3_XXS,
+UD-Q4_K_XL, Gyro-S, NVFP4, …). It keeps hot experts on the GPU and the rest in
+RAM. Like FastFlowLM it has a curated catalog addressed by name, not by file
+path. Unlike FastFlowLM, a model is not just downloaded files: setup builds a
+*pack* (38 GB for Q2_0), an MTP draft layer and a tokenizer from the GGUFs, and
+writes a JSON *run config* naming all of them plus derived engine arguments
+(`--kv-resident`, `--vram-reserve-mib`, …). Strata releases almost daily.
+
+Probed facts:
+
+* **Preparation** is `strata install -- --family F --model M --context N --kv K
+  --vision V --mtp on --yes --no-start`. On an installed size it takes about
+  5 s and re-checks nothing heavy. It writes the shared base config
+  `~/.local/share/strata/install/strata-<size>.json` and keeps one `.bak`.
+  Setup reads choices back from the previous config, so an option that is not
+  passed keeps its old value (`--mtp off` stuck across later runs). The base
+  config is per *size*, not per context.
+* **Setup-time vs start-time.** Only `--context`, `--kv` and `--vision` change
+  the base config's arguments, and vision also drops `--vram-reserve-mib`, so
+  these cannot be safely edited by hand. `--parallel` does not touch it.
+  `strata launch` itself copies the base config into
+  `~/.local/state/strata/launch/<name>.json` (`derive_config`, `runner.py`),
+  editing only top-level keys: `host`, `port`, `log`, `open_browser`,
+  `"mtp": false`, `"drafting"`. `serve/server.py` applies these on every start.
+* **Serving** is `strata serve --config <cfg> --host H --port P --parallel N`,
+  in the foreground. The HTTP port opens only after the engine has loaded, so
+  `GET /health` → 200 means ready (`"loaded": true`). Ready in 29 s with a warm
+  page cache.
+* **Shared files.** Everything under `mtp/` is built with `--experts q2_0` for
+  every size, and `mmproj-*.gguf` is per family. Neither belongs to one size.
+* **Processes.** Through the distrobox export, the `setsid` leader is
+  `podman exec`. The server is `python3.12 …/strata.py serve --config <cfg> …`
+  under `conmon`, in another session, and is *not* a descendant of the leader.
+  Its children `strata-host` (the engine, ~61 GiB RSS) and `strata-vision-hip`
+  each run in their own process group.
+* **Stopping.** SIGTERM to the server process drains and stops the engine,
+  vision reader and leader in 2.5 s. SIGTERM to the leader's group does **not**
+  reach the server: during load it left the server and vision reader running.
+* **Logs.** Server stdout carries `[strata] done: N tokens in S s (R tok/s)`.
+  The pp/tg pair (`prompt N tokens … (R tok/s), M generated … (R tok/s)`) goes
+  only to the config's `log`, which both engine and vision open in append mode.
+
+**Decision:**
+
+*Delegate preparation, own serving.* llmctl never downloads or edits engine
+arguments for Strata. A launch runs two steps:
+
+1. If the profile's setup-time choices (`context`, `kv`, `vision`) differ from
+   the base config, or the size is not installed, run the `strata install …
+   --no-start` line above. Always pass every setup-time option, `--mtp on`
+   included, so values left over from earlier runs never apply. Missing sizes
+   show up as a `Downloading` session fed by setup's output.
+2. Copy the base config to `~/.local/state/llmctl/strata/<profile-key>.json`,
+   changing only top-level keys: `log` (the session log), `open_browser:
+   false`, and `mtp`/`drafting`. Then spawn `strata serve --config <that>`
+   with `--host/--port/--parallel`.
+
+Step 1 rewrites the shared base config just as `strata launch` does. llmctl
+snapshots it straight away, so later rewrites never change a running or saved
+llmctl profile.
+
+*Identity.* The process token is the derived config path. Because the server's
+`comm` is `python3.12`, not the binary's name, the backend tells llmctl what to
+match through a new trait hook, defaulting to the binary's basename, which is
+stored in the session record (`serde(default)`). `find_server` then matches
+comm + config path + port. Stopping always targets the server found this way,
+never just the leader.
+
+*Catalog.* `strata ▸ local|online ▸ <size>`, virtual like FastFlowLM's
+(`profile_key = strata:<family>:<size>`). `local` comes from `strata models list
+--json`, `online` from a size table in the backend. Strata has no catalog
+command, and its tables live in `setup.py`. `single_session() = true`.
+
+*Delete* removes `models/<SIZE>/`, `packs/<size>/` and the base config, and
+removes `mtp/` and `mmproj-*` only when the last size goes.
+
+**Consequences:** This is the opposite of ADR-013, because a Strata model is
+largely *built* locally and only Strata knows how. llmctl relies on four
+interfaces: `strata install -- …` flags, `strata serve` flags, `models list
+--json`, and the top-level run-config keys. It doesn't depend on engine
+arguments. A Strata release that changes one of these breaks the backend,
+which is a risk given the release pace. A discovery-time check on `strata
+--version` should flag untested versions without refusing them. Tuning,
+presets, access (LAN/tunnels) and API keys stay with `strata launch`.
