@@ -964,8 +964,22 @@ pub fn parse_throughput(line: &str) -> Vec<Sample> {
     let Some(tokens) = rest.split_once('/').and_then(|(_, after)| leading_number(after)) else {
         return Vec::new();
     };
-    let sample = Sample { phase, tokens: tokens as u64, seconds: milliseconds / 1000.0 };
+    let sample = Sample {
+        phase,
+        tokens: tokens as u64,
+        seconds: milliseconds / 1000.0,
+        slot: slot_id(line),
+    };
     if sample.rate().is_none() { Vec::new() } else { vec![sample] }
+}
+
+/// The slot a `slot …: id  3 | task 488 | …` line is about. Parallel slots run
+/// requests side by side, and their lines interleave in one log.
+fn slot_id(line: &str) -> Option<u32> {
+    let (_, rest) = line.split_once(": id ")?;
+    let rest = rest.trim_start();
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 /// A request in progress, from the reports llama-server prints about every
@@ -987,6 +1001,7 @@ pub fn parse_live(line: &str) -> Option<crate::session::throughput::Live> {
             tokens: after("n_tokens =")? as u64,
             rate: after(" s /")?,
             progress: after("progress ="),
+            slot: slot_id(line),
         });
     }
     let tokens = after("| n_gen =").or_else(|| after("| n_decoded ="))?;
@@ -995,6 +1010,7 @@ pub fn parse_live(line: &str) -> Option<crate::session::throughput::Live> {
         tokens: tokens as u64,
         rate: after("tg_3s =").or_else(|| after(", tg ="))?,
         progress: None,
+        slot: slot_id(line),
     })
 }
 
@@ -1529,19 +1545,37 @@ mod tests {
                           tg =  28.06 t/s, tg_3s =  28.35 t/s";
         assert_eq!(
             parse_live(generating),
-            Some(Live { phase: Phase::Decode, tokens: 100, rate: 28.35, progress: None }),
+            Some(Live {
+                phase: Phase::Decode,
+                tokens: 100,
+                rate: 28.35,
+                progress: None,
+                slot: Some(0)
+            }),
             "the three-second rate is what the server is doing now"
         );
         let older = "0.13.460.646 I slot print_timing: id  3 | task 0 | n_decoded =    102, tg =  50.57 t/s";
         assert_eq!(
             parse_live(older),
-            Some(Live { phase: Phase::Decode, tokens: 102, rate: 50.57, progress: None })
+            Some(Live {
+                phase: Phase::Decode,
+                tokens: 102,
+                rate: 50.57,
+                progress: None,
+                slot: Some(3)
+            })
         );
         let reading = "4.31.551.562 I slot print_timing: id  3 | task 0 | prompt processing, \
                        n_tokens =   2048, progress = 0.76, t =   7.47 s / 274.25 tokens per second";
         assert_eq!(
             parse_live(reading),
-            Some(Live { phase: Phase::Prefill, tokens: 2048, rate: 274.25, progress: Some(0.76) })
+            Some(Live {
+                phase: Phase::Prefill,
+                tokens: 2048,
+                rate: 274.25,
+                progress: Some(0.76),
+                slot: Some(3)
+            })
         );
         // A finished request's summary is not progress.
         let summary = "2.30.023.298 I slot print_timing: id  0 | task 488 |        eval time =   \
@@ -1564,13 +1598,16 @@ mod tests {
         let prefill = parse_throughput(pp);
         assert_eq!(
             prefill,
-            vec![Sample { phase: Phase::Prefill, tokens: 3266, seconds: 10.43632 }]
+            vec![Sample { phase: Phase::Prefill, tokens: 3266, seconds: 10.43632, slot: Some(3) }]
         );
         // Divides out to the rate the server itself printed.
         assert!((prefill[0].rate().unwrap() - 312.95).abs() < 0.01);
 
         let decode = parse_throughput(tg);
-        assert_eq!(decode, vec![Sample { phase: Phase::Decode, tokens: 174, seconds: 9.37948 }]);
+        assert_eq!(
+            decode,
+            vec![Sample { phase: Phase::Decode, tokens: 174, seconds: 9.37948, slot: Some(3) }]
+        );
         assert!((decode[0].rate().unwrap() - 18.55).abs() < 0.01);
     }
 

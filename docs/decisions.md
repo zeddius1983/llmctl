@@ -1105,6 +1105,11 @@ a server feature:
   ten seconds without another, so a cancelled request cannot leave a session
   looking busy. A runtime that never reports progress (FastFlowLM) keeps its
   plain status.
+  - Live readings are kept per server slot (llama.cpp's `id N` on every slot
+    line), and a summary ends only the request in its own slot. Parallel
+    slots interleave their lines in one log, and one request finishing must
+    not make another still generating read as idle. With several running,
+    the one that reported last speaks for the session.
 - Context size and use come from the log too, through a second per-runtime
   parser beside the throughput one (`runtime::context_parser`).
   - llama.cpp gives the per-slot size at load (`n_ctx_slot = 16384`) and the
@@ -1113,8 +1118,9 @@ a server feature:
     `prompt eval` count leaves out.
   - FastFlowLM gives both in each closing usage chunk (`active_kv_tokens` of
     `max_kv_token_capacity`).
-  - No HTTP is needed, and a rediscovered session recovers both when its log
-    is read back.
+  - No HTTP is needed. A rediscovered session's log tail resumes near the end
+    of the file, past llama.cpp's one-off load line, so its capacity is read
+    from the first 256 KiB of the log instead (`context::capacity_from_head`).
 - The GPU comes from `amdgpu` sysfs (`gpu_busy_percent`, `mem_info_{vram,gtt}_*`,
   hwmon temperature and power), and RAM from `/proc/meminfo`.
 

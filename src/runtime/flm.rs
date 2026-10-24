@@ -862,6 +862,8 @@ pub fn parse_throughput(line: &str) -> Vec<Sample> {
             phase,
             tokens: usage.get(tokens)?.as_u64()?,
             seconds: usage.get(duration)?.as_f64()?,
+            // `flm serve` runs one request at a time.
+            slot: None,
         };
         sample.rate().is_some().then_some(sample)
     };

@@ -1684,8 +1684,18 @@ mod tests {
         use crate::session::throughput::{Phase, Sample, Throughput};
         let mut throughput = Throughput::default();
         if rates {
-            throughput.record(Sample { phase: Phase::Prefill, tokens: 3266, seconds: 2.292 });
-            throughput.record(Sample { phase: Phase::Decode, tokens: 174, seconds: 2.569 });
+            throughput.record(Sample {
+                phase: Phase::Prefill,
+                tokens: 3266,
+                seconds: 2.292,
+                slot: None,
+            });
+            throughput.record(Sample {
+                phase: Phase::Decode,
+                tokens: 174,
+                seconds: 2.569,
+                slot: None,
+            });
         }
         crate::session::Session::probe(
             SessionRecord {
@@ -2029,14 +2039,20 @@ mod tests {
         let finished = rows_text(std::slice::from_ref(&session), 160).remove(0);
         assert!(finished.contains("tg 67.73 t/s"), "{finished}");
 
-        let live = Live { phase: Phase::Decode, tokens: 865, rate: 29.75, progress: None };
+        let live =
+            Live { phase: Phase::Decode, tokens: 865, rate: 29.75, progress: None, slot: None };
         session.throughput.record_live(live, std::time::Instant::now());
         let running = rows_text(std::slice::from_ref(&session), 160).remove(0);
         assert!(running.contains("tg 29.75 t/s"), "{running}");
         assert!(running.contains("pp  1425 t/s"), "prefill keeps its last figure: {running}");
         assert_eq!(running.width(), finished.width(), "a live figure keeps the columns in line");
 
-        session.throughput.record(Sample { phase: Phase::Decode, tokens: 931, seconds: 26.92 });
+        session.throughput.record(Sample {
+            phase: Phase::Decode,
+            tokens: 931,
+            seconds: 26.92,
+            slot: None,
+        });
         let done = rows_text(std::slice::from_ref(&session), 160).remove(0);
         assert!(done.contains("tg 34.58 t/s"), "{done}");
     }

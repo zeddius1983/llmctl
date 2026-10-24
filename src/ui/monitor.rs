@@ -513,7 +513,8 @@ mod tests {
         let mut session = running_session();
         session.record.name = "nvidia-nemotron-3-5-bolt-74b-a9b-ud-q3_k_xl".into();
         session.context.record(Reading::Size(64_512));
-        let generating = Live { phase: Phase::Decode, tokens: 215, rate: 35.0, progress: None };
+        let generating =
+            Live { phase: Phase::Decode, tokens: 215, rate: 35.0, progress: None, slot: None };
         session.throughput.record_live(generating, now);
 
         let wide = text_of(&header(&session, 120, now));
@@ -542,16 +543,27 @@ mod tests {
             "a runtime that never reports progress"
         );
 
-        let reading =
-            Live { phase: Phase::Prefill, tokens: 2048, rate: 274.0, progress: Some(0.76) };
+        let reading = Live {
+            phase: Phase::Prefill,
+            tokens: 2048,
+            rate: 274.0,
+            progress: Some(0.76),
+            slot: None,
+        };
         session.throughput.record_live(reading, now);
         assert_eq!(status(&session, now).content, "▶ Reading 76%");
 
-        let generating = Live { phase: Phase::Decode, tokens: 781, rate: 29.75, progress: None };
+        let generating =
+            Live { phase: Phase::Decode, tokens: 781, rate: 29.75, progress: None, slot: None };
         session.throughput.record_live(generating, now);
         assert_eq!(status(&session, now).content, "▶ Generating 781 tokens", "and no rate");
 
-        session.throughput.record(Sample { phase: Phase::Decode, tokens: 931, seconds: 26.9 });
+        session.throughput.record(Sample {
+            phase: Phase::Decode,
+            tokens: 931,
+            seconds: 26.9,
+            slot: None,
+        });
         assert_eq!(status(&session, now).content, "● Running", "between requests");
 
         session.throughput.record_live(generating, now);

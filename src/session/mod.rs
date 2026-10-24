@@ -407,7 +407,13 @@ impl SessionManager {
                     SessionStatus::Starting
                 };
                 self.health_checks.request(probe_key(&record));
-                self.sessions.push(Session::new(record, status));
+                let mut session = Session::new(record, status);
+                // The log tail resumes near the end of the file, past the
+                // lines a server prints once at load; see
+                // `context::capacity_from_head`.
+                let parse = crate::runtime::log_parsers(&session.record.runtime).context;
+                session.context.size = context::capacity_from_head(&session.record.log_file, parse);
+                self.sessions.push(session);
             } else {
                 record.delete(&self.dir);
             }
@@ -1377,6 +1383,7 @@ mod tests {
             phase: throughput::Phase::Decode,
             tokens: 100,
             seconds: 2.0,
+            slot: None,
         });
 
         mgr.restart(0).expect("restart");

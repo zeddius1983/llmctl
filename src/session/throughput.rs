@@ -34,6 +34,9 @@ pub struct Sample {
     pub tokens: u64,
     /// Seconds of work, not of wall clock.
     pub seconds: f64,
+    /// The server slot that ran the request, where the runtime numbers them
+    /// (llama.cpp's `id N`), so its summary ends that request and no other.
+    pub slot: Option<u32>,
 }
 
 impl Sample {
@@ -54,6 +57,8 @@ pub struct Live {
     pub rate: f64,
     /// How much of the prompt is processed, 0–1. Prefill only.
     pub progress: Option<f64>,
+    /// The server slot running it; see [`Sample::slot`].
+    pub slot: Option<u32>,
 }
 
 /// What a session is doing, as far as its log says.
@@ -82,7 +87,10 @@ pub struct Throughput {
     last_decode: Option<Sample>,
     /// Oldest first: every rate reported, live and final, by phase.
     history: VecDeque<(Phase, f64)>,
-    live: Option<(Live, Instant)>,
+    /// Requests in progress, one per slot, least recently reported first.
+    /// Parallel slots run requests side by side, and each one's summary ends
+    /// only its own.
+    live: Vec<(Live, Instant)>,
     /// Whether this runtime reports requests in progress at all. One that does
     /// not (FastFlowLM) cannot be said to be idle, only silent.
     reports_live: bool,
@@ -99,14 +107,12 @@ impl Throughput {
             Phase::Decode => self.last_decode = Some(sample),
         }
         self.push(sample.phase, rate);
-        // The summary ends the phase it describes; a decode summary ends the
-        // request, since it is printed after the prefill's.
-        if self
-            .live
-            .is_some_and(|(live, _)| sample.phase == Phase::Decode || live.phase == sample.phase)
-        {
-            self.live = None;
-        }
+        // The summary ends the phase it describes in its own slot; a decode
+        // summary ends the request, since it is printed after the prefill's.
+        self.live.retain(|(live, _)| {
+            live.slot != sample.slot
+                || (sample.phase == Phase::Prefill && live.phase == Phase::Decode)
+        });
     }
 
     /// A progress report from a request still running, received at `now`.
@@ -116,7 +122,12 @@ impl Throughput {
         }
         self.reports_live = true;
         self.push(live.phase, live.rate);
-        self.live = Some((live, now));
+        // A slot runs one request at a time, so its newest report replaces
+        // its last; reports gone stale are dropped on the way.
+        self.live.retain(|(other, at)| {
+            other.slot != live.slot && now.saturating_duration_since(*at) < LIVE_FOR
+        });
+        self.live.push((live, now));
     }
 
     fn push(&mut self, phase: Phase, rate: f64) {
@@ -139,25 +150,31 @@ impl Throughput {
         if !self.reports_live {
             return None;
         }
-        Some(match self.live_at(now) {
-            Some(live) if live.phase == Phase::Prefill => Activity::Reading(live),
-            Some(live) => Activity::Generating(live),
+        // With several requests running, the one that reported last speaks
+        // for the session.
+        Some(match self.live_at(now).last() {
+            Some(live) if live.phase == Phase::Prefill => Activity::Reading(*live),
+            Some(live) => Activity::Generating(*live),
             None => Activity::Idle,
         })
     }
 
-    fn live_at(&self, now: Instant) -> Option<Live> {
-        let (live, at) = self.live?;
-        (now.saturating_duration_since(at) < LIVE_FOR).then_some(live)
+    /// The requests still in progress at `now`, least recently reported first.
+    fn live_at(&self, now: Instant) -> Vec<Live> {
+        self.live
+            .iter()
+            .filter(|(_, at)| now.saturating_duration_since(*at) < LIVE_FOR)
+            .map(|(live, _)| *live)
+            .collect()
     }
 
     /// The rate to show for `phase` at `now`: the request in progress if it is
     /// in that phase, else the last finished one. The second is whether it is
     /// live.
     pub fn current(&self, phase: Phase, now: Instant) -> Option<(f64, bool)> {
-        match self.live_at(now) {
-            Some(live) if live.phase == phase => Some((live.rate, true)),
-            _ => self.rate(phase).map(|rate| (rate, false)),
+        match self.live_at(now).into_iter().rev().find(|live| live.phase == phase) {
+            Some(live) => Some((live.rate, true)),
+            None => self.rate(phase).map(|rate| (rate, false)),
         }
     }
 
@@ -214,11 +231,11 @@ mod tests {
     use super::*;
 
     fn sample(phase: Phase, tokens: u64, seconds: f64) -> Sample {
-        Sample { phase, tokens, seconds }
+        Sample { phase, tokens, seconds, slot: None }
     }
 
     fn live(phase: Phase, tokens: u64, rate: f64) -> Live {
-        Live { phase, tokens, rate, progress: None }
+        Live { phase, tokens, rate, progress: None, slot: None }
     }
 
     #[test]
@@ -268,6 +285,41 @@ mod tests {
             None,
             "nothing finished to fall back on"
         );
+    }
+
+    /// Regression: with two slots busy, slot B's summary cleared slot A's live
+    /// reading, so the session read as idle while A was still generating.
+    #[test]
+    fn a_summary_ends_only_the_request_in_its_own_slot() {
+        let t0 = Instant::now();
+        let in_slot = |slot, rate| Live { slot: Some(slot), ..live(Phase::Decode, 100, rate) };
+        let mut throughput = Throughput::default();
+        throughput.record_live(in_slot(0, 28.0), t0);
+        throughput.record_live(in_slot(1, 40.0), t0);
+        assert_eq!(throughput.current(Phase::Decode, t0), Some((40.0, true)), "the latest report");
+
+        throughput.record(Sample { slot: Some(1), ..sample(Phase::Decode, 931, 26.9) });
+        assert!(
+            matches!(throughput.activity(t0), Some(Activity::Generating(l)) if l.slot == Some(0)),
+            "slot 0 is still generating"
+        );
+        assert_eq!(throughput.current(Phase::Decode, t0), Some((28.0, true)));
+
+        // A slot's prefill summary leaves its own decode running.
+        throughput.record(Sample { slot: Some(0), ..sample(Phase::Prefill, 19, 0.3) });
+        assert_eq!(throughput.current(Phase::Decode, t0), Some((28.0, true)));
+        throughput.record(Sample { slot: Some(0), ..sample(Phase::Decode, 400, 14.0) });
+        assert_eq!(throughput.activity(t0), Some(Activity::Idle));
+    }
+
+    #[test]
+    fn a_slot_reports_one_request_at_a_time() {
+        let t0 = Instant::now();
+        let mut throughput = Throughput::default();
+        throughput.record_live(Live { slot: Some(2), ..live(Phase::Prefill, 512, 300.0) }, t0);
+        throughput.record_live(Live { slot: Some(2), ..live(Phase::Decode, 10, 30.0) }, t0);
+        assert_eq!(throughput.live.len(), 1, "the slot moved on from prefill to decode");
+        assert_eq!(throughput.current(Phase::Prefill, t0), None, "no prefill left in progress");
     }
 
     #[test]
