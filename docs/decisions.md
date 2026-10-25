@@ -1137,6 +1137,16 @@ the narrowest pane rather than eyeballed. Sparklines are two rows tall
 (`SPARK_ROWS`, sixteen levels); one row of eight flattened every history into a
 strip. Tiles go two to a row from 38 columns and one below that.
 
+*Mouse (2026-10-26).* llmctl captures the mouse so the wheel scrolls what is
+under the pointer: the browser's lists, the session list, the Log pane beside
+it (which keeps its last 200 lines and otherwise follows the tail, with `↓ N
+more rows` on its border while scrolled back), and the full-screen log.
+Without capture, terminals turn the wheel into arrow keys, which moved the
+session list whatever the pointer was over. Clicks are not used, and an open
+popup ignores the wheel. Capture is released around foreground tools (chat,
+benchmark), on exit, and by a panic hook. The cost is the usual one: selecting
+text with the mouse needs Shift held.
+
 *Machine figures: tried and removed (2026-10-26).* The first cut also showed
 the session's CPU and RSS, the GPU (busy, clock, power, temperature), VRAM/GTT
 and RAM bars, and PCIe link and throughput. All of it went: it duplicated what

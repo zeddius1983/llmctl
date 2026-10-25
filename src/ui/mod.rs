@@ -586,6 +586,9 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
     // The key handler reads this: with no pane to swap, `l` opens the log full
     // screen rather than doing nothing.
     app.session_view.detail_pane_visible = detail.is_some();
+    // And the mouse handler these, to scroll whichever the pointer is over.
+    app.session_view.list_area = Some(jobs);
+    app.session_view.detail_area = detail;
     let [sessions, downloads] =
         Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(jobs);
     let focused = app.selected_server_session().is_some() || app.async_job_count() == 0;
@@ -601,7 +604,9 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
         match app.session_view.pane {
             // A download has no log, so its facts hold the column either way.
             SessionPane::Log if app.selected_server_session().is_some() => {
-                render_session_log(frame, detail, app.selected_server_session())
+                let back = app.session_view.pane_log_back;
+                app.session_view.pane_log_back =
+                    render_session_log(frame, detail, app.selected_server_session(), back);
             }
             _ => render_session_monitor(frame, detail, app),
         }
@@ -1011,13 +1016,20 @@ fn render_download_list(frame: &mut Frame, area: Rect, app: &App) {
 /// files reach tens of megabytes, and re-reading one each frame is what the
 /// full-screen view does and can afford to, because nothing else is on screen.
 ///
-/// It always shows the end of the log. `j`/`k` still move between sessions, so
-/// there is no cursor to scroll it with; `L` opens the log where there is.
-fn render_session_log(frame: &mut Frame, area: Rect, session: Option<&Session>) {
-    let block = session_pane_block(SessionPane::Log);
+/// It shows the end of the log, or `back` rows before it once the mouse wheel
+/// has scrolled it. `j`/`k` still move between sessions, so the keyboard has
+/// no cursor to scroll it with; `L` opens the log where there is. Returns
+/// `back` clamped to what the log holds.
+fn render_session_log(
+    frame: &mut Frame,
+    area: Rect,
+    session: Option<&Session>,
+    back: usize,
+) -> usize {
+    let mut block = session_pane_block(SessionPane::Log);
     let Some(session) = session else {
         frame.render_widget(block, area);
-        return;
+        return 0;
     };
     let width = area.width.saturating_sub(2) as usize;
     let height = area.height.saturating_sub(2) as usize;
@@ -1025,11 +1037,19 @@ fn render_session_log(frame: &mut Frame, area: Rect, session: Option<&Session>) 
     // Wrapped here rather than by `Wrap`, because the pane shows the *last*
     // rows and only a row count we did ourselves says which those are.
     let mut rows: Vec<String> = Vec::new();
-    for line in session.recent_log(height) {
+    for line in session.recent_log(usize::MAX) {
         rows.extend(wrap_hard(line, width));
     }
+    let back = back.min(rows.len().saturating_sub(height));
+    rows.truncate(rows.len() - back);
     if rows.len() > height {
         rows = rows.split_off(rows.len() - height);
+    }
+    if back > 0 {
+        block = block.title_bottom(
+            Line::styled(format!(" ↓ {back} more rows "), Style::default().fg(Color::DarkGray))
+                .right_aligned(),
+        );
     }
 
     let text = if rows.is_empty() {
@@ -1038,6 +1058,7 @@ fn render_session_log(frame: &mut Frame, area: Rect, session: Option<&Session>) 
         Text::from(rows.into_iter().map(Line::raw).collect::<Vec<_>>())
     };
     frame.render_widget(Paragraph::new(text).block(block), area);
+    back
 }
 
 /// Break `text` into rows of at most `width` terminal columns.
@@ -1278,6 +1299,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::raw(""),
         Line::from("General".bold()),
         help_row("F5", "rescan / reload"),
+        help_row("wheel", "scroll the list or log under the pointer"),
         help_row("? / q", "help / quit"),
         Line::raw(""),
         Line::from("press ? or Esc to close".dim().italic()),
@@ -1824,6 +1846,47 @@ mod tests {
         assert!(rows[heading + 3].contains("▌"), "cursor row: {:?}", rows[heading + 3]);
     }
 
+    /// Scrolled back by the wheel, the pane shows earlier rows and says how
+    /// many lie below; scrolled past the start, it stops at the first row.
+    #[test]
+    fn the_log_pane_scrolls_back_from_the_tail_and_stops_at_the_start() {
+        let lines: Vec<String> = (0..20).map(|i| format!("line {i:02}")).collect();
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let session = probe_session("muse", false).with_log(&lines);
+        // Four rows inside the border.
+        let draw = |back: usize| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 6)).unwrap();
+            let mut clamped = 0;
+            terminal
+                .draw(|frame| {
+                    clamped = render_session_log(frame, frame.area(), Some(&session), back);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let rows: Vec<String> = (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width).map(|x| buffer[(x, y)].symbol().to_string()).collect()
+                })
+                .collect();
+            (clamped, rows)
+        };
+
+        let (back, rows) = draw(0);
+        assert_eq!(back, 0);
+        assert!(rows[1].contains("line 16") && rows[4].contains("line 19"), "{rows:#?}");
+        assert!(!rows[5].contains("more rows"), "at the tail there is nothing below");
+
+        let (back, rows) = draw(5);
+        assert_eq!(back, 5);
+        assert!(rows[1].contains("line 11") && rows[4].contains("line 14"), "{rows:#?}");
+        assert!(rows[5].contains("↓ 5 more rows"), "{rows:#?}");
+
+        let (back, rows) = draw(999);
+        assert_eq!(back, 16, "clamped to the first screenful");
+        assert!(rows[1].contains("line 00"), "{rows:#?}");
+    }
+
     /// The pane is a tail: it shows the end of the log, and a line too long for
     /// the column wraps inside it rather than over the border beside it.
     #[test]
@@ -1836,7 +1899,11 @@ mod tests {
         ]);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
-        terminal.draw(|frame| render_session_log(frame, frame.area(), Some(&session))).unwrap();
+        terminal
+            .draw(|frame| {
+                render_session_log(frame, frame.area(), Some(&session), 0);
+            })
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rows: Vec<String> = (0..buffer.area.height)
             .map(|y| {
@@ -1864,7 +1931,11 @@ mod tests {
     fn an_unlogged_selection_leaves_an_empty_pane() {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 5)).unwrap();
-        terminal.draw(|frame| render_session_log(frame, frame.area(), None)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_session_log(frame, frame.area(), None, 0);
+            })
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let screen: String = (0..buffer.area.height)
             .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))

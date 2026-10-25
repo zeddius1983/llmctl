@@ -20,7 +20,9 @@ use downloads::{restore_model_downloads, transfer_percent};
 use session_view::SessionViewState;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use ratatui::DefaultTerminal;
 use ratatui::widgets::ListState;
 
@@ -419,11 +421,12 @@ impl App {
                 self.tick();
             }
             terminal.draw(|frame| ui::draw(frame, self))?;
-            if event::poll(Duration::from_millis(250))?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                self.on_key(key);
+            if event::poll(Duration::from_millis(250))? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key(key),
+                    Event::Mouse(mouse) => self.on_mouse(mouse),
+                    _ => {}
+                }
             }
             // A chat request hands the terminal to llama-cli, then we re-enter.
             if let Some(argv) = self.pending_chat.take() {
@@ -1220,6 +1223,54 @@ impl App {
 
     fn move_session(&mut self, delta: isize) {
         self.session_view.move_selection(delta, self.async_job_count());
+        // The scroll-back belongs to the log that was on screen.
+        self.session_view.pane_log_back = 0;
+    }
+
+    /// The mouse wheel scrolls whatever the pointer is over: the browser's
+    /// lists, the session list, the Log pane beside it, or the full-screen
+    /// log. Clicks are not used. While a popup is open the wheel does nothing,
+    /// so it cannot answer a prompt or dismiss a message by accident.
+    fn on_mouse(&mut self, mouse: MouseEvent) {
+        let delta: isize = match mouse.kind {
+            MouseEventKind::ScrollUp => -1,
+            MouseEventKind::ScrollDown => 1,
+            _ => return,
+        };
+        if self.modals.message.is_some()
+            || self.modals.confirm().is_some()
+            || self.modals.prompt().is_some()
+            || self.modals.selector().is_some()
+            || self.modals.search().is_some()
+            || self.modals.help()
+        {
+            return;
+        }
+        let over = |area: Option<ratatui::layout::Rect>| {
+            area.is_some_and(|a| {
+                a.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+            })
+        };
+        match self.screen {
+            Screen::Browser => self.move_selection(delta),
+            Screen::Sessions if over(self.session_view.detail_area) => {
+                if self.session_view.pane == SessionPane::Log
+                    && self.selected_server_index().is_some()
+                {
+                    // Rows back from the tail: up scrolls further back. The
+                    // renderer clamps it to what the log holds.
+                    let back = self.session_view.pane_log_back as isize - delta * WHEEL_ROWS;
+                    self.session_view.pane_log_back = back.max(0) as usize;
+                }
+            }
+            Screen::Sessions if over(self.session_view.list_area) => self.move_session(delta),
+            Screen::Sessions => {}
+            Screen::Logs => {
+                self.session_view.log_follow = false;
+                let scroll = self.session_view.log_scroll as isize + delta * WHEEL_ROWS;
+                self.session_view.log_scroll = scroll.clamp(0, u16::MAX as isize) as u16;
+            }
+        }
     }
 
     /// Build a launch request from the current selection and resolved options.
@@ -1800,6 +1851,7 @@ impl App {
             SessionPane::Monitor => SessionPane::Log,
             SessionPane::Log => SessionPane::Monitor,
         };
+        self.session_view.pane_log_back = 0;
     }
 
     /// Open the log-tail screen for the selected session (`L`).
@@ -3165,6 +3217,23 @@ fn option_value(options: &[OptionItem], key: &str) -> Option<String> {
     options.iter().find(|o| o.spec.key == key).map(|o| o.value.clone())
 }
 
+/// Log rows one notch of the mouse wheel scrolls.
+const WHEEL_ROWS: isize = 3;
+
+/// Enter the TUI: raw mode, the alternate screen, and mouse capture so the
+/// wheel arrives as scroll events rather than as arrow keys.
+pub fn init_terminal() -> DefaultTerminal {
+    let terminal = ratatui::init();
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    terminal
+}
+
+/// Leave the TUI, giving the terminal its mouse back first.
+pub fn restore_terminal() {
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    ratatui::restore();
+}
+
 /// Hand the terminal to a foreground tool, then re-enter the TUI.
 fn run_foreground(terminal: &mut DefaultTerminal, argv: &[String], label: &str) -> Result<()> {
     use std::process::Command as StdCommand;
@@ -3172,7 +3241,7 @@ fn run_foreground(terminal: &mut DefaultTerminal, argv: &[String], label: &str) 
         return Ok(());
     };
 
-    ratatui::restore(); // leave the alternate screen + raw mode
+    restore_terminal(); // leave the alternate screen, raw mode and mouse capture
     let status = StdCommand::new(prog).args(args).status();
 
     if let Err(e) = &status {
@@ -3181,7 +3250,7 @@ fn run_foreground(terminal: &mut DefaultTerminal, argv: &[String], label: &str) 
     eprintln!("\n[llmctl] {label} ended — press Enter to return to llmctl.");
     let _ = std::io::stdin().read_line(&mut String::new());
 
-    *terminal = ratatui::init();
+    *terminal = init_terminal();
     terminal.clear()?;
     Ok(())
 }
@@ -4063,5 +4132,82 @@ mod tests {
             &["online".into(), "huggingface".into()],
             true
         ));
+    }
+
+    /// The wheel scrolls what the pointer is over: the Log pane beside the
+    /// list scrolls back, the list moves between sessions (and leaves the
+    /// scroll-back behind), and an open popup takes nothing.
+    #[test]
+    fn the_mouse_wheel_scrolls_what_the_pointer_is_over() {
+        use crate::session::record::SessionRecord;
+        use crate::session::{Session, SessionStatus};
+        use crossterm::event::KeyModifiers as Mods;
+        use ratatui::layout::Rect;
+
+        let stamp =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("llmctl-wheel-{stamp}"));
+        let paths = Paths {
+            config_file: root.join("config.toml"),
+            models_dir: root.join("models"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+            sessions_dir: root.join("sessions"),
+        };
+        paths.ensure_dirs().unwrap();
+        let mut app = App::with_runtimes(Config::default(), paths, vec![], |paths| {
+            SessionManager::without_supervisor(paths.sessions_dir.clone(), paths.log_dir.clone())
+        });
+        for (id, port) in [("1", 8001), ("2", 8002)] {
+            app.sessions.sessions.push(Session::probe(
+                SessionRecord {
+                    id: id.into(),
+                    name: format!("s{id}"),
+                    runtime: "llama.cpp".into(),
+                    model: "m".into(),
+                    model_path: "m".into(),
+                    profile: "Default".into(),
+                    size_bytes: None,
+                    device: None,
+                    pid: -1,
+                    host: "127.0.0.1".into(),
+                    port,
+                    command: vec![],
+                    health_path: "/health".into(),
+                    log_file: Default::default(),
+                    download: None,
+                    started_unix: 0,
+                },
+                SessionStatus::Running,
+                Default::default(),
+            ));
+        }
+        app.screen = Screen::Sessions;
+        app.session_view.selection.select(Some(0));
+        app.session_view.pane = SessionPane::Log;
+        app.session_view.list_area = Some(Rect::new(0, 1, 60, 30));
+        app.session_view.detail_area = Some(Rect::new(60, 1, 40, 30));
+        let wheel = |kind, column| MouseEvent { kind, column, row: 5, modifiers: Mods::NONE };
+
+        app.on_mouse(wheel(MouseEventKind::ScrollUp, 70));
+        assert_eq!(app.session_view.pane_log_back, 3, "up over the log scrolls back");
+        assert_eq!(app.session_view.selection.selected(), Some(0), "and leaves the list alone");
+        app.on_mouse(wheel(MouseEventKind::ScrollDown, 70));
+        assert_eq!(app.session_view.pane_log_back, 0, "down returns to the tail");
+        app.on_mouse(wheel(MouseEventKind::ScrollDown, 70));
+        assert_eq!(app.session_view.pane_log_back, 0, "and no further");
+
+        app.on_mouse(wheel(MouseEventKind::ScrollUp, 70));
+        app.on_mouse(wheel(MouseEventKind::ScrollDown, 10));
+        assert_eq!(app.session_view.selection.selected(), Some(1), "over the list it moves");
+        assert_eq!(app.session_view.pane_log_back, 0, "the old log's scroll-back is dropped");
+
+        app.modals.message = Some(Message { title: "t".into(), lines: vec![] });
+        app.on_mouse(wheel(MouseEventKind::ScrollUp, 10));
+        assert_eq!(app.session_view.selection.selected(), Some(1), "a popup takes no wheel");
+        assert!(app.modals.message.is_some(), "and is not dismissed by it");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
