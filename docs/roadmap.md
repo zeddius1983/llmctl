@@ -410,9 +410,12 @@ From the default log:
 - [ ] Thinking time: `reasoning-budget: activated` / `deactivated` are
       timestamped (`thought 19 s of 37 s`). They carry no slot id, so only
       attributable with one request in flight
-- [ ] FastFlowLM: say why its rate tiles are empty. `flm` logs rates only for
-      streamed requests, and from 1.0.10 only with `stream_options.include_usage`.
-      Upstream: ROCm/FastFlowLM#841
+- [x] FastFlowLM rates and context fill on flm 1.0.10: the closing chunk no
+      longer carries `usage`; a separate `Usage: {…}` line follows it, for
+      every streamed request in the logs checked. Both forms are read
+- [ ] FastFlowLM non-streamed requests: none in the logs checked, so whether
+      they log usage is unknown (earlier versions logged rates only for
+      streamed requests; upstream ROCm/FastFlowLM#841)
 
 Needs `-lv 4` (agreed 2026-10-26: llmctl may launch llama.cpp at that level):
 - [ ] Launch llama.cpp with `-lv 4`. Measured cost: the load section grows to

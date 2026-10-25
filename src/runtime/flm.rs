@@ -860,27 +860,37 @@ impl Entry {
     }
 }
 
-/// Per-request timings from an `flm serve` log line, if it carries any.
+/// A request's `usage` object from an `flm serve` log line, if it carries one.
 ///
-/// `flm` streams `ChatCompletionChunk: {…}` lines and puts a `usage` object on
-/// the final one, with the token counts and the durations behind them:
+/// Up to 1.0.9 `flm` put it on the closing chunk of a stream; 1.0.10 closes the
+/// stream without it and logs it on a line of its own straight after:
 ///
 /// ```text
-/// ChatCompletionChunk: {…,"usage":{"prompt_tokens":299,"completion_tokens":10,
-///   "prefill_duration_ttft":7.53,"decoding_duration":0.97,
-///   "prefill_speed_tps":39.69,"decoding_speed_tps":10.36}}
+/// ChatCompletionChunk: {…,"usage":{"prompt_tokens":299,"completion_tokens":10,…}}
+/// Usage: {"prompt_tokens":304,"completion_tokens":1109,"active_kv_tokens":1416,…}
+/// ```
+fn usage(line: &str) -> Option<serde_json::Value> {
+    if let Some((_, json)) = line.split_once("ChatCompletionChunk:") {
+        let mut chunk = serde_json::from_str::<serde_json::Value>(json.trim()).ok()?;
+        return chunk.get_mut("usage").map(serde_json::Value::take);
+    }
+    let json = line.strip_prefix("Usage:")?;
+    serde_json::from_str::<serde_json::Value>(json.trim()).ok().filter(serde_json::Value::is_object)
+}
+
+/// Per-request timings from an `flm serve` log line, if it carries any: the
+/// token counts and the durations behind them, from the request's [`usage`]:
+///
+/// ```text
+/// "prompt_tokens":299,"completion_tokens":10,"prefill_duration_ttft":7.53,
+/// "decoding_duration":0.97,"prefill_speed_tps":39.69,"decoding_speed_tps":10.36
 /// ```
 ///
 /// It reports the rates too, but the counts and durations are what get used:
 /// they divide out to the same figures and, unlike a rate, can be summed across
 /// requests to average a window.
 pub fn parse_throughput(line: &str) -> Vec<Sample> {
-    let Some((_, json)) = line.split_once("ChatCompletionChunk:") else { return Vec::new() };
-    let Ok(chunk) = serde_json::from_str::<serde_json::Value>(json.trim()) else {
-        return Vec::new();
-    };
-    // Only the closing chunk of a stream carries usage.
-    let Some(usage) = chunk.get("usage") else { return Vec::new() };
+    let Some(usage) = usage(line) else { return Vec::new() };
 
     let read = |tokens: &str, duration: &str, phase: Phase| -> Option<Sample> {
         let sample = Sample {
@@ -901,16 +911,12 @@ pub fn parse_throughput(line: &str) -> Vec<Sample> {
     .collect()
 }
 
-/// Context size and use from the closing usage chunk, which FastFlowLM fills
+/// Context size and use from a request's [`usage`], which FastFlowLM fills
 /// with the KV cache's own figures: `active_kv_tokens` of
 /// `max_kv_token_capacity`.
 pub fn parse_context(line: &str) -> Vec<crate::session::context::Reading> {
     use crate::session::context::Reading;
-    let Some((_, json)) = line.split_once("ChatCompletionChunk:") else { return Vec::new() };
-    let Ok(chunk) = serde_json::from_str::<serde_json::Value>(json.trim()) else {
-        return Vec::new();
-    };
-    let Some(usage) = chunk.get("usage") else { return Vec::new() };
+    let Some(usage) = usage(line) else { return Vec::new() };
     let field = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64);
     [
         field("max_kv_token_capacity").map(Reading::Size),
@@ -1315,6 +1321,25 @@ mod tests {
         assert_eq!(parse_context(line), vec![Reading::Size(32768), Reading::Used(334)]);
         assert!(parse_context(r#"ChatCompletionChunk: {"choices":[]}"#).is_empty());
         assert!(parse_context("[FLM]  Creating checkpoint at context length 299").is_empty());
+    }
+
+    /// Verbatim from a real flm 1.0.10 log: the closing chunk has no usage any
+    /// more, and the line after it does.
+    #[test]
+    fn flm_1_0_10_logs_usage_on_its_own_line_after_the_closing_chunk() {
+        use crate::session::context::Reading;
+        let closing = r#"ChatCompletionChunk: {"id":"chatcmpl-208b4c02e56a655e09cf3b0f","object":"chat.completion.chunk","created":1792967802,"model":"qwen3.6-moe:35b-a3b","system_fingerprint":"fp_19267b9e7025bb41","choices":[{"index":0,"delta":{"content":null},"finish_reason":"stop"}]}"#;
+        let usage = r#"Usage: {"prompt_tokens":304,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens":1109,"total_tokens":1413,"active_kv_tokens":1416,"max_kv_token_capacity":32768,"kv_token_occupancy_rate_percentage":4.3212890625,"load_duration":2.695e-06,"prefill_duration_ttft":6.2892416,"decoding_duration":73.998832,"prefill_speed_tps":48.33651167097795,"decoding_speed_tps":14.986723033682479}"#;
+        assert!(parse_throughput(closing).is_empty());
+        assert!(parse_context(closing).is_empty());
+
+        let samples = parse_throughput(usage);
+        assert_eq!(samples.len(), 2);
+        assert_eq!((samples[0].phase, samples[0].tokens), (Phase::Prefill, 304));
+        assert_eq!((samples[1].phase, samples[1].tokens), (Phase::Decode, 1109));
+        assert!((samples[1].rate().unwrap() - 14.9867).abs() < 0.001);
+        assert_eq!(parse_context(usage), vec![Reading::Size(32768), Reading::Used(1416)]);
+        assert!(parse_throughput("Usage: not json").is_empty());
     }
 
     /// A verbatim closing chunk from a real `flm serve` log.
