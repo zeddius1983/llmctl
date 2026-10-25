@@ -255,10 +255,7 @@ fn machine_lines(host: &HostMonitor, width: usize) -> Vec<Line<'static>> {
         };
         lines.push(Line::from(vec![
             "GPU".bold(),
-            Span::styled(
-                format!(" · {}{more} · system-wide", gpu.name),
-                Style::default().fg(Color::Gray),
-            ),
+            Span::styled(format!(" · {}{more}", gpu.name), Style::default().fg(Color::Gray)),
         ]));
         lines.extend(tiles(
             &[

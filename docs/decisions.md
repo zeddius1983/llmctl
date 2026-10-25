@@ -1130,8 +1130,9 @@ second, so an idle server's sparkline does not decay to zero. The machine is
 sampled only while some session is live, because reading `gpu_busy_percent`
 keeps a discrete GPU from runtime-suspending.
 
-*Honesty.* GPU and RAM figures describe the machine. They are labelled
-system-wide, not apportioned to sessions. A missing reading is a gap in the
+*Honesty.* GPU and RAM figures describe the machine. They sit below the
+session's figures and are not apportioned to sessions (an earlier
+"system-wide" label on the GPU line was dropped as noise). A missing reading is a gap in the
 history, never a zero. With several GPUs the Monitor follows the one with the
 most VRAM, which an APU's carve-out never wins.
 
@@ -1142,7 +1143,19 @@ the narrowest pane rather than eyeballed. Sparklines are two rows tall
 strip. Tiles go two to a row from 38 columns
 and one below that.
 
+*NVIDIA.* The proprietary driver publishes none of the `amdgpu` sysfs files,
+so NVIDIA cards are read from `nvidia-smi --query-gpu=… --format=csv`. Starting
+it costs tens of milliseconds, so it runs on a worker thread and the Monitor
+shows the previous reading; a second process is never started while one is
+still running. It is only tried when `/proc/driver/nvidia/gpus` exists. Inside a
+distrobox the container sees the driver but usually has no `nvidia-smi`, so a
+missing binary falls back to the host's through `distrobox-host-exec` (~80 ms);
+the route that worked is remembered, and only when neither exists does the
+probe stop asking. NVML through FFI would avoid the process
+but cannot be tested without the hardware. NVIDIA has no GTT, so only the VRAM
+bar shows.
+
 **Consequences:** No new dependencies, endpoints, or launch flags. llama.cpp's
-`/slots` (serving state) and NVIDIA are follow-ups. A short terminal clips the
+`/slots` (serving state) is a follow-up. A short terminal clips the
 Monitor from the bottom, so the machine's bars go last. The other views Strata offers
 (Requests, Connect, Engine, …) are on the roadmap.

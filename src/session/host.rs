@@ -1,17 +1,21 @@
 //! Machine-wide readings for the Monitor: GPU load, memory, temperature and
-//! power from the kernel's `amdgpu` sysfs files, and system RAM from
-//! `/proc/meminfo`.
+//! power from the kernel's `amdgpu` sysfs files or from `nvidia-smi`, and
+//! system RAM from `/proc/meminfo`.
 //!
 //! These describe the machine, not a session. Two servers sharing a GPU see the
-//! same figures, which is why the Monitor labels them as system-wide.
+//! same figures, which is why the Monitor shows them apart from the sessions.
 //!
-//! Plain file reads, no vendor tools: `amdgpu` publishes everything needed
-//! under `/sys/class/drm/card*/device/`. Other vendors report nothing here and
-//! the Monitor simply leaves the GPU section out. Reading `gpu_busy_percent`
-//! wakes a runtime-suspended discrete GPU, so the caller samples only while a
-//! session is live.
+//! `amdgpu` publishes everything needed under `/sys/class/drm/card*/device/`,
+//! so AMD is plain file reads. NVIDIA's driver puts none of it in sysfs; its
+//! cards are read through `nvidia-smi`, which takes tens of milliseconds to
+//! start and so runs on a worker thread, one reading behind the tick (from a
+//! distrobox, through the host). Other
+//! vendors report nothing and the Monitor simply leaves the GPU section out.
+//! Either source wakes a runtime-suspended discrete GPU, so the caller samples
+//! only while a session is live.
 
 use std::path::Path;
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 use super::history::Series;
 
@@ -19,7 +23,8 @@ use super::history::Series;
 /// in what they expose, and a missing file is not a zero.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GpuSample {
-    /// `amdgpu 1002:1586` — the driver and PCI id, which is what sysfs knows.
+    /// `amdgpu 1002:1586` — the driver and PCI id, which is what sysfs knows —
+    /// or the marketing name `nvidia-smi` reports.
     pub name: String,
     pub busy_percent: Option<f64>,
     /// Dedicated memory, used and total bytes.
@@ -57,17 +62,24 @@ pub struct HostMonitor {
     pub gpu_power: Series,
     pub gpu_clock: Series,
     pub memory: Option<MemInfo>,
+    nvidia: NvidiaProbe,
 }
 
 impl HostMonitor {
     /// Take one reading from the live system.
     pub fn sample(&mut self) {
         let meminfo = std::fs::read_to_string("/proc/meminfo").ok();
-        self.sample_from(Path::new("/sys/class/drm"), meminfo.as_deref());
+        let mut gpus = gpus(Path::new("/sys/class/drm"));
+        gpus.extend(self.nvidia.poll());
+        self.record(gpus, meminfo.as_deref());
     }
 
+    #[cfg(test)]
     fn sample_from(&mut self, drm: &Path, meminfo: Option<&str>) {
-        let gpus = gpus(drm);
+        self.record(gpus(drm), meminfo);
+    }
+
+    fn record(&mut self, gpus: Vec<GpuSample>, meminfo: Option<&str>) {
         self.gpu_count = gpus.len();
         self.gpu = primary(gpus);
         let gpu = self.gpu.as_ref();
@@ -135,6 +147,105 @@ fn read_amdgpu(device: &Path) -> Option<GpuSample> {
             .or_else(|| hwmon_value("power1_input"))
             .map(|micro| micro / 1_000_000.0),
     })
+}
+
+/// The fields asked of `nvidia-smi`, in the order [`parse_nvidia_smi`] reads them.
+const NVIDIA_QUERY: &str =
+    "name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,clocks.sm";
+
+/// The ways to reach `nvidia-smi`, tried in order. Inside a distrobox the
+/// container sees the driver but usually lacks its tools, so the host's copy
+/// is run through `distrobox-host-exec`, which exists only in a container.
+const NVIDIA_SMI: [&[&str]; 2] = [&["nvidia-smi"], &["distrobox-host-exec", "nvidia-smi"]];
+
+/// `nvidia-smi`, run on a worker thread so a slow start never stalls the tick.
+/// Each poll hands back the last finished reading and starts the next.
+#[derive(Debug, Default)]
+struct NvidiaProbe {
+    /// The worker's answer: the [`NVIDIA_SMI`] entry that ran, and its reading,
+    /// or `None` when none of them could be found.
+    pending: Option<Receiver<(usize, Option<Vec<GpuSample>>)>>,
+    latest: Vec<GpuSample>,
+    /// The [`NVIDIA_SMI`] entry to start from: the one that last worked.
+    via: usize,
+    /// No NVIDIA driver, or no `nvidia-smi` to reach: stop asking.
+    absent: bool,
+}
+
+impl NvidiaProbe {
+    fn poll(&mut self) -> Vec<GpuSample> {
+        if self.absent {
+            return Vec::new();
+        }
+        if let Some(rx) = &self.pending {
+            match rx.try_recv() {
+                Ok((via, Some(gpus))) => (self.via, self.latest) = (via, gpus),
+                Ok((_, None)) => self.absent = true,
+                // Still running: keep the previous reading rather than start
+                // a second process beside it.
+                Err(TryRecvError::Empty) => return self.latest.clone(),
+                Err(TryRecvError::Disconnected) => self.latest.clear(),
+            }
+            self.pending = None;
+        }
+        // The driver's proc directory exists wherever an NVIDIA GPU is bound,
+        // so machines without one never spawn anything.
+        if self.absent || !Path::new("/proc/driver/nvidia/gpus").is_dir() {
+            self.absent = true;
+            return Vec::new();
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let first = self.via;
+        std::thread::spawn(move || {
+            let answer = (first..NVIDIA_SMI.len())
+                .find_map(|via| {
+                    let [program, args @ ..] = NVIDIA_SMI[via] else { return None };
+                    let output = std::process::Command::new(program)
+                        .args(args)
+                        .arg(format!("--query-gpu={NVIDIA_QUERY}"))
+                        .arg("--format=csv,noheader,nounits")
+                        .stdin(std::process::Stdio::null())
+                        .output();
+                    let reading = match output {
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+                        Ok(out) if out.status.success() => {
+                            parse_nvidia_smi(&String::from_utf8_lossy(&out.stdout))
+                        }
+                        // A failed run (driver reloading, GPU fallen off the
+                        // bus) is a gap, not a reason to give up.
+                        _ => Vec::new(),
+                    };
+                    Some((via, Some(reading)))
+                })
+                .unwrap_or((first, None));
+            let _ = tx.send(answer);
+        });
+        self.pending = Some(rx);
+        self.latest.clone()
+    }
+}
+
+/// One GPU per line of `nvidia-smi --format=csv,noheader,nounits`, fields as
+/// [`NVIDIA_QUERY`]. Memory is in MiB. Fields a card does not support read
+/// `[N/A]` or `[Not Supported]` and become `None`.
+fn parse_nvidia_smi(text: &str) -> Vec<GpuSample> {
+    text.lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+            let [name, busy, used, total, temp, power, clock] = fields[..] else { return None };
+            let number = |field: &str| field.parse::<f64>().ok();
+            let mib = |field: &str| number(field).map(|m| (m * 1024.0 * 1024.0) as u64);
+            Some(GpuSample {
+                name: name.to_string(),
+                busy_percent: number(busy),
+                vram: mib(used).zip(mib(total)),
+                gtt: None,
+                temp_c: number(temp),
+                power_w: number(power),
+                clock_mhz: number(clock),
+            })
+        })
+        .collect()
 }
 
 fn read_number(path: &Path) -> Option<f64> {
@@ -228,6 +339,45 @@ mod tests {
         assert_eq!(host.gpu.unwrap().vram, Some((0, 17_179_869_184)));
 
         let _ = std::fs::remove_dir_all(drm);
+    }
+
+    #[test]
+    fn nvidia_smi_rows_become_gpus_and_unsupported_fields_gaps() {
+        // The first row as an RTX 3080 on driver 580 prints it.
+        let text = "NVIDIA GeForce RTX 3080, 50, 816, 10240, 58, 28.79, 270\n\
+                    NVIDIA GeForce GTX 1650, [N/A], 5, 4096, 40, [Not Supported], 300\n";
+        let gpus = parse_nvidia_smi(text);
+        assert_eq!(gpus.len(), 2);
+        assert_eq!(gpus[0].name, "NVIDIA GeForce RTX 3080");
+        assert_eq!(gpus[0].busy_percent, Some(50.0));
+        assert_eq!(gpus[0].vram, Some((816 << 20, 10240 << 20)));
+        assert_eq!(gpus[0].gtt, None);
+        assert_eq!(gpus[0].temp_c, Some(58.0));
+        assert_eq!(gpus[0].power_w, Some(28.79));
+        assert_eq!(gpus[0].clock_mhz, Some(270.0));
+        assert_eq!(gpus[1].busy_percent, None, "[N/A] is a gap, not a zero");
+        assert_eq!(gpus[1].power_w, None);
+        assert_eq!(primary(gpus).unwrap().name, "NVIDIA GeForce RTX 3080");
+        assert!(parse_nvidia_smi("No devices were found\n").is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs an NVIDIA GPU and nvidia-smi"]
+    fn nvidia_probe_reads_a_live_card() {
+        let mut host = HostMonitor::default();
+        // The first sample only starts the worker; later ones see its reading.
+        for _ in 0..20 {
+            host.sample();
+            if host.gpu.as_ref().is_some_and(|gpu| gpu.vram.is_some()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        let gpu = host.gpu.expect("an NVIDIA GPU is read");
+        eprintln!("{gpu:?}");
+        assert!(gpu.vram.is_some_and(|(_, total)| total > 0));
+        assert!(gpu.busy_percent.is_some());
+        assert!(host.gpu_busy.last().is_some());
     }
 
     #[test]

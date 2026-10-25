@@ -353,8 +353,13 @@ llmctl has the first and, in the log tail, the sixth.
       slot reported last
 - [x] PID as a Session Manager column (dropped from the Monitor); it goes
       after the profile and before the rates when a narrow pane sheds columns
-- [ ] NVIDIA via NVML or `nvidia-smi` behind the same sampler; a GPU picker
-      when there are several (today: the one with the most VRAM)
+- [x] NVIDIA through `nvidia-smi` behind the same sampler, on a worker thread
+      so its start-up never stalls the tick; skipped when
+      `/proc/driver/nvidia/gpus` is absent; inside a distrobox without
+      `nvidia-smi` it runs the host's through `distrobox-host-exec`
+- [ ] A GPU picker when there are several (today: the one with the most VRAM)
+- [x] Verified on an RTX 3080 (driver 580): the ignored
+      `nvidia_probe_reads_a_live_card` test reads busy, VRAM, temp, power, clock
 - [ ] More views, switched inside the pane: Requests (a table of the parsed
       samples), Connect (client settings for OpenCode, Claude Code, …), Engine
       (the command line and `/props`)
