@@ -782,11 +782,14 @@ impl SessionManager {
             SessionStatus::Starting
         };
         session.requested_stop = false;
-        // The rates and the read position belong to the process that just went
-        // away. The replacement writes its own log from byte zero and has said
-        // nothing yet about how fast it runs; carrying either across would show
-        // the old process's figures as if they were the new one's.
+        // The rates, the context fill and the read position belong to the
+        // process that just went away. The replacement writes its own log from
+        // byte zero and has said nothing yet about how fast it runs or how full
+        // it is; carrying any of it across would show the old process's figures
+        // as if they were the new one's. Its context size comes back from its
+        // own load line.
         session.throughput = Throughput::default();
+        session.context = context::ContextFill::default();
         session.log_tail = LogTail::default();
         session.recent.clear();
         Ok(())
@@ -1308,6 +1311,8 @@ mod tests {
             seconds: 2.0,
             slot: None,
         });
+        mgr.sessions[0].context.record(context::Reading::Size(16384));
+        mgr.sessions[0].context.record(context::Reading::Used(9000));
 
         mgr.restart(0).expect("restart");
         assert!(mgr.poll_restarts().is_empty(), "no spawn errors expected");
@@ -1316,6 +1321,11 @@ mod tests {
         assert!(
             mgr.sessions[0].throughput.rate(throughput::Phase::Decode).is_none(),
             "the replacement kept the old process's rates"
+        );
+        assert_eq!(
+            mgr.sessions[0].context,
+            context::ContextFill::default(),
+            "the replacement kept the old process's context fill"
         );
 
         sleep(Duration::from_millis(100));
