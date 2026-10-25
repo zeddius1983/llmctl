@@ -36,6 +36,12 @@ pub struct GpuSample {
     pub power_w: Option<f64>,
     /// Shader clock, which drops to idle within a second of the work stopping.
     pub clock_mhz: Option<f64>,
+    /// The PCIe link as it runs now, generation and lane count. NVIDIA drops
+    /// the generation while idle.
+    pub pcie_link: Option<(u32, u32)>,
+    /// PCIe traffic to and from the GPU, MB/s.
+    pub pcie_rx: Option<f64>,
+    pub pcie_tx: Option<f64>,
 }
 
 /// Physical memory, from `/proc/meminfo`.
@@ -61,6 +67,8 @@ pub struct HostMonitor {
     pub gpu_temp: Series,
     pub gpu_power: Series,
     pub gpu_clock: Series,
+    pub pcie_rx: Series,
+    pub pcie_tx: Series,
     pub memory: Option<MemInfo>,
     nvidia: NvidiaProbe,
 }
@@ -87,6 +95,8 @@ impl HostMonitor {
         self.gpu_temp.push(gpu.and_then(|g| g.temp_c));
         self.gpu_power.push(gpu.and_then(|g| g.power_w));
         self.gpu_clock.push(gpu.and_then(|g| g.clock_mhz));
+        self.pcie_rx.push(gpu.and_then(|g| g.pcie_rx));
+        self.pcie_tx.push(gpu.and_then(|g| g.pcie_tx));
         self.memory = meminfo.and_then(parse_meminfo);
     }
 }
@@ -146,12 +156,40 @@ fn read_amdgpu(device: &Path) -> Option<GpuSample> {
         power_w: hwmon_value("power1_average")
             .or_else(|| hwmon_value("power1_input"))
             .map(|micro| micro / 1_000_000.0),
+        pcie_link: amdgpu_link(device),
+        ..GpuSample::default()
     })
 }
 
+/// The PCIe link a discrete card runs at now. An APU reports one too, but it
+/// is the bridge inside the chip — the GPU reaches memory over the fabric — so
+/// it is left out. APUs are told apart by `gpu_metrics`: its format revision
+/// is 2 or 3 on APUs and 1 on discrete cards.
+fn amdgpu_link(device: &Path) -> Option<(u32, u32)> {
+    let metrics = std::fs::read(device.join("gpu_metrics")).ok();
+    if metrics.as_deref().and_then(|bytes| bytes.get(2)).is_some_and(|rev| matches!(rev, 2 | 3)) {
+        return None;
+    }
+    let speed = std::fs::read_to_string(device.join("current_link_speed")).ok()?;
+    let lanes = read_number(&device.join("current_link_width"))? as u32;
+    Some((pcie_generation(&speed)?, lanes)).filter(|_| lanes > 0)
+}
+
+/// `16.0 GT/s PCIe` → 4. Each generation doubles the transfer rate from 8 GT/s
+/// up; the first two ran at 2.5 and 5.
+fn pcie_generation(speed: &str) -> Option<u32> {
+    let rate: f64 = speed.split_whitespace().next()?.parse().ok()?;
+    match rate {
+        r if r < 2.0 => None,
+        r if r < 4.0 => Some(1),
+        r if r < 6.0 => Some(2),
+        r => Some(3 + (r / 8.0).log2().round().max(0.0) as u32),
+    }
+}
+
 /// The fields asked of `nvidia-smi`, in the order [`parse_nvidia_smi`] reads them.
-const NVIDIA_QUERY: &str =
-    "name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,clocks.sm";
+const NVIDIA_QUERY: &str = "index,name,utilization.gpu,memory.used,memory.total,\
+temperature.gpu,power.draw,clocks.sm,pcie.link.gen.current,pcie.link.width.current";
 
 /// The ways to reach `nvidia-smi`, tried in order. Inside a distrobox the
 /// container sees the driver but usually lacks its tools, so the host's copy
@@ -206,7 +244,7 @@ impl NvidiaProbe {
                         .arg("--format=csv,noheader,nounits")
                         .stdin(std::process::Stdio::null())
                         .output();
-                    let reading = match output {
+                    let mut reading = match output {
                         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
                         Ok(out) if out.status.success() => {
                             parse_nvidia_smi(&String::from_utf8_lossy(&out.stdout))
@@ -215,7 +253,19 @@ impl NvidiaProbe {
                         // bus) is a gap, not a reason to give up.
                         _ => Vec::new(),
                     };
-                    Some((via, Some(reading)))
+                    // PCIe throughput is not a query field; `dmon` samples it
+                    // once, by the same route, in about as long again.
+                    let dmon = std::process::Command::new(program)
+                        .args(args)
+                        .args(["dmon", "-s", "t", "-c", "1"])
+                        .stdin(std::process::Stdio::null())
+                        .output();
+                    if let Ok(out) = dmon
+                        && out.status.success()
+                    {
+                        add_pcie_throughput(&mut reading, &String::from_utf8_lossy(&out.stdout));
+                    }
+                    Some((via, Some(reading.into_iter().map(|(_, gpu)| gpu).collect())))
                 })
                 .unwrap_or((first, None));
             let _ = tx.send(answer);
@@ -226,26 +276,64 @@ impl NvidiaProbe {
 }
 
 /// One GPU per line of `nvidia-smi --format=csv,noheader,nounits`, fields as
-/// [`NVIDIA_QUERY`]. Memory is in MiB. Fields a card does not support read
-/// `[N/A]` or `[Not Supported]` and become `None`.
-fn parse_nvidia_smi(text: &str) -> Vec<GpuSample> {
+/// [`NVIDIA_QUERY`], with its `nvidia-smi` index. Memory is in MiB. Fields a
+/// card does not support read `[N/A]` or `[Not Supported]` and become `None`.
+fn parse_nvidia_smi(text: &str) -> Vec<(u32, GpuSample)> {
     text.lines()
         .filter_map(|line| {
             let fields: Vec<&str> = line.split(',').map(str::trim).collect();
-            let [name, busy, used, total, temp, power, clock] = fields[..] else { return None };
+            let [index, name, busy, used, total, temp, power, clock, generation, lanes] =
+                fields[..]
+            else {
+                return None;
+            };
             let number = |field: &str| field.parse::<f64>().ok();
             let mib = |field: &str| number(field).map(|m| (m * 1024.0 * 1024.0) as u64);
-            Some(GpuSample {
-                name: name.to_string(),
-                busy_percent: number(busy),
-                vram: mib(used).zip(mib(total)),
-                gtt: None,
-                temp_c: number(temp),
-                power_w: number(power),
-                clock_mhz: number(clock),
-            })
+            let link = generation.parse().ok().zip(lanes.parse().ok());
+            Some((
+                index.parse().ok()?,
+                GpuSample {
+                    name: name.to_string(),
+                    busy_percent: number(busy),
+                    vram: mib(used).zip(mib(total)),
+                    gtt: None,
+                    temp_c: number(temp),
+                    power_w: number(power),
+                    clock_mhz: number(clock),
+                    pcie_link: link,
+                    pcie_rx: None,
+                    pcie_tx: None,
+                },
+            ))
         })
         .collect()
+}
+
+/// Fill in PCIe throughput from `nvidia-smi dmon -s t`, matching rows to GPUs
+/// by index. Columns are found by name in the `# gpu rxpci txpci` header, and
+/// an unsupported reading prints as `-`:
+///
+/// ```text
+/// # gpu  rxpci  txpci
+/// # Idx   MB/s   MB/s
+///     0   2522     42
+/// ```
+fn add_pcie_throughput(gpus: &mut [(u32, GpuSample)], dmon: &str) {
+    let Some(header) = dmon.lines().find_map(|line| line.strip_prefix('#')) else { return };
+    let header: Vec<&str> = header.split_whitespace().collect();
+    let column = |name: &str| header.iter().position(|field| *field == name);
+    let (Some(rx), Some(tx)) = (column("rxpci"), column("txpci")) else { return };
+    for line in dmon.lines().filter(|line| !line.trim_start().starts_with('#')) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let Some(index) = fields.first().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        let value = |at: usize| fields.get(at).and_then(|field| field.parse::<f64>().ok());
+        if let Some((_, gpu)) = gpus.iter_mut().find(|(i, _)| *i == index) {
+            gpu.pcie_rx = value(rx);
+            gpu.pcie_tx = value(tx);
+        }
+    }
 }
 
 fn read_number(path: &Path) -> Option<f64> {
@@ -303,6 +391,10 @@ mod tests {
         write(&device.join("hwmon/hwmon7/temp1_input"), "64000\n");
         write(&device.join("hwmon/hwmon7/power1_input"), "118077000\n");
         write(&device.join("hwmon/hwmon7/freq1_input"), "2788000000\n");
+        // The bridge inside the chip, which reports a link like any card.
+        write(&device.join("current_link_speed"), "16.0 GT/s PCIe\n");
+        write(&device.join("current_link_width"), "16\n");
+        std::fs::write(device.join("gpu_metrics"), [0x08, 0x01, 3, 0]).unwrap();
         std::fs::create_dir_all(drm.join("card1-DP-1")).unwrap();
 
         let mut host = HostMonitor::default();
@@ -315,6 +407,7 @@ mod tests {
         assert_eq!(gpu.temp_c, Some(64.0));
         assert_eq!(gpu.power_w, Some(118.077), "power1_input stands in for a missing average");
         assert_eq!(gpu.clock_mhz, Some(2788.0));
+        assert_eq!(gpu.pcie_link, None, "an APU's link is the bridge inside the chip");
         assert_eq!(host.gpu_busy.last(), Some(94.0));
         assert_eq!(host.memory, None, "no meminfo, no RAM figure");
 
@@ -330,23 +423,47 @@ mod tests {
             write(&device.join("mem_info_vram_used"), "0\n");
             write(&device.join("mem_info_vram_total"), vram);
         }
+        let discrete = drm.join("card1/device");
+        write(&discrete.join("current_link_speed"), "2.5 GT/s PCIe\n");
+        write(&discrete.join("current_link_width"), "16\n");
+        std::fs::write(discrete.join("gpu_metrics"), [0x08, 0x01, 1, 0]).unwrap();
         // A device without `gpu_busy_percent` is some other vendor's.
         write(&drm.join("card2/device/vendor"), "0x10de\n");
 
         let mut host = HostMonitor::default();
         host.sample_from(&drm, None);
         assert_eq!(host.gpu_count, 2);
-        assert_eq!(host.gpu.unwrap().vram, Some((0, 17_179_869_184)));
+        let gpu = host.gpu.unwrap();
+        assert_eq!(gpu.vram, Some((0, 17_179_869_184)));
+        assert_eq!(gpu.pcie_link, Some((1, 16)), "a discrete card idles at Gen1");
 
         let _ = std::fs::remove_dir_all(drm);
     }
 
     #[test]
+    fn link_speeds_name_their_pcie_generation() {
+        let generation = |speed| pcie_generation(speed);
+        assert_eq!(generation("2.5 GT/s PCIe"), Some(1));
+        assert_eq!(generation("5.0 GT/s PCIe"), Some(2));
+        assert_eq!(generation("8.0 GT/s PCIe"), Some(3));
+        assert_eq!(generation("16.0 GT/s PCIe"), Some(4));
+        assert_eq!(generation("32.0 GT/s PCIe"), Some(5));
+        assert_eq!(generation("64.0 GT/s PCIe"), Some(6));
+        assert_eq!(generation("Unknown"), None);
+    }
+
+    #[test]
     fn nvidia_smi_rows_become_gpus_and_unsupported_fields_gaps() {
         // The first row as an RTX 3080 on driver 580 prints it.
-        let text = "NVIDIA GeForce RTX 3080, 50, 816, 10240, 58, 28.79, 270\n\
-                    NVIDIA GeForce GTX 1650, [N/A], 5, 4096, 40, [Not Supported], 300\n";
-        let gpus = parse_nvidia_smi(text);
+        let text = "0, NVIDIA GeForce RTX 3080, 50, 816, 10240, 58, 28.79, 270, 4, 16\n\
+                    1, NVIDIA GeForce GTX 1650, [N/A], 5, 4096, 40, [Not Supported], 300, 1, 16\n";
+        let mut indexed = parse_nvidia_smi(text);
+        add_pcie_throughput(
+            &mut indexed,
+            "# gpu  rxpci  txpci \n# Idx   MB/s   MB/s \n    0   2522     42 \n    1      -      - \n",
+        );
+        assert_eq!(indexed.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [0, 1]);
+        let gpus: Vec<GpuSample> = indexed.into_iter().map(|(_, gpu)| gpu).collect();
         assert_eq!(gpus.len(), 2);
         assert_eq!(gpus[0].name, "NVIDIA GeForce RTX 3080");
         assert_eq!(gpus[0].busy_percent, Some(50.0));
@@ -355,6 +472,9 @@ mod tests {
         assert_eq!(gpus[0].temp_c, Some(58.0));
         assert_eq!(gpus[0].power_w, Some(28.79));
         assert_eq!(gpus[0].clock_mhz, Some(270.0));
+        assert_eq!(gpus[0].pcie_link, Some((4, 16)));
+        assert_eq!((gpus[0].pcie_rx, gpus[0].pcie_tx), (Some(2522.0), Some(42.0)));
+        assert_eq!((gpus[1].pcie_rx, gpus[1].pcie_tx), (None, None), "`-` is a gap");
         assert_eq!(gpus[1].busy_percent, None, "[N/A] is a gap, not a zero");
         assert_eq!(gpus[1].power_w, None);
         assert_eq!(primary(gpus).unwrap().name, "NVIDIA GeForce RTX 3080");
@@ -378,6 +498,8 @@ mod tests {
         assert!(gpu.vram.is_some_and(|(_, total)| total > 0));
         assert!(gpu.busy_percent.is_some());
         assert!(host.gpu_busy.last().is_some());
+        assert!(gpu.pcie_link.is_some_and(|(generation, lanes)| generation > 0 && lanes > 0));
+        assert!(gpu.pcie_rx.is_some() && gpu.pcie_tx.is_some(), "dmon gives throughput");
     }
 
     #[test]

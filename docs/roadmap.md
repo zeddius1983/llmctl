@@ -359,7 +359,17 @@ llmctl has the first and, in the log tail, the sixth.
       `nvidia-smi` it runs the host's through `distrobox-host-exec`
 - [ ] A GPU picker when there are several (today: the one with the most VRAM)
 - [x] Verified on an RTX 3080 (driver 580): the ignored
-      `nvidia_probe_reads_a_live_card` test reads busy, VRAM, temp, power, clock
+      `nvidia_probe_reads_a_live_card` test reads busy, VRAM, temp, power,
+      clock, PCIe link and throughput
+- [x] PCIe tiles: the running link (`Gen4 x16`) and MB/s to and from the GPU,
+      from `nvidia-smi dmon -s t`
+- [x] AMD discrete cards: the link on the GPU line (sysfs); APUs, whose link
+      is the bridge inside the chip, show none
+- [ ] PCIe throughput on AMD discrete cards: no source on RDNA (`pcie_bw` is
+      Vega and older, and blocks for a second)
+- [ ] Memory bandwidth on Strix Halo: `gpu_metrics` DRAM counters read ~3×
+      low against a measured decode, so they stay out until a trustworthy
+      source turns up
 - [ ] More views, switched inside the pane: Requests (a table of the parsed
       samples), Connect (client settings for OpenCode, Claude Code, …), Engine
       (the command line and `/props`)

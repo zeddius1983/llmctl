@@ -1155,6 +1155,28 @@ probe stop asking. NVML through FFI would avoid the process
 but cannot be tested without the hardware. NVIDIA has no GTT, so only the VRAM
 bar shows.
 
+*PCIe.* A row of two tiles under the GPU's, traffic to and from the card,
+headed by the link as it runs now (`PCIe Gen4 x16`; NVIDIA drops to Gen1 while
+idle, and that is shown as it is). The two share one scale so their heights
+compare. NVIDIA gives the link in the query and the throughput through
+`nvidia-smi dmon -s t -c 1`, run right after it by the same route; dmon's
+columns are found by header name. The row appears only once throughput is
+measured.
+
+AMD discrete cards show the link on the GPU line instead (`GPU · amdgpu
+1002:744c · PCIe Gen4 x16`), read from sysfs `current_link_speed` and
+`current_link_width`. They get no throughput: the kernel offers `pcie_bw` only
+on Vega and older, where each read sleeps a second. An APU's link is the bridge
+inside the chip (on Strix Halo, `00:08.1`, reporting Gen4 x16) and is left
+out. An APU is told apart by its `gpu_metrics` format revision: 2 or 3, where
+discrete cards report 1.
+
+Strix Halo's `gpu_metrics` v3.0 does carry `average_dram_reads`/`writes` in
+MB/s, but they are not shown. Measured against `llama-bench` decode of a
+6.48 GiB model at 21.9 t/s (about 150 GB/s of weight reads), the counter read
+about 52 GB/s. It also covers the whole SoC, read 23–42 GB/s near idle, and as
+a 16-bit field it cannot pass 65.5 GB/s on a 256 GB/s memory system.
+
 **Consequences:** No new dependencies, endpoints, or launch flags. llama.cpp's
 `/slots` (serving state) is a follow-up. A short terminal clips the
 Monitor from the bottom, so the machine's bars go last. The other views Strata offers

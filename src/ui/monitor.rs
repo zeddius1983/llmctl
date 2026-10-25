@@ -8,6 +8,7 @@
 //! layout is a pure function of the session and the host reading, testable
 //! without a terminal.
 
+use std::borrow::Cow;
 use std::time::Instant;
 
 use ratatui::style::{Color, Style, Stylize};
@@ -37,7 +38,7 @@ const BORDER: Color = Color::DarkGray;
 /// One tile: what it measures, its current value, and its history scaled
 /// against `ceiling`. A live tile is showing a request still in progress.
 struct Tile {
-    label: &'static str,
+    label: Cow<'static, str>,
     value: String,
     history: Vec<Option<f64>>,
     ceiling: Option<f64>,
@@ -46,12 +47,12 @@ struct Tile {
 
 impl Tile {
     fn new(
-        label: &'static str,
+        label: impl Into<Cow<'static, str>>,
         value: String,
         history: Vec<Option<f64>>,
         ceiling: Option<f64>,
     ) -> Self {
-        Self { label, value, history, ceiling, live: false }
+        Self { label: label.into(), value, history, ceiling, live: false }
     }
 }
 
@@ -63,11 +64,11 @@ pub(super) fn monitor_lines(
 ) -> Text<'static> {
     let mut lines = vec![header(session, width, now), Line::raw("")];
 
-    let speed = |label, phase| {
+    let speed = |label: &'static str, phase| {
         let history = session.throughput.rates(phase);
         let current = session.throughput.current(phase, now);
         Tile {
-            label,
+            label: label.into(),
             value: current.map_or("—".into(), |(r, _)| format!("{} t/s", format_rate(r))),
             ceiling: peak(&history),
             history,
@@ -253,9 +254,15 @@ fn machine_lines(host: &HostMonitor, width: usize) -> Vec<Line<'static>> {
             0 | 1 => String::new(),
             n => format!(" (1 of {n})"),
         };
+        // Where throughput is measured the link heads the PCIe tiles instead.
+        let pcie_tiles = host.pcie_rx.max().is_some() || host.pcie_tx.max().is_some();
+        let link = match gpu.pcie_link {
+            Some((generation, lanes)) if !pcie_tiles => format!(" · PCIe Gen{generation} x{lanes}"),
+            _ => String::new(),
+        };
         lines.push(Line::from(vec![
             "GPU".bold(),
-            Span::styled(format!(" · {}{more}", gpu.name), Style::default().fg(Color::Gray)),
+            Span::styled(format!(" · {}{more}{link}", gpu.name), Style::default().fg(Color::Gray)),
         ]));
         lines.extend(tiles(
             &[
@@ -287,6 +294,35 @@ fn machine_lines(host: &HostMonitor, width: usize) -> Vec<Line<'static>> {
             width,
             Color::LightMagenta,
         ));
+        // Only where throughput is measured, which today is NVIDIA. The two
+        // directions share a scale, so their heights compare.
+        if pcie_tiles {
+            let ceiling = host.pcie_rx.max().into_iter().chain(host.pcie_tx.max()).reduce(f64::max);
+            let link = gpu.pcie_link.map_or_else(String::new, |(generation, lanes)| {
+                format!(" Gen{generation} x{lanes}")
+            });
+            lines.extend(tiles(
+                &[
+                    Tile::new(
+                        format!("PCIe{link}"),
+                        format!("to GPU {}", gpu.pcie_rx.map_or("—".into(), megabytes_per_second)),
+                        host.pcie_rx.values(),
+                        ceiling,
+                    ),
+                    Tile::new(
+                        "PCIe",
+                        format!(
+                            "from GPU {}",
+                            gpu.pcie_tx.map_or("—".into(), megabytes_per_second)
+                        ),
+                        host.pcie_tx.values(),
+                        ceiling,
+                    ),
+                ],
+                width,
+                Color::LightMagenta,
+            ));
+        }
         lines.push(Line::raw(""));
         if let Some((used, total)) = gpu.vram {
             lines.push(gauge("VRAM", used, total, width));
@@ -369,6 +405,11 @@ fn tiles(tiles: &[Tile], width: usize, color: Color) -> Vec<Line<'static>> {
         lines.extend(rows.into_iter().map(Line::from));
     }
     lines
+}
+
+/// `578 MB/s`, or `2.5 GB/s` from a thousand up.
+fn megabytes_per_second(rate: f64) -> String {
+    if rate >= 1000.0 { format!("{:.1} GB/s", rate / 1000.0) } else { format!("{rate:.0} MB/s") }
 }
 
 /// `VRAM ████████░░░░  40.4/124.0 GiB`
@@ -490,7 +531,7 @@ mod tests {
     #[test]
     fn boxed_tiles_pair_up_when_there_is_room_and_keep_their_borders_square() {
         let tile = |label| Tile {
-            label,
+            label: Cow::Borrowed(label),
             value: "211.40 t/s".into(),
             history: vec![Some(1.0); 80],
             ceiling: Some(2.0),
@@ -625,5 +666,39 @@ mod tests {
             assert_eq!(text.width(), width, "{text:?}");
             assert!(text.ends_with(" 40.4/124.0 GiB"));
         }
+    }
+
+    #[test]
+    fn the_pcie_link_heads_the_tiles_or_else_the_gpu_line() {
+        use crate::session::host::GpuSample;
+        let mut host = HostMonitor::default();
+        host.gpu = Some(GpuSample { name: "NVIDIA GeForce RTX 3080".into(), ..Default::default() });
+        let text = |host: &HostMonitor| -> String {
+            machine_lines(host, 60).iter().map(|line| text_of(line) + "\n").collect()
+        };
+        assert!(!text(&host).contains("PCIe"), "no throughput, no PCIe row");
+        host.gpu = Some(GpuSample {
+            name: "amdgpu 1002:744c".into(),
+            pcie_link: Some((4, 16)),
+            ..Default::default()
+        });
+        let shown = text(&host);
+        assert!(shown.starts_with("GPU · amdgpu 1002:744c · PCIe Gen4 x16\n"), "{shown}");
+        assert!(!shown.contains("╭ PCIe"), "a link alone goes on the header, no tiles");
+
+        host.gpu = Some(GpuSample {
+            name: "NVIDIA GeForce RTX 3080".into(),
+            pcie_link: Some((4, 16)),
+            pcie_rx: Some(2522.0),
+            pcie_tx: Some(42.0),
+            ..Default::default()
+        });
+        host.pcie_rx.push(Some(2522.0));
+        host.pcie_tx.push(Some(42.0));
+        let shown = text(&host);
+        assert!(shown.contains("╭ PCIe Gen4 x16 "), "{shown}");
+        assert!(shown.starts_with("GPU · NVIDIA GeForce RTX 3080\n"), "the tiles carry the link");
+        assert!(shown.contains("to GPU 2.5 GB/s"), "{shown}");
+        assert!(shown.contains("from GPU 42 MB/s"), "{shown}");
     }
 }
