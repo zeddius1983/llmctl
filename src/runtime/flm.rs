@@ -208,6 +208,9 @@ pub struct FlmBackend {
     npu_ready: bool,
     /// Why the stack is not ready, when it isn't.
     npu_problem: Option<String>,
+    /// The kernel's `amdxdna` driver has an NPU bound, whether or not `flm` is
+    /// installed to use it.
+    npu_present: bool,
     /// The last catalog read from `flm`, held so re-grouping does not re-read
     /// it. See [`FlmBackend::cached_catalog`].
     catalog_cache: Mutex<Option<Vec<Entry>>>,
@@ -248,6 +251,7 @@ impl FlmBackend {
             },
             npu_ready,
             npu_problem,
+            npu_present: npu_present(Path::new(AMDXDNA_DRIVER)),
             catalog_cache: Mutex::new(None),
         }
     }
@@ -537,6 +541,14 @@ impl RuntimeBackend for FlmBackend {
         true
     }
 
+    /// Listed where there is an NPU to use or an `flm` to use it with. A
+    /// machine with neither — no XDNA hardware, nothing installed — never
+    /// shows FastFlowLM; one with the NPU but no `flm` shows it dimmed, so the
+    /// option is discoverable.
+    fn listed(&self) -> bool {
+        self.runtime.binary_path.is_some() || self.npu_present
+    }
+
     fn unavailable_reason(&self) -> Option<String> {
         if self.runtime.binary_path.is_none() {
             return Some("flm binary not found on PATH".into());
@@ -547,6 +559,19 @@ impl RuntimeBackend for FlmBackend {
         }
         None
     }
+}
+
+/// Where the kernel lists the devices bound to the AMD XDNA (NPU) driver.
+const AMDXDNA_DRIVER: &str = "/sys/bus/pci/drivers/amdxdna";
+
+/// Whether `driver` has a device bound: an entry named like a PCI address
+/// (`0000:c8:00.1`) beside the driver's own `bind`, `module` and `uevent`.
+fn npu_present(driver: &Path) -> bool {
+    std::fs::read_dir(driver).is_ok_and(|entries| {
+        entries.filter_map(Result::ok).any(|entry| {
+            entry.file_name().to_str().is_some_and(|name| name.split(':').count() == 3)
+        })
+    })
 }
 
 /// The tag to serve. Falls back to the display name so a malformed catalog
@@ -835,39 +860,110 @@ impl Entry {
     }
 }
 
-/// Per-request timings from an `flm serve` log line, if it carries any.
+/// A request's `usage` object from an `flm serve` log line, if it carries one.
 ///
-/// `flm` streams `ChatCompletionChunk: {…}` lines and puts a `usage` object on
-/// the final one, with the token counts and the durations behind them:
+/// Up to 1.0.9 `flm` put it on the closing chunk of a stream; 1.0.10 closes the
+/// stream without it and logs it on a line of its own straight after:
 ///
 /// ```text
-/// ChatCompletionChunk: {…,"usage":{"prompt_tokens":299,"completion_tokens":10,
-///   "prefill_duration_ttft":7.53,"decoding_duration":0.97,
-///   "prefill_speed_tps":39.69,"decoding_speed_tps":10.36}}
+/// ChatCompletionChunk: {…,"usage":{"prompt_tokens":299,"completion_tokens":10,…}}
+/// Usage: {"prompt_tokens":304,"completion_tokens":1109,"active_kv_tokens":1416,…}
+/// ```
+fn usage(line: &str) -> Option<serde_json::Value> {
+    if let Some((_, json)) = line.split_once("ChatCompletionChunk:") {
+        let mut chunk = serde_json::from_str::<serde_json::Value>(json.trim()).ok()?;
+        return chunk.get_mut("usage").map(serde_json::Value::take);
+    }
+    let json = line.strip_prefix("Usage:")?;
+    serde_json::from_str::<serde_json::Value>(json.trim()).ok().filter(serde_json::Value::is_object)
+}
+
+/// Per-request timings from an `flm serve` log line, if it carries any: the
+/// token counts and the durations behind them, from the request's [`usage`]:
+///
+/// ```text
+/// "prompt_tokens":299,"completion_tokens":10,"prefill_duration_ttft":7.53,
+/// "decoding_duration":0.97,"prefill_speed_tps":39.69,"decoding_speed_tps":10.36
 /// ```
 ///
 /// It reports the rates too, but the counts and durations are what get used:
 /// they divide out to the same figures and, unlike a rate, can be summed across
 /// requests to average a window.
 pub fn parse_throughput(line: &str) -> Vec<Sample> {
-    let Some((_, json)) = line.split_once("ChatCompletionChunk:") else { return Vec::new() };
-    let Ok(chunk) = serde_json::from_str::<serde_json::Value>(json.trim()) else {
-        return Vec::new();
-    };
-    // Only the closing chunk of a stream carries usage.
-    let Some(usage) = chunk.get("usage") else { return Vec::new() };
+    let Some(usage) = usage(line) else { return Vec::new() };
 
     let read = |tokens: &str, duration: &str, phase: Phase| -> Option<Sample> {
         let sample = Sample {
             phase,
             tokens: usage.get(tokens)?.as_u64()?,
             seconds: usage.get(duration)?.as_f64()?,
+            // `flm serve` runs one request at a time.
+            slot: None,
         };
         sample.rate().is_some().then_some(sample)
     };
     [
         read("prompt_tokens", "prefill_duration_ttft", Phase::Prefill),
         read("completion_tokens", "decoding_duration", Phase::Decode),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// A request's stage, from the lines `flm serve` prints as it reaches each:
+///
+/// ```text
+/// [FLM]  Start prefill...
+/// [FLM]  Prefill chunk 2/4 with 512 tokens
+/// [FLM]  Start generating...
+/// ```
+///
+/// No token count or rate comes until the request's [`usage`], so neither is
+/// claimed. Prefill progress is the chunks already done, shown only for a
+/// prompt long enough to take several. Matched anywhere in the line: `flm`
+/// writes from several threads, and lines arrive spliced together.
+pub fn parse_live(line: &str) -> Option<crate::session::throughput::Live> {
+    use crate::session::throughput::Live;
+    let stage = |phase, progress| Live {
+        phase,
+        tokens: None,
+        rate: None,
+        progress,
+        slot: None,
+        until_done: true,
+    };
+    if line.contains("[FLM]  Start generating...") {
+        return Some(stage(Phase::Decode, None));
+    }
+    if line.contains("[FLM]  Start prefill...") {
+        return Some(stage(Phase::Prefill, None));
+    }
+    let (_, rest) = line.split_once("[FLM]  Prefill chunk ")?;
+    let (done, rest) = rest.split_once('/')?;
+    let total: f64 = rest.split_whitespace().next()?.parse().ok()?;
+    let chunk: f64 = done.parse().ok()?;
+    let progress = (total > 1.0).then(|| (chunk - 1.0) / total);
+    Some(stage(Phase::Prefill, progress))
+}
+
+/// The end of a request, finished or cancelled: `flm serve` releases the NPU
+/// after every one, which a cancelled request, with no usage to close it,
+/// still does.
+pub fn parse_end(line: &str) -> bool {
+    line.contains("NPU Lock Released!")
+}
+
+/// Context size and use from a request's [`usage`], which FastFlowLM fills
+/// with the KV cache's own figures: `active_kv_tokens` of
+/// `max_kv_token_capacity`.
+pub fn parse_context(line: &str) -> Vec<crate::session::context::Reading> {
+    use crate::session::context::Reading;
+    let Some(usage) = usage(line) else { return Vec::new() };
+    let field = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64);
+    [
+        field("max_kv_token_capacity").map(Reading::Size),
+        field("active_kv_tokens").map(Reading::Used),
     ]
     .into_iter()
     .flatten()
@@ -1260,6 +1356,116 @@ mod tests {
         assert_eq!(commit_order(["model.q4nx"]), ["model.q4nx"]);
     }
 
+    /// A closing chunk's usage, as a real `flm serve` log reports the KV cache.
+    #[test]
+    fn context_size_and_use_are_read_from_the_closing_chunk() {
+        use crate::session::context::Reading;
+        let line = r#"ChatCompletionChunk: {"choices":[],"usage":{"prompt_tokens":299,"completion_tokens":35,"total_tokens":334,"active_kv_tokens":334,"max_kv_token_capacity":32768,"kv_token_occupancy_rate_percentage":1.019287109375}}"#;
+        assert_eq!(parse_context(line), vec![Reading::Size(32768), Reading::Used(334)]);
+        assert!(parse_context(r#"ChatCompletionChunk: {"choices":[]}"#).is_empty());
+        assert!(parse_context("[FLM]  Creating checkpoint at context length 299").is_empty());
+    }
+
+    /// Verbatim stage lines from real flm 1.0.10 logs, in the order a request
+    /// prints them, including one spliced into another thread's output.
+    #[test]
+    fn a_request_in_progress_is_read_from_its_stage_lines() {
+        let live = |line| parse_live(line).map(|l| (l.phase, l.progress, l.tokens, l.until_done));
+        assert_eq!(live("[FLM]  Start prefill..."), Some((Phase::Prefill, None, None, true)));
+        assert_eq!(
+            live("[FLM]  Prefill chunk 1/1 with 13 tokens"),
+            Some((Phase::Prefill, None, None, true)),
+            "one chunk: no progress worth showing"
+        );
+        assert_eq!(
+            live("[FLM]  Prefill chunk 3/4 with 512 tokens"),
+            Some((Phase::Prefill, Some(0.5), None, true)),
+            "two of four done"
+        );
+        assert_eq!(live("[FLM]  Start generating..."), Some((Phase::Decode, None, None, true)));
+        assert_eq!(
+            live("[LOG]  Version: 10[FLM]  Start generating..."),
+            Some((Phase::Decode, None, None, true))
+        );
+        assert_eq!(live("[FLM]  Model loaded in 10.07 s"), None);
+        assert!(parse_end("[🔵 ]  NPU Lock Released!"));
+        assert!(!parse_end("[🔴 ]  Client disconnected; cancelling active request"));
+        assert!(!parse_end("[🟢 ]  NPU Locked!"));
+    }
+
+    /// A whole request from a real flm 1.0.10 log, fed line by line through
+    /// the same parsers the session manager runs: Reading, then Generating
+    /// through the quiet of decoding, then idle with the request's rates.
+    #[test]
+    fn a_logged_request_reads_as_reading_then_generating_then_idle() {
+        use crate::session::throughput::{Activity, Throughput};
+        let parse = crate::runtime::log_parsers(NAME);
+        let request = [
+            "[🟢 ]  NPU Locked!",
+            "[FLM]  Prompt cache miss.",
+            "[FLM]  Start prefill...",
+            "[FLM]  Prefill chunk 1/1 with 13 tokens",
+            "\u{1b}[31m[FLM]  Creating checkpoint at context length 13\u{1b}[0m",
+            "[FLM]  Start generating...",
+            "[FLM]  Model RAW Output: ",
+            "Okay, so I need to explain what Git rebase does in two sentences.",
+            r#"Usage: {"prompt_tokens":13,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens":510,"total_tokens":523,"active_kv_tokens":523,"max_kv_token_capacity":32768,"kv_token_occupancy_rate_percentage":1.59,"load_duration":2.1e-06,"prefill_duration_ttft":0.42,"decoding_duration":34.0,"prefill_speed_tps":30.95,"decoding_speed_tps":15.0}"#,
+            "[🔒 ]  Closing TCP connection (streaming, non-keep-alive)",
+            "[🔵 ]  NPU Lock Released!",
+        ];
+        let now = std::time::Instant::now();
+        let mut throughput = Throughput::default();
+        let mut seen = Vec::new();
+        for line in request {
+            if let Some(live) = (parse.live)(line) {
+                throughput.record_live(live, now);
+            }
+            if (parse.ends)(line) {
+                throughput.record_end(None);
+            }
+            for sample in (parse.throughput)(line) {
+                throughput.record(sample);
+            }
+            let state = match throughput.activity(now) {
+                Some(Activity::Reading(_)) => "reading",
+                Some(Activity::Generating(_)) => "generating",
+                Some(Activity::Idle) => "idle",
+                None => "silent",
+            };
+            if seen.last() != Some(&state) {
+                seen.push(state);
+            }
+        }
+        assert_eq!(seen, ["silent", "reading", "generating", "idle"]);
+        assert!((throughput.rate(Phase::Decode).unwrap() - 15.0).abs() < 0.01);
+
+        // Cancelled mid-generation: no usage, but the NPU is still released.
+        throughput.record_live((parse.live)("[FLM]  Start generating...").unwrap(), now);
+        assert!(matches!(throughput.activity(now), Some(Activity::Generating(_))));
+        assert!((parse.ends)("[🔵 ]  NPU Lock Released!"));
+        throughput.record_end(None);
+        assert_eq!(throughput.activity(now), Some(Activity::Idle));
+    }
+
+    /// Verbatim from a real flm 1.0.10 log: the closing chunk has no usage any
+    /// more, and the line after it does.
+    #[test]
+    fn flm_1_0_10_logs_usage_on_its_own_line_after_the_closing_chunk() {
+        use crate::session::context::Reading;
+        let closing = r#"ChatCompletionChunk: {"id":"chatcmpl-208b4c02e56a655e09cf3b0f","object":"chat.completion.chunk","created":1792967802,"model":"qwen3.6-moe:35b-a3b","system_fingerprint":"fp_19267b9e7025bb41","choices":[{"index":0,"delta":{"content":null},"finish_reason":"stop"}]}"#;
+        let usage = r#"Usage: {"prompt_tokens":304,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens":1109,"total_tokens":1413,"active_kv_tokens":1416,"max_kv_token_capacity":32768,"kv_token_occupancy_rate_percentage":4.3212890625,"load_duration":2.695e-06,"prefill_duration_ttft":6.2892416,"decoding_duration":73.998832,"prefill_speed_tps":48.33651167097795,"decoding_speed_tps":14.986723033682479}"#;
+        assert!(parse_throughput(closing).is_empty());
+        assert!(parse_context(closing).is_empty());
+
+        let samples = parse_throughput(usage);
+        assert_eq!(samples.len(), 2);
+        assert_eq!((samples[0].phase, samples[0].tokens), (Phase::Prefill, 304));
+        assert_eq!((samples[1].phase, samples[1].tokens), (Phase::Decode, 1109));
+        assert!((samples[1].rate().unwrap() - 14.9867).abs() < 0.001);
+        assert_eq!(parse_context(usage), vec![Reading::Size(32768), Reading::Used(1416)]);
+        assert!(parse_throughput("Usage: not json").is_empty());
+    }
+
     /// A verbatim closing chunk from a real `flm serve` log.
     #[test]
     fn per_request_timings_are_read_from_the_closing_chunk() {
@@ -1400,6 +1606,50 @@ mod tests {
     }
 
     #[test]
+    fn an_npu_is_present_when_the_xdna_driver_has_a_device_bound() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let driver = std::env::temp_dir().join(format!("llmctl-amdxdna-{nonce}"));
+        // The driver loaded with nothing bound: only its own files.
+        for file in ["bind", "unbind", "uevent", "new_id", "remove_id"] {
+            std::fs::create_dir_all(&driver).unwrap();
+            std::fs::write(driver.join(file), "").unwrap();
+        }
+        std::fs::create_dir_all(driver.join("module")).unwrap();
+        assert!(!npu_present(&driver));
+        std::fs::create_dir_all(driver.join("0000:c8:00.1")).unwrap();
+        assert!(npu_present(&driver));
+        assert!(!npu_present(Path::new("/nonexistent/llmctl/amdxdna")), "no driver, no NPU");
+        let _ = std::fs::remove_dir_all(&driver);
+    }
+
+    #[test]
+    fn fastflowlm_is_listed_with_an_npu_or_an_flm_but_not_with_neither() {
+        let backend = |binary: Option<&str>, npu_present| FlmBackend {
+            runtime: Runtime {
+                name: NAME.into(),
+                description: String::new(),
+                version: None,
+                binary_path: binary.map(PathBuf::from),
+                bench_path: None,
+                formats: vec![],
+                devices: vec![],
+            },
+            npu_ready: false,
+            npu_problem: None,
+            npu_present,
+            catalog_cache: Mutex::new(None),
+        };
+        assert!(!backend(None, false).listed(), "no NPU and no flm: nothing to offer");
+        let no_flm = backend(None, true);
+        assert!(no_flm.listed(), "an NPU without flm is shown, dimmed");
+        assert_eq!(no_flm.unavailable_reason().as_deref(), Some("flm binary not found on PATH"));
+        assert!(backend(Some("/usr/bin/flm"), false).listed(), "flm with no NPU says why");
+    }
+
+    #[test]
     fn all_resolved_defaults_pass_launch_validation() {
         let backend = FlmBackend {
             runtime: Runtime {
@@ -1413,6 +1663,7 @@ mod tests {
             },
             npu_ready: true,
             npu_problem: None,
+            npu_present: true,
             catalog_cache: Mutex::new(None),
         };
         let model =
@@ -1456,6 +1707,7 @@ mod tests {
             },
             npu_ready: true,
             npu_problem: None,
+            npu_present: true,
             catalog_cache: Mutex::new(None),
         };
         let model =
@@ -1494,6 +1746,7 @@ mod tests {
             },
             npu_ready: true,
             npu_problem: None,
+            npu_present: true,
             catalog_cache: Mutex::new(None),
         };
         let model =
@@ -1522,6 +1775,7 @@ mod tests {
             },
             npu_ready: true,
             npu_problem: None,
+            npu_present: true,
             catalog_cache: Mutex::new(None),
         };
         let model =

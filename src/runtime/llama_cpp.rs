@@ -964,8 +964,80 @@ pub fn parse_throughput(line: &str) -> Vec<Sample> {
     let Some(tokens) = rest.split_once('/').and_then(|(_, after)| leading_number(after)) else {
         return Vec::new();
     };
-    let sample = Sample { phase, tokens: tokens as u64, seconds: milliseconds / 1000.0 };
+    let sample = Sample {
+        phase,
+        tokens: tokens as u64,
+        seconds: milliseconds / 1000.0,
+        slot: slot_id(line),
+    };
     if sample.rate().is_none() { Vec::new() } else { vec![sample] }
+}
+
+/// The slot a `slot …: id  3 | task 488 | …` line is about. Parallel slots run
+/// requests side by side, and their lines interleave in one log.
+fn slot_id(line: &str) -> Option<u32> {
+    let (_, rest) = line.split_once(": id ")?;
+    let rest = rest.trim_start();
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// A request in progress, from the reports llama-server prints about every
+/// three seconds while it works:
+///
+/// - `prompt processing, n_tokens = 2048, progress = 0.76, t = 7.47 s / 274.25
+///   tokens per second` while it reads the prompt;
+/// - `n_gen = 865, tg = 34.99 t/s, tg_3s = 29.75 t/s` while it generates —
+///   `n_decoded = …, tg = …` on older builds, which have no three-second rate.
+///
+/// The three-second rate is preferred: it is what the server is doing now,
+/// where `tg` averages back to the start of the request.
+pub fn parse_live(line: &str) -> Option<crate::session::throughput::Live> {
+    use crate::session::throughput::Live;
+    let after = |key: &str| line.split_once(key).and_then(|(_, rest)| leading_number(rest));
+    if line.contains("prompt processing, n_tokens =") {
+        return Some(Live {
+            phase: Phase::Prefill,
+            tokens: Some(after("n_tokens =")? as u64),
+            rate: Some(after(" s /")?),
+            progress: after("progress ="),
+            slot: slot_id(line),
+            until_done: false,
+        });
+    }
+    let tokens = after("| n_gen =").or_else(|| after("| n_decoded ="))?;
+    Some(Live {
+        phase: Phase::Decode,
+        tokens: Some(tokens as u64),
+        rate: Some(after("tg_3s =").or_else(|| after(", tg ="))?),
+        progress: None,
+        slot: slot_id(line),
+        until_done: false,
+    })
+}
+
+/// Context size and use from llama-server's slot lines.
+///
+/// The size is per slot: `load_model: …, n_ctx_slot = 16384` (older builds:
+/// `new slot, n_ctx = 16384`), the context one request can fill however many
+/// slots share the KV cache. The use is the slot's whole context when a
+/// request releases it — `stop processing: n_tokens = 97` (older: `n_past`) —
+/// which counts the cached prefix that `prompt eval` leaves out.
+pub fn parse_context(line: &str) -> Vec<crate::session::context::Reading> {
+    use crate::session::context::Reading;
+    let after = |key: &str| line.split_once(key).and_then(|(_, rest)| leading_number(rest));
+    if line.contains("stop processing:") {
+        if let Some(used) = after("n_tokens =").or_else(|| after("n_past =")) {
+            return vec![Reading::Used(used as u64)];
+        }
+    } else if let Some(size) = after("n_ctx_slot =") {
+        return vec![Reading::Size(size as u64)];
+    } else if line.contains("new slot")
+        && let Some(size) = after("n_ctx =")
+    {
+        return vec![Reading::Size(size as u64)];
+    }
+    Vec::new()
 }
 
 /// The number at the start of `text`, ignoring the spaces llama.cpp pads its
@@ -1439,6 +1511,87 @@ mod tests {
         assert!(local_deletion(&test_model(), &[test_model()]).is_none());
     }
 
+    /// Verbatim lines from a real session log (b0-620d222, four slots sharing
+    /// a unified KV cache).
+    #[test]
+    fn context_size_and_use_are_read_from_the_slot_lines() {
+        use crate::session::context::Reading;
+        let load = "0.09.324.355 I srv    load_model: initializing, n_slots = 4, \
+                    n_ctx_slot = 16384, kv_unified = 'true'";
+        assert_eq!(parse_context(load), vec![Reading::Size(16384)]);
+        let release = "20.20.352.451 I slot      release: id  0 | task 2 | stop processing: \
+                       n_tokens = 48, truncated = 0";
+        assert_eq!(parse_context(release), vec![Reading::Used(48)]);
+        // Older builds.
+        assert_eq!(
+            parse_context("slot load_model: id  0 | task -1 | new slot, n_ctx = 8192"),
+            vec![Reading::Size(8192)]
+        );
+        assert_eq!(
+            parse_context(
+                "slot release: id  0 | task 7 | stop processing: n_past = 97, truncated = 0"
+            ),
+            vec![Reading::Used(97)]
+        );
+        // Picking a slot is not finishing a request in it.
+        let select = "20.19.333.318 I slot get_availabl: id  0 | task -1 | selected slot by LRU, \
+                      n_tokens = 0, t_last = -1";
+        assert!(parse_context(select).is_empty());
+    }
+
+    /// Verbatim progress lines from real session logs, current and older builds.
+    #[test]
+    fn a_request_in_progress_is_read_from_its_progress_lines() {
+        use crate::session::throughput::Live;
+        let generating = "2.06.630.707 I slot print_timing: id  0 | task 488 | n_gen =    100, \
+                          tg =  28.06 t/s, tg_3s =  28.35 t/s";
+        assert_eq!(
+            parse_live(generating),
+            Some(Live {
+                phase: Phase::Decode,
+                tokens: Some(100),
+                rate: Some(28.35),
+                progress: None,
+                slot: Some(0),
+                until_done: false,
+            }),
+            "the three-second rate is what the server is doing now"
+        );
+        let older = "0.13.460.646 I slot print_timing: id  3 | task 0 | n_decoded =    102, tg =  50.57 t/s";
+        assert_eq!(
+            parse_live(older),
+            Some(Live {
+                phase: Phase::Decode,
+                tokens: Some(102),
+                rate: Some(50.57),
+                progress: None,
+                slot: Some(3),
+                until_done: false,
+            })
+        );
+        let reading = "4.31.551.562 I slot print_timing: id  3 | task 0 | prompt processing, \
+                       n_tokens =   2048, progress = 0.76, t =   7.47 s / 274.25 tokens per second";
+        assert_eq!(
+            parse_live(reading),
+            Some(Live {
+                phase: Phase::Prefill,
+                tokens: Some(2048),
+                rate: Some(274.25),
+                progress: Some(0.76),
+                slot: Some(3),
+                until_done: false,
+            })
+        );
+        // A finished request's summary is not progress.
+        let summary = "2.30.023.298 I slot print_timing: id  0 | task 488 |        eval time =   \
+                       26920.39 ms /   931 tokens (   28.95 ms per token,    34.55 tokens per second)";
+        assert_eq!(parse_live(summary), None);
+        assert_eq!(
+            parse_live("slot release: id 0 | task 488 | stop processing: n_tokens = 1227"),
+            None
+        );
+    }
+
     /// Verbatim lines from a real session log.
     #[test]
     fn per_request_timings_are_read_from_the_server_log() {
@@ -1450,13 +1603,16 @@ mod tests {
         let prefill = parse_throughput(pp);
         assert_eq!(
             prefill,
-            vec![Sample { phase: Phase::Prefill, tokens: 3266, seconds: 10.43632 }]
+            vec![Sample { phase: Phase::Prefill, tokens: 3266, seconds: 10.43632, slot: Some(3) }]
         );
         // Divides out to the rate the server itself printed.
         assert!((prefill[0].rate().unwrap() - 312.95).abs() < 0.01);
 
         let decode = parse_throughput(tg);
-        assert_eq!(decode, vec![Sample { phase: Phase::Decode, tokens: 174, seconds: 9.37948 }]);
+        assert_eq!(
+            decode,
+            vec![Sample { phase: Phase::Decode, tokens: 174, seconds: 9.37948, slot: Some(3) }]
+        );
         assert!((decode[0].rate().unwrap() - 18.55).abs() < 0.01);
     }
 

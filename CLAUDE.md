@@ -64,8 +64,10 @@ src/
                  (Template type; tables live with the backends), store.rs
                  (per-model YAML), mod.rs (resolution layering)
   session/       command.rs (argv/display), supervisor.rs (owned children, setsid/signals),
-                 record.rs (session-<id>.json), proc.rs (/proc), health.rs (/health), mod.rs (SessionManager)
-  ui/            ratatui rendering (browser columns, Session Manager, log view, footer, prompts, help)
+                 record.rs (session-<id>.json), proc.rs (/proc), health.rs (/health),
+                 mod.rs (SessionManager)
+  ui/            ratatui rendering (browser columns, Session Manager, log view, footer, prompts, help);
+                 monitor.rs (the Session Manager's Monitor pane)
 docs/            requirements, architecture, decisions (ADRs), roadmap
 ```
 

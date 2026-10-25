@@ -1,5 +1,6 @@
 //! Presentation state for the jobs list and log viewer.
 use super::SessionPane;
+use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 
 pub struct SessionViewState {
@@ -9,17 +10,27 @@ pub struct SessionViewState {
     pub log_lines: Vec<String>,
     pub log_follow: bool,
     pub log_scroll: u16,
+    /// How many rows the Log pane beside the list is scrolled back from the
+    /// end of the log; 0 follows the tail.
+    pub pane_log_back: usize,
+    /// Where the list and the column beside it were last drawn, so a mouse
+    /// wheel can be routed to whichever the pointer is over.
+    pub list_area: Option<Rect>,
+    pub detail_area: Option<Rect>,
 }
 
 impl Default for SessionViewState {
     fn default() -> Self {
         Self {
-            pane: SessionPane::Detail,
+            pane: SessionPane::Monitor,
             detail_pane_visible: true,
             selection: ListState::default(),
             log_lines: vec![],
             log_follow: true,
             log_scroll: 0,
+            pane_log_back: 0,
+            list_area: None,
+            detail_area: None,
         }
     }
 }

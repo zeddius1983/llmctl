@@ -464,6 +464,15 @@ real server lives inside a container. This works without special-casing because
 argv match, and the container shares the host PID and network namespaces. Any
 runtime fronted by a launcher script benefits from the same mechanism.
 
+*Listing (2026-10-26).* FastFlowLM appears in the Runtime column only where
+there is something to use: an NPU bound to the kernel's `amdxdna` driver (a
+PCI-address entry under `/sys/bus/pci/drivers/amdxdna`), or an installed `flm`.
+A machine with neither — the common case away from Ryzen AI — never sees it.
+One with the NPU but no `flm`, or `flm` with the NPU stack not ready, shows it
+dimmed, with the reason on the status line. The rule lives behind
+`RuntimeBackend::listed` (default: always), and any unusable runtime that is
+listed is dimmed.
+
 ## ADR-013: llmctl downloads FastFlowLM models, not `flm pull`
 
 **Status:** Accepted (2026-07-27). Amends the *Downloads* section of ADR-012.
@@ -1053,3 +1062,122 @@ remain opt-in. Initial discovery still runs before the first frame, and the UI
 may briefly display its previous catalog while a refresh is pending. No Tokio
 runtime or supervisor daemon is required. Formatting, build, tests, and strict
 Clippy checks run in CI to preserve the verified baseline.
+
+---
+
+## ADR-021: The Session Manager's Monitor replaces the Detail pane
+
+**Status:** Accepted (2026-10-24); machine figures removed (2026-10-26).
+
+**Context:** The Detail pane beside the session list mostly restated the row it
+sat next to (see the roadmap). `strata monitor` showed what a live view of a
+server could be instead: tiles with a current value and a minute of history,
+then how full the machine is, then the latest requests. It is a full-screen
+monitor fed by Strata's own `/metrics`. llmctl's servers have no such endpoint,
+and the session list should stay visible.
+
+**Decision:** The column beside the list becomes a **Monitor**. `l`/`→` still
+swaps it for the log tail. The pane is titled ` Monitor │ Log ` with the view on
+screen highlighted, so the key reads as a switch between two named views. A
+download keeps its facts there.
+
+*Layout.* Tiles are boxed, with the title in the border, so the pane reads as
+panels rather than loose text. One header line, as `strata monitor` heads its view: `● Running ·
+http://127.0.0.1:8000/v1 · gemma-4-e4b 16K · 38m 32s`. That is status, the
+endpoint (what one copies out to point a client at the server), the model with
+its context size, and uptime. The model name truncates first when the pane is
+narrow. The compute backend is a column of the row beside it, and the PID is to
+become one. A narrow pane sheds the uptime and then the name, which the list
+shows, before it wraps. Next come the decode and prefill tiles and the
+context-fill bar. The log path and command are
+left out: `L` and `y` reach them. A list of recent requests was tried and
+dropped; it belongs in a Requests view.
+
+*Sources.* Everything comes from the server's own log:
+
+- Per-session rates come from the throughput samples already parsed from the
+  log (ADR-016). `Throughput` now keeps its last sixty measurements and pairs
+  a prefill followed by a decode into one request. Both runtimes report them in
+  that order.
+- Live progress comes from the log as well. While a request runs, llama.cpp
+  prints `prompt processing, n_tokens = 2048, progress = 0.76, t = 7.47 s /
+  274.25 tokens per second`, then `n_gen = 865, tg = 34.99 t/s, tg_3s = 29.75
+  t/s` (older builds: `n_decoded = …, tg = …`), about every three seconds.
+  These drive the header's status (`▶ Reading 76%` / `▶ Generating 781
+  tokens` in place of `● Running`, with no rate), the live
+  decode and prefill tiles, and the Session Manager's `tg`/`pp` columns, which
+  show a live figure in green. The three-second `tg_3s` is preferred over `tg`,
+  which averages back to the start of the request. A live reading lapses after
+  ten seconds without another, so a cancelled request cannot leave a session
+  looking busy.
+  - FastFlowLM 1.0.10 reports stages, not progress: `Start prefill...`,
+    `Prefill chunk 2/4 with 512 tokens`, `Start generating...`, and `NPU Lock
+    Released!` after every request, cancelled ones included. So the header
+    reads `▶ Reading` (with a percentage for a prompt of several chunks), then
+    `▶ Generating` with no token count, and the tiles keep the last finished
+    rate, since no live rate exists. Decoding prints nothing until it ends, so
+    these readings stand until the release line rather than lapsing after ten
+    seconds (`Live::until_done`, `LogParsers::ends`).
+  - Live readings are kept per server slot (llama.cpp's `id N` on every slot
+    line), and a summary ends only the request in its own slot. Parallel
+    slots interleave their lines in one log, and one request finishing must
+    not make another still generating read as idle. With several running,
+    the one that reported last speaks for the session.
+- Context size and use come from the log too, through a second per-runtime
+  parser beside the throughput one (`runtime::context_parser`).
+  - llama.cpp gives the per-slot size at load (`n_ctx_slot = 16384`) and the
+    slot's whole context when a request releases it (`stop processing:
+    n_tokens = 97`). That count includes the cached prefix, which the
+    `prompt eval` count leaves out.
+  - FastFlowLM gives both in each closing usage chunk (`active_kv_tokens` of
+    `max_kv_token_capacity`).
+  - No HTTP is needed. A rediscovered session's log tail resumes near the end
+    of the file, past llama.cpp's one-off load line, so its capacity is read
+    from the first 256 KiB of the log instead (`context::capacity_from_head`).
+
+*Cadence.* The tick stays at 250 ms. Rate histories advance per request, not
+per second, sixty deep, so an idle server's sparkline does not decay to zero.
+
+*Rendering.* The Monitor is text. Sparklines and bars are block characters
+built by pure functions in `ui/monitor.rs`, so widths are unit-tested against
+the narrowest pane rather than eyeballed. Sparklines are two rows tall
+(`SPARK_ROWS`, sixteen levels); one row of eight flattened every history into a
+strip. Tiles go two to a row from 38 columns and one below that.
+
+*Mouse (2026-10-26).* llmctl captures the mouse so the wheel scrolls what is
+under the pointer: the browser's lists, the session list, the Log pane beside
+it (which keeps its last 200 lines and otherwise follows the tail, with `↓ N
+more rows` on its border while scrolled back), and the full-screen log.
+Without capture, terminals turn the wheel into arrow keys, which moved the
+session list whatever the pointer was over. Clicks are not used, and an open
+popup ignores the wheel. Capture is released around foreground tools (chat,
+benchmark), on exit, and by a panic hook. The cost is the usual one: selecting
+text with the mouse needs Shift held.
+
+*Machine figures: tried and removed (2026-10-26).* The first cut also showed
+the session's CPU and RSS, the GPU (busy, clock, power, temperature), VRAM/GTT
+and RAM bars, and PCIe link and throughput. All of it went: it duplicated what
+nvtop and btop already do better, across vendors, and it had no answer for
+several GPUs — tiles per GPU push the session off the pane, and following one
+hides where a split model sits. The Monitor keeps only what the server itself
+reports, which no system monitor can see. What was learned, for whoever
+revisits it:
+
+- NVIDIA's driver publishes none of `amdgpu`'s sysfs files. `nvidia-smi
+  --query-gpu` costs tens of milliseconds a call (so a worker thread), and
+  `nvidia-smi dmon -s t -c 1` gives PCIe MB/s each way. Inside a distrobox the
+  driver is visible but `nvidia-smi` usually is not; the host's runs through
+  `distrobox-host-exec` in about 80 ms.
+- AMD discrete cards report their link in sysfs (`current_link_speed`/`width`)
+  but RDNA has no throughput counter; `pcie_bw` is Vega and older and sleeps a
+  second per read. An APU's link is the bridge inside the chip (Strix Halo:
+  `00:08.1`, Gen4 x16), told apart by a `gpu_metrics` format revision of 2 or 3.
+- Strix Halo's `gpu_metrics` v3.0 DRAM read/write counters read about 52 GB/s
+  against a `llama-bench` decode moving about 150 GB/s of weights. They cover
+  the whole SoC, and as 16-bit MB/s fields cannot pass 65.5 GB/s.
+
+**Consequences:** No new dependencies, endpoints, or launch flags. llama.cpp's
+`/slots` (serving state) is a follow-up. Request statistics drawn from the same
+log are the natural next addition. The other views Strata offers (Requests,
+Connect, Engine, …) are on the roadmap. Whether a model fits the GPU is a
+question for launch time, not for a live bar.

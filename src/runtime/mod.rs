@@ -421,6 +421,16 @@ pub trait RuntimeBackend: Send + Sync {
         false
     }
 
+    /// Whether the browser offers this runtime at all. One whose hardware the
+    /// machine lacks and whose tool is not installed has nothing to offer, and
+    /// listing it only invites a dead end; one that is merely not ready yet
+    /// stays listed, dimmed, with [`unavailable_reason`] saying why.
+    ///
+    /// [`unavailable_reason`]: RuntimeBackend::unavailable_reason
+    fn listed(&self) -> bool {
+        true
+    }
+
     /// Why this runtime cannot launch right now, or `None` if it is usable.
     /// Rendered in the status line and returned when a launch is attempted.
     fn unavailable_reason(&self) -> Option<String> {
@@ -445,18 +455,48 @@ pub fn templates_for(runtime: &str) -> &'static [Template] {
     }
 }
 
-/// How to read per-request rates out of a runtime's log, identified only by
-/// name.
+/// What a runtime's log says about its requests, one reader per kind of fact.
+pub struct LogParsers {
+    /// A finished request's rates.
+    pub throughput: fn(&str) -> Vec<crate::session::throughput::Sample>,
+    /// Context size and use.
+    pub context: fn(&str) -> Vec<crate::session::context::Reading>,
+    /// A request in progress.
+    pub live: fn(&str) -> Option<crate::session::throughput::Live>,
+    /// The end of a request, finished or not, for a runtime whose live
+    /// readings wait for one (see [`Live::until_done`]).
+    ///
+    /// [`Live::until_done`]: crate::session::throughput::Live::until_done
+    pub ends: fn(&str) -> bool,
+}
+
+/// How to read a runtime's log, identified only by name.
 ///
 /// The same exception as [`templates_for`], for the same reason: session
 /// records are read off disk at startup, long before any backend is in hand,
 /// and they carry the runtime's name rather than a handle to it. Everywhere a
 /// backend *is* available, dispatch goes through the trait.
-pub fn throughput_parser(runtime: &str) -> fn(&str) -> Vec<crate::session::throughput::Sample> {
+pub fn log_parsers(runtime: &str) -> LogParsers {
     match runtime {
-        flm::NAME => flm::parse_throughput,
-        llama_cpp::NAME => llama_cpp::parse_throughput,
-        _ => |_| Vec::new(),
+        flm::NAME => LogParsers {
+            throughput: flm::parse_throughput,
+            context: flm::parse_context,
+            live: flm::parse_live,
+            ends: flm::parse_end,
+        },
+        llama_cpp::NAME => LogParsers {
+            throughput: llama_cpp::parse_throughput,
+            context: llama_cpp::parse_context,
+            live: llama_cpp::parse_live,
+            // Its readings lapse on their own; a summary ends them early.
+            ends: |_| false,
+        },
+        _ => LogParsers {
+            throughput: |_| Vec::new(),
+            context: |_| Vec::new(),
+            live: |_| None,
+            ends: |_| false,
+        },
     }
 }
 
@@ -473,10 +513,11 @@ pub(crate) fn resolve_binary(binary: &str) -> Option<std::path::PathBuf> {
 
 /// Probe every known runtime, in display order.
 pub fn discover(config: &Config, paths: &Paths) -> Vec<Arc<dyn RuntimeBackend>> {
-    vec![
+    let all: Vec<Arc<dyn RuntimeBackend>> = vec![
         Arc::new(LlamaCppBackend::discover(&config.runtime.llama_cpp, &paths.cache_dir)),
         Arc::new(FlmBackend::discover(&config.runtime.fastflowlm)),
-    ]
+    ];
+    all.into_iter().filter(|backend| backend.listed()).collect()
 }
 
 #[cfg(test)]

@@ -11,6 +11,8 @@
 //! ```
 //! Columns slide left as the user drills in (`l`/`→`) and right on `h`/`←`.
 
+use std::time::Instant;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -27,6 +29,8 @@ use crate::app::{
 use crate::domain::human_size;
 use crate::session::throughput::{Phase, format_rate};
 use crate::session::{Session, SessionStatus, format_uptime};
+
+mod monitor;
 
 const ACCENT: Color = Color::Yellow;
 
@@ -182,7 +186,16 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
             .runtimes
             .items
             .iter()
-            .map(|r| ListItem::new(format!("{icon}  {}", r.descriptor().name)))
+            .map(|r| {
+                let item = ListItem::new(format!("{icon}  {}", r.descriptor().name));
+                // Listed but unusable (no binary, NPU not ready): dimmed, with
+                // the reason on the status line when it is hovered.
+                if r.unavailable_reason().is_some() {
+                    item.style(Style::default().fg(Color::DarkGray))
+                } else {
+                    item
+                }
+            })
             .collect(),
         Pane::Model => app
             .browser
@@ -532,17 +545,27 @@ fn status_color(status: SessionStatus) -> Color {
 /// The Session Manager: list of servers on the left, detail on the right.
 /// The narrowest a right-hand column is worth drawing.
 ///
-/// Under this every Detail line wraps into fragments and a log tail shows a few
+/// Under this every Monitor line wraps into fragments and a log tail shows a few
 /// characters per row — the pane stops answering anything and only takes width
 /// from the list, which is the one thing on this screen that must stay legible.
 const MIN_DETAIL_WIDTH: u16 = 44;
 
 /// Split the Session Manager's body into the jobs column and the pane beside
 /// it, which a narrow terminal does without entirely.
+///
+/// The pane takes 43% of the width and two columns more, which is what lets two
+/// of the Monitor's tiles sit side by side with room for a minute of history.
+///
+/// Whether there is a pane at all is decided on the 43% alone, so the extra
+/// columns widen the pane without bringing it onto terminals that had none.
 fn session_panes(body: Rect) -> (Rect, Option<Rect>) {
+    let share = (u32::from(body.width) * 43 / 100) as u16;
+    if share < MIN_DETAIL_WIDTH {
+        return (body, None);
+    }
     let [jobs, detail] =
-        Layout::horizontal([Constraint::Percentage(57), Constraint::Percentage(43)]).areas(body);
-    if detail.width < MIN_DETAIL_WIDTH { (body, None) } else { (jobs, Some(detail)) }
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(share + 2)]).areas(body);
+    (jobs, Some(detail))
 }
 
 fn draw_sessions(frame: &mut Frame, app: &mut App) {
@@ -563,6 +586,9 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
     // The key handler reads this: with no pane to swap, `l` opens the log full
     // screen rather than doing nothing.
     app.session_view.detail_pane_visible = detail.is_some();
+    // And the mouse handler these, to scroll whichever the pointer is over.
+    app.session_view.list_area = Some(jobs);
+    app.session_view.detail_area = detail;
     let [sessions, downloads] =
         Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(jobs);
     let focused = app.selected_server_session().is_some() || app.async_job_count() == 0;
@@ -578,9 +604,11 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
         match app.session_view.pane {
             // A download has no log, so its facts hold the column either way.
             SessionPane::Log if app.selected_server_session().is_some() => {
-                render_session_log(frame, detail, app.selected_server_session())
+                let back = app.session_view.pane_log_back;
+                app.session_view.pane_log_back =
+                    render_session_log(frame, detail, app.selected_server_session(), back);
             }
-            _ => render_session_detail(frame, detail, app),
+            _ => render_session_monitor(frame, detail, app),
         }
     }
 
@@ -601,8 +629,8 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
         }
     } else {
         let pane = match app.session_view.pane {
-            SessionPane::Detail => ("l", "log"),
-            SessionPane::Log => ("l", "detail"),
+            SessionPane::Monitor => ("l", "log"),
+            SessionPane::Log => ("l", "monitor"),
         };
         vec![
             ("x", "stop"),
@@ -627,6 +655,7 @@ fn draw_sessions(frame: &mut Frame, app: &mut App) {
 /// even when its content is shorter.
 const COL_PROFILE: usize = 12; // "[inquisitor]"
 const COL_PORT: usize = 6; // ":65535"
+const COL_PID: usize = 7; // "4194304", the most `pid_max` allows
 const COL_SIZE: usize = 8; // "11.3 GB"
 const COL_DEVICE: usize = 6; // "Vulkan"
 const COL_RATE: usize = 12; // "tg 67.73 t/s"
@@ -640,8 +669,9 @@ const RATE_FIGURE: usize = crate::session::throughput::RATE_WIDTH;
 const MISSING: &str = "—";
 /// Gap between columns. Wide enough that the eye reads the row as columns
 /// rather than as one run of text — the rate cells especially, which already
-/// carry a space inside them.
-const COL_GAP: usize = 4;
+/// carry a space inside them — and no wider: with eight columns, every space
+/// here costs eight that a narrow pane would rather spend on keeping one.
+const COL_GAP: usize = 3;
 /// Keep session metadata clear of the pane's right border.
 const ROW_RIGHT_PADDING: usize = 1;
 /// Below this much room for the model name, a column is not worth its space.
@@ -653,11 +683,12 @@ const MAX_NAME: usize = 32;
 ///
 /// Deliberately not right-to-left: the uptime sits at the far right but is
 /// worth more than the size or the backend, which never change once a session
-/// is up. The Detail pane carries every one of them regardless.
-const DROP_ORDER: [Column; 6] = [
+/// is up. The Monitor carries every one of them regardless.
+const DROP_ORDER: [Column; 7] = [
     Column::Size,
     Column::Device,
     Column::Profile,
+    Column::Pid,
     Column::Prefill,
     Column::Uptime,
     Column::Decode,
@@ -667,6 +698,7 @@ const DROP_ORDER: [Column; 6] = [
 enum Column {
     Profile,
     Port,
+    Pid,
     Size,
     Device,
     Decode,
@@ -680,7 +712,9 @@ impl Column {
     /// Always something: a column that vanished when a session had no figure
     /// for it would shift every column after it out of line with the rows above
     /// and below, which is the whole point of having columns.
-    fn cell(self, session: &Session) -> String {
+    ///
+    /// `now` decides whether a request still in progress counts as live.
+    fn cell(self, session: &Session, now: Instant) -> String {
         match self {
             // Truncated rather than allowed to widen the column: a long profile
             // name must not shift every row below it.
@@ -688,10 +722,14 @@ impl Column {
                 format!("[{}]", truncate_right(&session.record.profile, COL_PROFILE - 2))
             }
             Column::Port => format!(":{}", session.record.port),
+            // The server's own process, once re-acquired behind any launcher
+            // wrapper. A session that has ended has no process to name.
+            Column::Pid if session.status.is_terminal() => MISSING.into(),
+            Column::Pid => session.record.pid.to_string(),
             Column::Size => session.record.size_bytes.map(human_size).unwrap_or(MISSING.into()),
             Column::Device => session.record.device.clone().unwrap_or(MISSING.into()),
-            Column::Decode => rate_cell("tg", session, Phase::Decode),
-            Column::Prefill => rate_cell("pp", session, Phase::Prefill),
+            Column::Decode => rate_cell("tg", session, Phase::Decode, now),
+            Column::Prefill => rate_cell("pp", session, Phase::Prefill, now),
             Column::Uptime => session.uptime_secs().map(format_uptime).unwrap_or(MISSING.into()),
         }
     }
@@ -700,6 +738,7 @@ impl Column {
         match self {
             Column::Profile => COL_PROFILE,
             Column::Port => COL_PORT,
+            Column::Pid => COL_PID,
             Column::Size => COL_SIZE,
             Column::Device => COL_DEVICE,
             Column::Decode | Column::Prefill => COL_RATE,
@@ -712,7 +751,7 @@ impl Column {
     fn pad(self, text: &str) -> String {
         let width = self.width();
         match self {
-            Column::Size | Column::Uptime => pad_left(text, width),
+            Column::Pid | Column::Size | Column::Uptime => pad_left(text, width),
             Column::Decode | Column::Prefill => pad_right(text, width),
             _ => pad_right(text, width),
         }
@@ -724,8 +763,9 @@ impl Column {
 ///
 /// A session that has served nothing yet shows the shape of the number rather
 /// than a blank, so a fresh server sits in the same columns as a busy one.
-fn rate_cell(label: &str, session: &Session, phase: Phase) -> String {
-    let value = session.throughput.rate(phase).map(format_rate).unwrap_or_else(|| {
+fn rate_cell(label: &str, session: &Session, phase: Phase, now: Instant) -> String {
+    let current = session.throughput.current(phase, now).map(|(rate, _)| rate);
+    let value = current.map(format_rate).unwrap_or_else(|| {
         match phase {
             // Decode is reported to two decimals and prefill whole, so their
             // placeholders differ too — each is the shape of what will replace it.
@@ -744,9 +784,10 @@ fn rate_cell(label: &str, session: &Session, phase: Phase) -> String {
 /// right edge and gives every row the same column starts regardless of
 /// model-name length.
 fn row_plan(width: usize, longest: usize) -> (usize, Vec<Column>) {
-    const ORDER: [Column; 7] = [
+    const ORDER: [Column; 8] = [
         Column::Profile,
         Column::Port,
+        Column::Pid,
         Column::Size,
         Column::Device,
         Column::Decode,
@@ -772,7 +813,14 @@ fn row_plan(width: usize, longest: usize) -> (usize, Vec<Column>) {
 }
 
 /// One session row: status, model, then the columns the pane agreed on.
-fn session_row(session: &Session, name_width: usize, columns: &[Column]) -> Line<'static> {
+/// One session's row. A rate column showing a request still in progress is
+/// green, as its tile in the Monitor is; everything else is dim.
+fn session_row(
+    session: &Session,
+    name_width: usize,
+    columns: &[Column],
+    now: Instant,
+) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
             format!("{} ", session.status.glyph()),
@@ -781,9 +829,16 @@ fn session_row(session: &Session, name_width: usize, columns: &[Column]) -> Line
         Span::raw(pad_right(&truncate_right(&session.record.name, name_width), name_width)),
     ];
     for column in columns {
+        let live = match column {
+            Column::Decode => session.throughput.current(Phase::Decode, now),
+            Column::Prefill => session.throughput.current(Phase::Prefill, now),
+            _ => None,
+        }
+        .is_some_and(|(_, live)| live);
+        spans.push(Span::raw(" ".repeat(COL_GAP)));
         spans.push(Span::styled(
-            format!("{}{}", " ".repeat(COL_GAP), column.pad(&column.cell(session))),
-            Style::default().fg(Color::DarkGray),
+            column.pad(&column.cell(session, now)),
+            Style::default().fg(if live { Color::Green } else { Color::DarkGray }),
         ));
     }
     spans.push(Span::raw(" ".repeat(ROW_RIGHT_PADDING)));
@@ -876,6 +931,7 @@ fn session_items(
     let longest = sessions.iter().map(|session| session.record.name.width()).max().unwrap_or(0);
     let (name_width, columns) = row_plan(width, longest);
     let indent = " ".repeat(SESSION_INDENT);
+    let now = Instant::now();
     let items = rows
         .iter()
         .map(|row| match row {
@@ -885,7 +941,7 @@ fn session_items(
             ))),
             SessionListRow::Session(index) => {
                 let mut spans = vec![Span::raw(indent.clone())];
-                spans.extend(session_row(&sessions[*index], name_width, &columns).spans);
+                spans.extend(session_row(&sessions[*index], name_width, &columns, now).spans);
                 ListItem::new(Line::from(spans))
             }
         })
@@ -952,7 +1008,7 @@ fn render_download_list(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// A live tail of the selected session's log, in the column the Detail pane
+/// A live tail of the selected session's log, in the column the Monitor
 /// otherwise holds.
 ///
 /// The lines come from the ring buffer [`crate::session::SessionManager::refresh`]
@@ -960,13 +1016,20 @@ fn render_download_list(frame: &mut Frame, area: Rect, app: &App) {
 /// files reach tens of megabytes, and re-reading one each frame is what the
 /// full-screen view does and can afford to, because nothing else is on screen.
 ///
-/// It always shows the end of the log. `j`/`k` still move between sessions, so
-/// there is no cursor to scroll it with; `L` opens the log where there is.
-fn render_session_log(frame: &mut Frame, area: Rect, session: Option<&Session>) {
-    let block = pane_block("Log", false);
+/// It shows the end of the log, or `back` rows before it once the mouse wheel
+/// has scrolled it. `j`/`k` still move between sessions, so the keyboard has
+/// no cursor to scroll it with; `L` opens the log where there is. Returns
+/// `back` clamped to what the log holds.
+fn render_session_log(
+    frame: &mut Frame,
+    area: Rect,
+    session: Option<&Session>,
+    back: usize,
+) -> usize {
+    let mut block = session_pane_block(SessionPane::Log);
     let Some(session) = session else {
         frame.render_widget(block, area);
-        return;
+        return 0;
     };
     let width = area.width.saturating_sub(2) as usize;
     let height = area.height.saturating_sub(2) as usize;
@@ -974,11 +1037,19 @@ fn render_session_log(frame: &mut Frame, area: Rect, session: Option<&Session>) 
     // Wrapped here rather than by `Wrap`, because the pane shows the *last*
     // rows and only a row count we did ourselves says which those are.
     let mut rows: Vec<String> = Vec::new();
-    for line in session.recent_log(height) {
+    for line in session.recent_log(usize::MAX) {
         rows.extend(wrap_hard(line, width));
     }
+    let back = back.min(rows.len().saturating_sub(height));
+    rows.truncate(rows.len() - back);
     if rows.len() > height {
         rows = rows.split_off(rows.len() - height);
+    }
+    if back > 0 {
+        block = block.title_bottom(
+            Line::styled(format!(" ↓ {back} more rows "), Style::default().fg(Color::DarkGray))
+                .right_aligned(),
+        );
     }
 
     let text = if rows.is_empty() {
@@ -987,6 +1058,7 @@ fn render_session_log(frame: &mut Frame, area: Rect, session: Option<&Session>) 
         Text::from(rows.into_iter().map(Line::raw).collect::<Vec<_>>())
     };
     frame.render_widget(Paragraph::new(text).block(block), area);
+    back
 }
 
 /// Break `text` into rows of at most `width` terminal columns.
@@ -1019,14 +1091,19 @@ fn wrap_hard(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
-fn render_session_detail(frame: &mut Frame, area: Rect, app: &App) {
-    let block = pane_block("Detail", false);
-    let text = if let Some(session) = app.selected_server_session() {
-        session_detail_lines(session)
+/// The column beside the jobs list: the selected session's Monitor, or a
+/// download's facts — a transfer has no server to monitor.
+fn render_session_monitor(frame: &mut Frame, area: Rect, app: &App) {
+    let (block, text) = if let Some(session) = app.selected_server_session() {
+        let width = usize::from(area.width.saturating_sub(2));
+        (
+            session_pane_block(SessionPane::Monitor),
+            monitor::monitor_lines(session, width, Instant::now()),
+        )
     } else if let Some(download) = app.selected_model_download() {
-        download_detail_lines(download)
+        (pane_block("Detail", false), download_detail_lines(download))
     } else {
-        frame.render_widget(block, area);
+        frame.render_widget(session_pane_block(SessionPane::Monitor), area);
         return;
     };
     frame.render_widget(Paragraph::new(text).block(block).wrap(Wrap { trim: false }), area);
@@ -1066,69 +1143,6 @@ fn download_detail_lines(download: &ModelDownload) -> Text<'static> {
         ),
         Line::raw(""),
         Line::from(detail),
-    ])
-}
-
-/// One `pp`/`tg` line for the Detail pane: the rate, and the request it came
-/// from — the server's own summary of the last thing it did.
-fn rate_line(label: &str, session: &Session, phase: Phase) -> Line<'static> {
-    let Some(last) = session.throughput.last(phase) else {
-        return kv(label, "—");
-    };
-    let Some(rate) = last.rate() else { return kv(label, "—") };
-    Line::from(vec![
-        Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
-        Span::raw(format!(
-            "{} t/s  ({} tok in {:.2}s)",
-            format_rate(rate),
-            last.tokens,
-            last.seconds
-        )),
-    ])
-}
-
-fn session_detail_lines(session: &Session) -> Text<'static> {
-    let r = &session.record;
-    let color = status_color(session.status);
-    let uptime = session.uptime_secs().map(format_uptime).unwrap_or_else(|| "—".into());
-    let mem = session.rss_bytes.map(human_size).unwrap_or_else(|| "—".into());
-    let cpu = session.cpu_percent.map(|c| format!("{c:.0}%")).unwrap_or_else(|| "—".into());
-    // The row sheds these two first when the pane narrows, so Detail is where
-    // they have to remain readable.
-    let size = r.size_bytes.map(human_size).unwrap_or_else(|| "—".into());
-    let device = r.device.clone().unwrap_or_else(|| "—".into());
-
-    Text::from(vec![
-        Line::from(r.name.clone().bold().fg(ACCENT)),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{} {}", session.status.glyph(), session.status_label()),
-                Style::default().fg(color),
-            ),
-        ]),
-        kv("Runtime", &r.runtime),
-        kv("Model", &r.model),
-        kv("Profile", &r.profile),
-        kv("Size", &size),
-        kv("Backend", &device),
-        Line::raw(""),
-        kv("PID", &r.pid.to_string()),
-        kv("Port", &r.port.to_string()),
-        kv("Uptime", &uptime),
-        kv("Memory", &mem),
-        kv("CPU", &cpu),
-        Line::raw(""),
-        Line::from("Throughput".bold()),
-        rate_line("Prefill", session, Phase::Prefill),
-        rate_line("Decode", session, Phase::Decode),
-        Line::raw(""),
-        kv("Endpoint", &r.endpoint()),
-        kv("Log", &r.log_file.display().to_string()),
-        Line::raw(""),
-        Line::from("Command".bold()),
-        Line::from(crate::session::command::Command { argv: r.command.clone() }.display()),
     ])
 }
 
@@ -1285,6 +1299,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::raw(""),
         Line::from("General".bold()),
         help_row("F5", "rescan / reload"),
+        help_row("wheel", "scroll the list or log under the pointer"),
         help_row("? / q", "help / quit"),
         Line::raw(""),
         Line::from("press ? or Esc to close".dim().italic()),
@@ -1442,6 +1457,31 @@ fn pane_block(title: &str, focused: bool) -> Block<'static> {
         .border_type(BorderType::Rounded)
         .border_style(border_style)
         .title(title)
+}
+
+/// The column beside the session list, titled with both of its views —
+/// ` Monitor │ Log ` — and the one on screen picked out, so `l` reads as a
+/// switch between two named things rather than a key to remember.
+fn session_pane_block(showing: SessionPane) -> Block<'static> {
+    let view = |name: &'static str, pane: SessionPane| {
+        if pane == showing {
+            Span::styled(
+                format!(" {name} "),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(format!(" {name} "), Style::default().fg(Color::DarkGray))
+        }
+    };
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Line::from(vec![
+            view("Monitor", SessionPane::Monitor),
+            Span::styled("│", Style::default().fg(Color::DarkGray)),
+            view("Log", SessionPane::Log),
+        ]))
 }
 
 /// A "key: value" line where the key is dimmed.
@@ -1695,8 +1735,18 @@ mod tests {
         use crate::session::throughput::{Phase, Sample, Throughput};
         let mut throughput = Throughput::default();
         if rates {
-            throughput.record(Sample { phase: Phase::Prefill, tokens: 3266, seconds: 2.292 });
-            throughput.record(Sample { phase: Phase::Decode, tokens: 174, seconds: 2.569 });
+            throughput.record(Sample {
+                phase: Phase::Prefill,
+                tokens: 3266,
+                seconds: 2.292,
+                slot: None,
+            });
+            throughput.record(Sample {
+                phase: Phase::Decode,
+                tokens: 174,
+                seconds: 2.569,
+                slot: None,
+            });
         }
         crate::session::Session::probe(
             SessionRecord {
@@ -1708,7 +1758,7 @@ mod tests {
                 profile: "inquisitor".into(),
                 size_bytes: Some(12_100_000_000),
                 device: Some("ROCm".into()),
-                pid: 1,
+                pid: 474342,
                 host: "127.0.0.1".into(),
                 port: 8001,
                 command: vec![],
@@ -1796,6 +1846,47 @@ mod tests {
         assert!(rows[heading + 3].contains("▌"), "cursor row: {:?}", rows[heading + 3]);
     }
 
+    /// Scrolled back by the wheel, the pane shows earlier rows and says how
+    /// many lie below; scrolled past the start, it stops at the first row.
+    #[test]
+    fn the_log_pane_scrolls_back_from_the_tail_and_stops_at_the_start() {
+        let lines: Vec<String> = (0..20).map(|i| format!("line {i:02}")).collect();
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let session = probe_session("muse", false).with_log(&lines);
+        // Four rows inside the border.
+        let draw = |back: usize| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 6)).unwrap();
+            let mut clamped = 0;
+            terminal
+                .draw(|frame| {
+                    clamped = render_session_log(frame, frame.area(), Some(&session), back);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let rows: Vec<String> = (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width).map(|x| buffer[(x, y)].symbol().to_string()).collect()
+                })
+                .collect();
+            (clamped, rows)
+        };
+
+        let (back, rows) = draw(0);
+        assert_eq!(back, 0);
+        assert!(rows[1].contains("line 16") && rows[4].contains("line 19"), "{rows:#?}");
+        assert!(!rows[5].contains("more rows"), "at the tail there is nothing below");
+
+        let (back, rows) = draw(5);
+        assert_eq!(back, 5);
+        assert!(rows[1].contains("line 11") && rows[4].contains("line 14"), "{rows:#?}");
+        assert!(rows[5].contains("↓ 5 more rows"), "{rows:#?}");
+
+        let (back, rows) = draw(999);
+        assert_eq!(back, 16, "clamped to the first screenful");
+        assert!(rows[1].contains("line 00"), "{rows:#?}");
+    }
+
     /// The pane is a tail: it shows the end of the log, and a line too long for
     /// the column wraps inside it rather than over the border beside it.
     #[test]
@@ -1808,7 +1899,11 @@ mod tests {
         ]);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
-        terminal.draw(|frame| render_session_log(frame, frame.area(), Some(&session))).unwrap();
+        terminal
+            .draw(|frame| {
+                render_session_log(frame, frame.area(), Some(&session), 0);
+            })
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rows: Vec<String> = (0..buffer.area.height)
             .map(|y| {
@@ -1836,7 +1931,11 @@ mod tests {
     fn an_unlogged_selection_leaves_an_empty_pane() {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 5)).unwrap();
-        terminal.draw(|frame| render_session_log(frame, frame.area(), None)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_session_log(frame, frame.area(), None, 0);
+            })
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let screen: String = (0..buffer.area.height)
             .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
@@ -2005,6 +2104,9 @@ mod tests {
         assert!(row.width() <= 60, "{row:?}");
     }
 
+    /// A list pane wide enough for every session column.
+    const WIDE: usize = 132;
+
     /// The rows a pane of `width` draws for these sessions.
     ///
     /// One plan for the set, the way the list does it: rows that sized their
@@ -2016,7 +2118,7 @@ mod tests {
         sessions
             .iter()
             .map(|session| {
-                super::session_row(session, name_width, &columns)
+                super::session_row(session, name_width, &columns, std::time::Instant::now())
                     .spans
                     .iter()
                     .map(|span| span.content.to_string())
@@ -2030,12 +2132,46 @@ mod tests {
     }
 
     /// The point of the columns: they line up regardless of name length.
+    /// The list's rate columns follow a request in progress, as the Monitor
+    /// does, and fall back to the last finished one when it ends.
+    #[test]
+    fn rate_columns_show_a_request_in_progress() {
+        use crate::session::throughput::{Live, Phase, Sample};
+        use unicode_width::UnicodeWidthStr;
+        let mut session = probe_session("qwen", true);
+        let finished = rows_text(std::slice::from_ref(&session), 160).remove(0);
+        assert!(finished.contains("tg 67.73 t/s"), "{finished}");
+
+        let live = Live {
+            phase: Phase::Decode,
+            tokens: Some(865),
+            rate: Some(29.75),
+            progress: None,
+            slot: None,
+            until_done: false,
+        };
+        session.throughput.record_live(live, std::time::Instant::now());
+        let running = rows_text(std::slice::from_ref(&session), 160).remove(0);
+        assert!(running.contains("tg 29.75 t/s"), "{running}");
+        assert!(running.contains("pp  1425 t/s"), "prefill keeps its last figure: {running}");
+        assert_eq!(running.width(), finished.width(), "a live figure keeps the columns in line");
+
+        session.throughput.record(Sample {
+            phase: Phase::Decode,
+            tokens: 931,
+            seconds: 26.92,
+            slot: None,
+        });
+        let done = rows_text(std::slice::from_ref(&session), 160).remove(0);
+        assert!(done.contains("tg 34.58 t/s"), "{done}");
+    }
+
     #[test]
     fn session_columns_align_across_rows() {
         // A pane wide enough for every column. The last row has served
         // nothing: a session without figures must still line up with one that
         // has them, which is why no column is ever omitted.
-        let width = 120;
+        let width = WIDE;
         let sessions: Vec<_> = [("a", true), ("gpt-oss-20b-q8_0", true), ("fresh", false)]
             .iter()
             .map(|(name, rates)| probe_session(name, *rates))
@@ -2049,7 +2185,7 @@ mod tests {
         // in characters, not bytes: the glyph and the ellipsis are multibyte.
         // Anchored on the labels, since the last row's figures are placeholders
         // — that they still start in the same column is exactly the point.
-        for cell in ["[inquisitor]", ":8001", "11.3 GB", "ROCm", "tg ", "pp ", "2h 34m"] {
+        for cell in ["[inquisitor]", ":8001", "474342", "11.3 GB", "ROCm", "tg ", "pp ", "2h 34m"] {
             let columns: Vec<Option<usize>> = rows
                 .iter()
                 .map(|row| row.find(cell).map(|byte| row[..byte].chars().count()))
@@ -2067,7 +2203,7 @@ mod tests {
     fn wide_characters_are_measured_in_terminal_columns() {
         use unicode_width::UnicodeWidthStr;
 
-        let width = 120;
+        let width = WIDE;
         let mut session = probe_session("通義千問-32B-指令", true);
         // Ten characters, and twice that many columns.
         session.record.profile = "深度思考模式一二三四".into();
@@ -2078,7 +2214,7 @@ mod tests {
         // The profile was cut down to its field rather than allowed to overrun.
         assert!(wide.contains('…'), "{wide:?}");
         // And every column after it starts where it does on an ASCII row.
-        for cell in [":8001", "11.3 GB", "ROCm", "tg ", "pp ", "2h 34m"] {
+        for cell in [":8001", "474342", "11.3 GB", "ROCm", "tg ", "pp ", "2h 34m"] {
             let at = |row: &str| row.find(cell).map(|byte| row[..byte].width());
             assert_eq!(at(&wide), at(&plain), "{cell} drifts: {wide:?}");
         }
@@ -2087,11 +2223,12 @@ mod tests {
     /// The requested order, left to right.
     #[test]
     fn session_columns_are_in_the_documented_order() {
-        let row = row_text(&probe_session("gpt-oss-20b-q8_0", true), 120);
+        let row = row_text(&probe_session("gpt-oss-20b-q8_0", true), WIDE);
         let order = [
             "gpt-oss-20b-q8_0",
             "[inquisitor]",
             ":8001",
+            "474342",
             "11.3 GB",
             "ROCm",
             "tg ",
@@ -2116,11 +2253,21 @@ mod tests {
             assert!(row.chars().count() <= width, "{width}: overflowed with {row:?}");
             row
         };
-        assert!(kept(120).contains("11.3 GB"), "everything fits on a wide pane");
+        let wide = kept(WIDE);
+        assert!(
+            wide.contains("11.3 GB") && wide.contains("474342"),
+            "everything fits on a wide pane"
+        );
         // Narrower: the size and the backend go before the uptime does.
         let tight = kept(80);
         assert!(!tight.contains("11.3 GB") && !tight.contains("ROCm"), "{tight}");
         assert!(tight.contains("2h 34m") && tight.contains("pp "), "{tight}");
+        // The PID outlives the static columns but not the rates.
+        let sized = |row: &str| row.contains("11.3 GB") || row.contains("ROCm");
+        let with_pid =
+            (52..WIDE).find(|w| kept(*w).contains("474342")).expect("a width with a PID");
+        assert!(!sized(&kept(with_pid)), "the PID went before the size or backend");
+        assert!(kept(with_pid).contains("pp "), "the PID went after prefill");
         // Narrower still: only the decode rate survives beside port and uptime.
         let tighter = kept(52);
         assert!(!tighter.contains("pp "), "{tighter}");
@@ -2145,8 +2292,8 @@ mod tests {
         let mut session = probe_session("legacy", true);
         session.record.size_bytes = None;
         session.record.device = None;
-        let row = row_text(&session, 120);
-        let full = row_text(&probe_session("legacy", true), 120);
+        let row = row_text(&session, WIDE);
+        let full = row_text(&probe_session("legacy", true), WIDE);
         assert_eq!(row.chars().count(), full.chars().count(), "{row:?}");
         assert_eq!(row.matches('—').count(), 2, "one dash for each missing cell: {row}");
     }

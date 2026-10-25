@@ -22,9 +22,16 @@ fn main() -> Result<()> {
 
     let config = Config::load()?;
 
-    let mut terminal = ratatui::init();
+    let mut terminal = app::init_terminal();
+    // `ratatui::init` restores the screen on a panic but knows nothing of mouse
+    // capture; without this a crash would leave the shell receiving mouse codes.
+    let restore_screen = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+        restore_screen(info);
+    }));
     let result = App::new(config, paths).run(&mut terminal);
-    ratatui::restore();
+    app::restore_terminal();
 
     result
 }
