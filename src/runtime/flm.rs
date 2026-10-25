@@ -911,6 +911,49 @@ pub fn parse_throughput(line: &str) -> Vec<Sample> {
     .collect()
 }
 
+/// A request's stage, from the lines `flm serve` prints as it reaches each:
+///
+/// ```text
+/// [FLM]  Start prefill...
+/// [FLM]  Prefill chunk 2/4 with 512 tokens
+/// [FLM]  Start generating...
+/// ```
+///
+/// No token count or rate comes until the request's [`usage`], so neither is
+/// claimed. Prefill progress is the chunks already done, shown only for a
+/// prompt long enough to take several. Matched anywhere in the line: `flm`
+/// writes from several threads, and lines arrive spliced together.
+pub fn parse_live(line: &str) -> Option<crate::session::throughput::Live> {
+    use crate::session::throughput::Live;
+    let stage = |phase, progress| Live {
+        phase,
+        tokens: None,
+        rate: None,
+        progress,
+        slot: None,
+        until_done: true,
+    };
+    if line.contains("[FLM]  Start generating...") {
+        return Some(stage(Phase::Decode, None));
+    }
+    if line.contains("[FLM]  Start prefill...") {
+        return Some(stage(Phase::Prefill, None));
+    }
+    let (_, rest) = line.split_once("[FLM]  Prefill chunk ")?;
+    let (done, rest) = rest.split_once('/')?;
+    let total: f64 = rest.split_whitespace().next()?.parse().ok()?;
+    let chunk: f64 = done.parse().ok()?;
+    let progress = (total > 1.0).then(|| (chunk - 1.0) / total);
+    Some(stage(Phase::Prefill, progress))
+}
+
+/// The end of a request, finished or cancelled: `flm serve` releases the NPU
+/// after every one, which a cancelled request, with no usage to close it,
+/// still does.
+pub fn parse_end(line: &str) -> bool {
+    line.contains("NPU Lock Released!")
+}
+
 /// Context size and use from a request's [`usage`], which FastFlowLM fills
 /// with the KV cache's own figures: `active_kv_tokens` of
 /// `max_kv_token_capacity`.
@@ -1321,6 +1364,87 @@ mod tests {
         assert_eq!(parse_context(line), vec![Reading::Size(32768), Reading::Used(334)]);
         assert!(parse_context(r#"ChatCompletionChunk: {"choices":[]}"#).is_empty());
         assert!(parse_context("[FLM]  Creating checkpoint at context length 299").is_empty());
+    }
+
+    /// Verbatim stage lines from real flm 1.0.10 logs, in the order a request
+    /// prints them, including one spliced into another thread's output.
+    #[test]
+    fn a_request_in_progress_is_read_from_its_stage_lines() {
+        let live = |line| parse_live(line).map(|l| (l.phase, l.progress, l.tokens, l.until_done));
+        assert_eq!(live("[FLM]  Start prefill..."), Some((Phase::Prefill, None, None, true)));
+        assert_eq!(
+            live("[FLM]  Prefill chunk 1/1 with 13 tokens"),
+            Some((Phase::Prefill, None, None, true)),
+            "one chunk: no progress worth showing"
+        );
+        assert_eq!(
+            live("[FLM]  Prefill chunk 3/4 with 512 tokens"),
+            Some((Phase::Prefill, Some(0.5), None, true)),
+            "two of four done"
+        );
+        assert_eq!(live("[FLM]  Start generating..."), Some((Phase::Decode, None, None, true)));
+        assert_eq!(
+            live("[LOG]  Version: 10[FLM]  Start generating..."),
+            Some((Phase::Decode, None, None, true))
+        );
+        assert_eq!(live("[FLM]  Model loaded in 10.07 s"), None);
+        assert!(parse_end("[🔵 ]  NPU Lock Released!"));
+        assert!(!parse_end("[🔴 ]  Client disconnected; cancelling active request"));
+        assert!(!parse_end("[🟢 ]  NPU Locked!"));
+    }
+
+    /// A whole request from a real flm 1.0.10 log, fed line by line through
+    /// the same parsers the session manager runs: Reading, then Generating
+    /// through the quiet of decoding, then idle with the request's rates.
+    #[test]
+    fn a_logged_request_reads_as_reading_then_generating_then_idle() {
+        use crate::session::throughput::{Activity, Throughput};
+        let parse = crate::runtime::log_parsers(NAME);
+        let request = [
+            "[🟢 ]  NPU Locked!",
+            "[FLM]  Prompt cache miss.",
+            "[FLM]  Start prefill...",
+            "[FLM]  Prefill chunk 1/1 with 13 tokens",
+            "\u{1b}[31m[FLM]  Creating checkpoint at context length 13\u{1b}[0m",
+            "[FLM]  Start generating...",
+            "[FLM]  Model RAW Output: ",
+            "Okay, so I need to explain what Git rebase does in two sentences.",
+            r#"Usage: {"prompt_tokens":13,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens":510,"total_tokens":523,"active_kv_tokens":523,"max_kv_token_capacity":32768,"kv_token_occupancy_rate_percentage":1.59,"load_duration":2.1e-06,"prefill_duration_ttft":0.42,"decoding_duration":34.0,"prefill_speed_tps":30.95,"decoding_speed_tps":15.0}"#,
+            "[🔒 ]  Closing TCP connection (streaming, non-keep-alive)",
+            "[🔵 ]  NPU Lock Released!",
+        ];
+        let now = std::time::Instant::now();
+        let mut throughput = Throughput::default();
+        let mut seen = Vec::new();
+        for line in request {
+            if let Some(live) = (parse.live)(line) {
+                throughput.record_live(live, now);
+            }
+            if (parse.ends)(line) {
+                throughput.record_end(None);
+            }
+            for sample in (parse.throughput)(line) {
+                throughput.record(sample);
+            }
+            let state = match throughput.activity(now) {
+                Some(Activity::Reading(_)) => "reading",
+                Some(Activity::Generating(_)) => "generating",
+                Some(Activity::Idle) => "idle",
+                None => "silent",
+            };
+            if seen.last() != Some(&state) {
+                seen.push(state);
+            }
+        }
+        assert_eq!(seen, ["silent", "reading", "generating", "idle"]);
+        assert!((throughput.rate(Phase::Decode).unwrap() - 15.0).abs() < 0.01);
+
+        // Cancelled mid-generation: no usage, but the NPU is still released.
+        throughput.record_live((parse.live)("[FLM]  Start generating...").unwrap(), now);
+        assert!(matches!(throughput.activity(now), Some(Activity::Generating(_))));
+        assert!((parse.ends)("[🔵 ]  NPU Lock Released!"));
+        throughput.record_end(None);
+        assert_eq!(throughput.activity(now), Some(Activity::Idle));
     }
 
     /// Verbatim from a real flm 1.0.10 log: the closing chunk has no usage any

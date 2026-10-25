@@ -998,19 +998,21 @@ pub fn parse_live(line: &str) -> Option<crate::session::throughput::Live> {
     if line.contains("prompt processing, n_tokens =") {
         return Some(Live {
             phase: Phase::Prefill,
-            tokens: after("n_tokens =")? as u64,
-            rate: after(" s /")?,
+            tokens: Some(after("n_tokens =")? as u64),
+            rate: Some(after(" s /")?),
             progress: after("progress ="),
             slot: slot_id(line),
+            until_done: false,
         });
     }
     let tokens = after("| n_gen =").or_else(|| after("| n_decoded ="))?;
     Some(Live {
         phase: Phase::Decode,
-        tokens: tokens as u64,
-        rate: after("tg_3s =").or_else(|| after(", tg ="))?,
+        tokens: Some(tokens as u64),
+        rate: Some(after("tg_3s =").or_else(|| after(", tg ="))?),
         progress: None,
         slot: slot_id(line),
+        until_done: false,
     })
 }
 
@@ -1547,10 +1549,11 @@ mod tests {
             parse_live(generating),
             Some(Live {
                 phase: Phase::Decode,
-                tokens: 100,
-                rate: 28.35,
+                tokens: Some(100),
+                rate: Some(28.35),
                 progress: None,
-                slot: Some(0)
+                slot: Some(0),
+                until_done: false,
             }),
             "the three-second rate is what the server is doing now"
         );
@@ -1559,10 +1562,11 @@ mod tests {
             parse_live(older),
             Some(Live {
                 phase: Phase::Decode,
-                tokens: 102,
-                rate: 50.57,
+                tokens: Some(102),
+                rate: Some(50.57),
                 progress: None,
-                slot: Some(3)
+                slot: Some(3),
+                until_done: false,
             })
         );
         let reading = "4.31.551.562 I slot print_timing: id  3 | task 0 | prompt processing, \
@@ -1571,10 +1575,11 @@ mod tests {
             parse_live(reading),
             Some(Live {
                 phase: Phase::Prefill,
-                tokens: 2048,
-                rate: 274.25,
+                tokens: Some(2048),
+                rate: Some(274.25),
                 progress: Some(0.76),
-                slot: Some(3)
+                slot: Some(3),
+                until_done: false,
             })
         );
         // A finished request's summary is not progress.

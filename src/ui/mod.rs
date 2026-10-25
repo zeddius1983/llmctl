@@ -2142,8 +2142,14 @@ mod tests {
         let finished = rows_text(std::slice::from_ref(&session), 160).remove(0);
         assert!(finished.contains("tg 67.73 t/s"), "{finished}");
 
-        let live =
-            Live { phase: Phase::Decode, tokens: 865, rate: 29.75, progress: None, slot: None };
+        let live = Live {
+            phase: Phase::Decode,
+            tokens: Some(865),
+            rate: Some(29.75),
+            progress: None,
+            slot: None,
+            until_done: false,
+        };
         session.throughput.record_live(live, std::time::Instant::now());
         let running = rows_text(std::slice::from_ref(&session), 160).remove(0);
         assert!(running.contains("tg 29.75 t/s"), "{running}");

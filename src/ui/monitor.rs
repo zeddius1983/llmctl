@@ -133,7 +133,8 @@ fn header(session: &Session, width: usize, now: Instant) -> Line<'static> {
 /// the server's own progress reports:
 ///
 /// - `▶ Reading 76%` while it processes a prompt;
-/// - `▶ Generating 781 tokens` while it generates;
+/// - `▶ Generating 781 tokens` while it generates (`▶ Generating` from a
+///   runtime that keeps no running count);
 /// - `● Running` between requests, as for every other status.
 ///
 /// No rate: the Decode and Prefill tiles beside it carry that, live.
@@ -144,7 +145,10 @@ fn status(session: &Session, now: Instant) -> Span<'static> {
     };
     match activity {
         Some(Activity::Generating(live)) => Span::styled(
-            format!("▶ Generating {} tokens", live.tokens),
+            match live.tokens {
+                Some(tokens) => format!("▶ Generating {tokens} tokens"),
+                None => "▶ Generating".into(),
+            },
             Style::default().fg(Color::Green).bold(),
         ),
         Some(Activity::Reading(live)) => Span::styled(
@@ -429,8 +433,14 @@ mod tests {
         let mut session = running_session();
         session.record.name = "nvidia-nemotron-3-5-bolt-74b-a9b-ud-q3_k_xl".into();
         session.context.record(Reading::Size(64_512));
-        let generating =
-            Live { phase: Phase::Decode, tokens: 215, rate: 35.0, progress: None, slot: None };
+        let generating = Live {
+            phase: Phase::Decode,
+            tokens: Some(215),
+            rate: Some(35.0),
+            progress: None,
+            slot: None,
+            until_done: false,
+        };
         session.throughput.record_live(generating, now);
 
         let wide = text_of(&header(&session, 120, now));
@@ -461,18 +471,29 @@ mod tests {
 
         let reading = Live {
             phase: Phase::Prefill,
-            tokens: 2048,
-            rate: 274.0,
+            tokens: Some(2048),
+            rate: Some(274.0),
             progress: Some(0.76),
             slot: None,
+            until_done: false,
         };
         session.throughput.record_live(reading, now);
         assert_eq!(status(&session, now).content, "▶ Reading 76%");
 
-        let generating =
-            Live { phase: Phase::Decode, tokens: 781, rate: 29.75, progress: None, slot: None };
+        let generating = Live {
+            phase: Phase::Decode,
+            tokens: Some(781),
+            rate: Some(29.75),
+            progress: None,
+            slot: None,
+            until_done: false,
+        };
         session.throughput.record_live(generating, now);
         assert_eq!(status(&session, now).content, "▶ Generating 781 tokens", "and no rate");
+        let uncounted = Live { tokens: None, rate: None, until_done: true, ..generating };
+        session.throughput.record_live(uncounted, now);
+        assert_eq!(status(&session, now).content, "▶ Generating", "a runtime with no count");
+        session.throughput.record_live(generating, now);
 
         session.throughput.record(Sample {
             phase: Phase::Decode,

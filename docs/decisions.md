@@ -1109,8 +1109,15 @@ dropped; it belongs in a Requests view.
   show a live figure in green. The three-second `tg_3s` is preferred over `tg`,
   which averages back to the start of the request. A live reading lapses after
   ten seconds without another, so a cancelled request cannot leave a session
-  looking busy. A runtime that never reports progress (FastFlowLM) keeps its
-  plain status.
+  looking busy.
+  - FastFlowLM 1.0.10 reports stages, not progress: `Start prefill...`,
+    `Prefill chunk 2/4 with 512 tokens`, `Start generating...`, and `NPU Lock
+    Released!` after every request, cancelled ones included. So the header
+    reads `▶ Reading` (with a percentage for a prompt of several chunks), then
+    `▶ Generating` with no token count, and the tiles keep the last finished
+    rate, since no live rate exists. Decoding prints nothing until it ends, so
+    these readings stand until the release line rather than lapsing after ten
+    seconds (`Live::until_done`, `LogParsers::ends`).
   - Live readings are kept per server slot (llama.cpp's `id N` on every slot
     line), and a summary ends only the request in its own slot. Parallel
     slots interleave their lines in one log, and one request finishing must

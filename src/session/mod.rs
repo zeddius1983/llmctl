@@ -624,6 +624,10 @@ impl SessionManager {
                 if let Some(live) = (parse.live)(line) {
                     s.throughput.record_live(live, now);
                 }
+                if (parse.ends)(line) {
+                    // `flm serve` runs one request at a time, unslotted.
+                    s.throughput.record_end(None);
+                }
                 for measurement in (parse.throughput)(line) {
                     s.throughput.record(measurement);
                 }

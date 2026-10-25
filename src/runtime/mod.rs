@@ -463,6 +463,11 @@ pub struct LogParsers {
     pub context: fn(&str) -> Vec<crate::session::context::Reading>,
     /// A request in progress.
     pub live: fn(&str) -> Option<crate::session::throughput::Live>,
+    /// The end of a request, finished or not, for a runtime whose live
+    /// readings wait for one (see [`Live::until_done`]).
+    ///
+    /// [`Live::until_done`]: crate::session::throughput::Live::until_done
+    pub ends: fn(&str) -> bool,
 }
 
 /// How to read a runtime's log, identified only by name.
@@ -476,15 +481,22 @@ pub fn log_parsers(runtime: &str) -> LogParsers {
         flm::NAME => LogParsers {
             throughput: flm::parse_throughput,
             context: flm::parse_context,
-            // `flm serve` reports a request only once it has finished.
-            live: |_| None,
+            live: flm::parse_live,
+            ends: flm::parse_end,
         },
         llama_cpp::NAME => LogParsers {
             throughput: llama_cpp::parse_throughput,
             context: llama_cpp::parse_context,
             live: llama_cpp::parse_live,
+            // Its readings lapse on their own; a summary ends them early.
+            ends: |_| false,
         },
-        _ => LogParsers { throughput: |_| Vec::new(), context: |_| Vec::new(), live: |_| None },
+        _ => LogParsers {
+            throughput: |_| Vec::new(),
+            context: |_| Vec::new(),
+            live: |_| None,
+            ends: |_| false,
+        },
     }
 }
 

@@ -11,9 +11,10 @@
 //! tell generating apart from idling, so a server that produced 20 tokens in a
 //! second and then sat quiet would appear to slow down while doing nothing.
 //!
-//! llama.cpp also reports a request while it runs — prompt progress, and the
-//! generation rate over its last few seconds — which is what [`Live`] carries
-//! and what tells the Monitor a session is busy.
+//! The runtimes also report a request while it runs, which is what [`Live`]
+//! carries and what tells the Monitor a session is busy. llama.cpp prints
+//! prompt progress and the generation rate over its last few seconds;
+//! FastFlowLM only says which stage a request has reached.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -45,20 +46,24 @@ impl Sample {
     }
 }
 
-/// A request still in progress, as the runtime reports it every few seconds:
-/// how far it has got and how fast it is going right now.
+/// A request still in progress, as the runtime reports it: how far it has got
+/// and how fast it is going right now, as far as the runtime says.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Live {
     pub phase: Phase,
     /// Tokens processed (prefill) or generated (decode) so far.
-    pub tokens: u64,
+    pub tokens: Option<u64>,
     /// The runtime's current rate — over its last few seconds where it reports
     /// one, else since the phase began.
-    pub rate: f64,
+    pub rate: Option<f64>,
     /// How much of the prompt is processed, 0–1. Prefill only.
     pub progress: Option<f64>,
     /// The server slot running it; see [`Sample::slot`].
     pub slot: Option<u32>,
+    /// The runtime reports stages rather than a steady beat, and says when the
+    /// request ends, so the reading stands until then instead of lapsing after
+    /// [`LIVE_FOR`] of quiet. FastFlowLM is silent for a whole generation.
+    pub until_done: bool,
 }
 
 /// What a session is doing, as far as its log says.
@@ -91,8 +96,8 @@ pub struct Throughput {
     /// Parallel slots run requests side by side, and each one's summary ends
     /// only its own.
     live: Vec<(Live, Instant)>,
-    /// Whether this runtime reports requests in progress at all. One that does
-    /// not (FastFlowLM) cannot be said to be idle, only silent.
+    /// Whether this runtime has reported a request in progress yet. Until it
+    /// has, the session cannot be said to be idle, only silent.
     reports_live: bool,
 }
 
@@ -117,17 +122,25 @@ impl Throughput {
 
     /// A progress report from a request still running, received at `now`.
     pub fn record_live(&mut self, live: Live, now: Instant) {
-        if !(live.rate.is_finite() && live.rate > 0.0) {
-            return;
+        if let Some(rate) = live.rate {
+            if !(rate.is_finite() && rate > 0.0) {
+                return;
+            }
+            self.push(live.phase, rate);
         }
         self.reports_live = true;
-        self.push(live.phase, live.rate);
         // A slot runs one request at a time, so its newest report replaces
         // its last; reports gone stale are dropped on the way.
         self.live.retain(|(other, at)| {
             other.slot != live.slot && now.saturating_duration_since(*at) < LIVE_FOR
         });
         self.live.push((live, now));
+    }
+
+    /// The runtime said the request in `slot` is over, whether or not it
+    /// finished: a cancelled one leaves no summary to end it.
+    pub fn record_end(&mut self, slot: Option<u32>) {
+        self.live.retain(|(live, _)| live.slot != slot);
     }
 
     fn push(&mut self, phase: Phase, rate: f64) {
@@ -163,17 +176,18 @@ impl Throughput {
     fn live_at(&self, now: Instant) -> Vec<Live> {
         self.live
             .iter()
-            .filter(|(_, at)| now.saturating_duration_since(*at) < LIVE_FOR)
+            .filter(|(live, at)| live.until_done || now.saturating_duration_since(*at) < LIVE_FOR)
             .map(|(live, _)| *live)
             .collect()
     }
 
     /// The rate to show for `phase` at `now`: the request in progress if it is
-    /// in that phase, else the last finished one. The second is whether it is
-    /// live.
+    /// in that phase and reports one, else the last finished one. The second is
+    /// whether it is live.
     pub fn current(&self, phase: Phase, now: Instant) -> Option<(f64, bool)> {
-        match self.live_at(now).into_iter().rev().find(|live| live.phase == phase) {
-            Some(live) => Some((live.rate, true)),
+        let live = self.live_at(now).into_iter().rev().find(|live| live.phase == phase);
+        match live.and_then(|live| live.rate) {
+            Some(rate) => Some((rate, true)),
             None => self.rate(phase).map(|rate| (rate, false)),
         }
     }
@@ -235,7 +249,44 @@ mod tests {
     }
 
     fn live(phase: Phase, tokens: u64, rate: f64) -> Live {
-        Live { phase, tokens, rate, progress: None, slot: None }
+        Live {
+            phase,
+            tokens: Some(tokens),
+            rate: Some(rate),
+            progress: None,
+            slot: None,
+            until_done: false,
+        }
+    }
+
+    /// FastFlowLM reports stages, no rate, and is quiet while it generates:
+    /// the reading stands through the quiet, the tiles keep the last finished
+    /// rate, and the end marker clears it even with no summary.
+    #[test]
+    fn a_stage_report_stands_until_the_runtime_says_the_request_ended() {
+        let t0 = Instant::now();
+        let mut throughput = Throughput::default();
+        throughput.record(sample(Phase::Decode, 300, 20.0));
+        let generating = Live {
+            phase: Phase::Decode,
+            tokens: None,
+            rate: None,
+            progress: None,
+            slot: None,
+            until_done: true,
+        };
+        throughput.record_live(generating, t0);
+        let later = t0 + LIVE_FOR * 30;
+        assert!(matches!(throughput.activity(later), Some(Activity::Generating(_))));
+        assert_eq!(
+            throughput.current(Phase::Decode, later),
+            Some((15.0, false)),
+            "no live rate, so the last finished one, not marked live"
+        );
+        assert_eq!(throughput.rates(Phase::Decode), vec![Some(15.0)], "nothing pushed");
+
+        throughput.record_end(None);
+        assert_eq!(throughput.activity(later), Some(Activity::Idle), "cancelled, no summary");
     }
 
     #[test]
