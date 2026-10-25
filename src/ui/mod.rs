@@ -186,7 +186,16 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, level: Pane, role: 
             .runtimes
             .items
             .iter()
-            .map(|r| ListItem::new(format!("{icon}  {}", r.descriptor().name)))
+            .map(|r| {
+                let item = ListItem::new(format!("{icon}  {}", r.descriptor().name));
+                // Listed but unusable (no binary, NPU not ready): dimmed, with
+                // the reason on the status line when it is hovered.
+                if r.unavailable_reason().is_some() {
+                    item.style(Style::default().fg(Color::DarkGray))
+                } else {
+                    item
+                }
+            })
             .collect(),
         Pane::Model => app
             .browser

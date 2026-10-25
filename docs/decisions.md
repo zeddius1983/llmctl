@@ -464,6 +464,15 @@ real server lives inside a container. This works without special-casing because
 argv match, and the container shares the host PID and network namespaces. Any
 runtime fronted by a launcher script benefits from the same mechanism.
 
+*Listing (2026-10-26).* FastFlowLM appears in the Runtime column only where
+there is something to use: an NPU bound to the kernel's `amdxdna` driver (a
+PCI-address entry under `/sys/bus/pci/drivers/amdxdna`), or an installed `flm`.
+A machine with neither — the common case away from Ryzen AI — never sees it.
+One with the NPU but no `flm`, or `flm` with the NPU stack not ready, shows it
+dimmed, with the reason on the status line. The rule lives behind
+`RuntimeBackend::listed` (default: always), and any unusable runtime that is
+listed is dimmed.
+
 ## ADR-013: llmctl downloads FastFlowLM models, not `flm pull`
 
 **Status:** Accepted (2026-07-27). Amends the *Downloads* section of ADR-012.

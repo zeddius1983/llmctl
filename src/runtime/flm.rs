@@ -208,6 +208,9 @@ pub struct FlmBackend {
     npu_ready: bool,
     /// Why the stack is not ready, when it isn't.
     npu_problem: Option<String>,
+    /// The kernel's `amdxdna` driver has an NPU bound, whether or not `flm` is
+    /// installed to use it.
+    npu_present: bool,
     /// The last catalog read from `flm`, held so re-grouping does not re-read
     /// it. See [`FlmBackend::cached_catalog`].
     catalog_cache: Mutex<Option<Vec<Entry>>>,
@@ -248,6 +251,7 @@ impl FlmBackend {
             },
             npu_ready,
             npu_problem,
+            npu_present: npu_present(Path::new(AMDXDNA_DRIVER)),
             catalog_cache: Mutex::new(None),
         }
     }
@@ -537,6 +541,14 @@ impl RuntimeBackend for FlmBackend {
         true
     }
 
+    /// Listed where there is an NPU to use or an `flm` to use it with. A
+    /// machine with neither — no XDNA hardware, nothing installed — never
+    /// shows FastFlowLM; one with the NPU but no `flm` shows it dimmed, so the
+    /// option is discoverable.
+    fn listed(&self) -> bool {
+        self.runtime.binary_path.is_some() || self.npu_present
+    }
+
     fn unavailable_reason(&self) -> Option<String> {
         if self.runtime.binary_path.is_none() {
             return Some("flm binary not found on PATH".into());
@@ -547,6 +559,19 @@ impl RuntimeBackend for FlmBackend {
         }
         None
     }
+}
+
+/// Where the kernel lists the devices bound to the AMD XDNA (NPU) driver.
+const AMDXDNA_DRIVER: &str = "/sys/bus/pci/drivers/amdxdna";
+
+/// Whether `driver` has a device bound: an entry named like a PCI address
+/// (`0000:c8:00.1`) beside the driver's own `bind`, `module` and `uevent`.
+fn npu_present(driver: &Path) -> bool {
+    std::fs::read_dir(driver).is_ok_and(|entries| {
+        entries.filter_map(Result::ok).any(|entry| {
+            entry.file_name().to_str().is_some_and(|name| name.split(':').count() == 3)
+        })
+    })
 }
 
 /// The tag to serve. Falls back to the display name so a malformed catalog
@@ -1432,6 +1457,50 @@ mod tests {
     }
 
     #[test]
+    fn an_npu_is_present_when_the_xdna_driver_has_a_device_bound() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let driver = std::env::temp_dir().join(format!("llmctl-amdxdna-{nonce}"));
+        // The driver loaded with nothing bound: only its own files.
+        for file in ["bind", "unbind", "uevent", "new_id", "remove_id"] {
+            std::fs::create_dir_all(&driver).unwrap();
+            std::fs::write(driver.join(file), "").unwrap();
+        }
+        std::fs::create_dir_all(driver.join("module")).unwrap();
+        assert!(!npu_present(&driver));
+        std::fs::create_dir_all(driver.join("0000:c8:00.1")).unwrap();
+        assert!(npu_present(&driver));
+        assert!(!npu_present(Path::new("/nonexistent/llmctl/amdxdna")), "no driver, no NPU");
+        let _ = std::fs::remove_dir_all(&driver);
+    }
+
+    #[test]
+    fn fastflowlm_is_listed_with_an_npu_or_an_flm_but_not_with_neither() {
+        let backend = |binary: Option<&str>, npu_present| FlmBackend {
+            runtime: Runtime {
+                name: NAME.into(),
+                description: String::new(),
+                version: None,
+                binary_path: binary.map(PathBuf::from),
+                bench_path: None,
+                formats: vec![],
+                devices: vec![],
+            },
+            npu_ready: false,
+            npu_problem: None,
+            npu_present,
+            catalog_cache: Mutex::new(None),
+        };
+        assert!(!backend(None, false).listed(), "no NPU and no flm: nothing to offer");
+        let no_flm = backend(None, true);
+        assert!(no_flm.listed(), "an NPU without flm is shown, dimmed");
+        assert_eq!(no_flm.unavailable_reason().as_deref(), Some("flm binary not found on PATH"));
+        assert!(backend(Some("/usr/bin/flm"), false).listed(), "flm with no NPU says why");
+    }
+
+    #[test]
     fn all_resolved_defaults_pass_launch_validation() {
         let backend = FlmBackend {
             runtime: Runtime {
@@ -1445,6 +1514,7 @@ mod tests {
             },
             npu_ready: true,
             npu_problem: None,
+            npu_present: true,
             catalog_cache: Mutex::new(None),
         };
         let model =
@@ -1488,6 +1558,7 @@ mod tests {
             },
             npu_ready: true,
             npu_problem: None,
+            npu_present: true,
             catalog_cache: Mutex::new(None),
         };
         let model =
@@ -1526,6 +1597,7 @@ mod tests {
             },
             npu_ready: true,
             npu_problem: None,
+            npu_present: true,
             catalog_cache: Mutex::new(None),
         };
         let model =
@@ -1554,6 +1626,7 @@ mod tests {
             },
             npu_ready: true,
             npu_problem: None,
+            npu_present: true,
             catalog_cache: Mutex::new(None),
         };
         let model =

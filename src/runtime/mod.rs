@@ -421,6 +421,16 @@ pub trait RuntimeBackend: Send + Sync {
         false
     }
 
+    /// Whether the browser offers this runtime at all. One whose hardware the
+    /// machine lacks and whose tool is not installed has nothing to offer, and
+    /// listing it only invites a dead end; one that is merely not ready yet
+    /// stays listed, dimmed, with [`unavailable_reason`] saying why.
+    ///
+    /// [`unavailable_reason`]: RuntimeBackend::unavailable_reason
+    fn listed(&self) -> bool {
+        true
+    }
+
     /// Why this runtime cannot launch right now, or `None` if it is usable.
     /// Rendered in the status line and returned when a launch is attempted.
     fn unavailable_reason(&self) -> Option<String> {
@@ -491,10 +501,11 @@ pub(crate) fn resolve_binary(binary: &str) -> Option<std::path::PathBuf> {
 
 /// Probe every known runtime, in display order.
 pub fn discover(config: &Config, paths: &Paths) -> Vec<Arc<dyn RuntimeBackend>> {
-    vec![
+    let all: Vec<Arc<dyn RuntimeBackend>> = vec![
         Arc::new(LlamaCppBackend::discover(&config.runtime.llama_cpp, &paths.cache_dir)),
         Arc::new(FlmBackend::discover(&config.runtime.fastflowlm)),
-    ]
+    ];
+    all.into_iter().filter(|backend| backend.listed()).collect()
 }
 
 #[cfg(test)]
