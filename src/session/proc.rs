@@ -1,7 +1,8 @@
 //! Linux `/proc` helpers for inspecting detached server processes.
 //!
 //! Used to rediscover sessions after an llmctl restart (liveness + cmdline
-//! match guards against PID reuse) and to show live resource usage.
+//! match guards against PID reuse) and to find the real server behind a
+//! launcher wrapper.
 
 use std::fs;
 
@@ -98,61 +99,4 @@ pub fn descendants(pid: i32) -> Vec<i32> {
         }
     }
     out
-}
-
-/// Resident set size in bytes (physical memory), from `/proc/<pid>/statm`.
-pub fn rss_bytes(pid: i32) -> Option<u64> {
-    let statm = fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
-    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-    Some(pages * page_size())
-}
-
-/// A point-in-time CPU sample for one process: its busy jiffies and the
-/// system-wide total jiffies, so a later sample yields a delta-based percentage.
-#[derive(Debug, Clone, Copy)]
-pub struct CpuSample {
-    proc_jiffies: u64,
-    total_jiffies: u64,
-}
-
-/// Take a CPU sample for `pid`, or `None` if the process can't be read.
-pub fn cpu_sample(pid: i32) -> Option<CpuSample> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // utime (14) + stime (15), counting fields after the closing paren of comm.
-    let rest = stat.rsplit_once(')')?.1;
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    // After the paren, index 0 = state, so utime is index 11 and stime 12.
-    let utime: u64 = fields.get(11)?.parse().ok()?;
-    let stime: u64 = fields.get(12)?.parse().ok()?;
-    Some(CpuSample { proc_jiffies: utime + stime, total_jiffies: total_jiffies()? })
-}
-
-/// CPU usage between two samples, in "one core = 100%" units (can exceed 100%).
-pub fn cpu_percent(prev: CpuSample, now: CpuSample) -> Option<f64> {
-    let proc_delta = now.proc_jiffies.checked_sub(prev.proc_jiffies)?;
-    let total_delta = now.total_jiffies.checked_sub(prev.total_jiffies)?;
-    if total_delta == 0 {
-        return None;
-    }
-    let ncpu = num_cpus().max(1) as f64;
-    Some(proc_delta as f64 / total_delta as f64 * ncpu * 100.0)
-}
-
-/// Sum of all jiffies on the aggregate `cpu` line of `/proc/stat`.
-fn total_jiffies() -> Option<u64> {
-    let stat = fs::read_to_string("/proc/stat").ok()?;
-    let line = stat.lines().next()?; // "cpu  u n s i w ..."
-    Some(line.split_whitespace().skip(1).filter_map(|v| v.parse::<u64>().ok()).sum())
-}
-
-fn page_size() -> u64 {
-    // SAFETY: sysconf with a constant name has no preconditions.
-    let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if v > 0 { v as u64 } else { 4096 }
-}
-
-fn num_cpus() -> usize {
-    // SAFETY: sysconf with a constant name has no preconditions.
-    let v = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
-    if v > 0 { v as usize } else { 1 }
 }

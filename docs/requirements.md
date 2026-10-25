@@ -442,7 +442,8 @@ Displays:
 * Generated command
 * Environment
 * Logs
-* Resource usage
+* Resource usage — left to nvtop/btop; the Monitor shows the server's own
+  figures (ADR-021)
 
 ---
 

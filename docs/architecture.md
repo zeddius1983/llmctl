@@ -90,10 +90,10 @@ completions to the event loop.
     process-group/descendant signals); plus the
     OSC 52 base64 helper used for clipboard yank.
   - `record.rs` — `SessionRecord` persisted as `session-<id>.json`; load/prune.
-  - `proc.rs` — `/proc` liveness, cmdline match (PID-reuse guard), RSS, CPU%.
+  - `proc.rs` — `/proc` liveness, cmdline match (PID-reuse guard), launcher descendants.
   - `health.rs` — bounded readiness worker queue and TCP probe; bindable-port check.
   - `mod.rs` — `SessionManager`: launch, rediscover + prune, refresh
-    (status/resources), stop/kill/restart, port-conflict resolution.
+    (status, log-derived rates and context), stop/kill/restart, port-conflict resolution.
 - **`ui/`** — all rendering: the browser's three columns + footer, the Session
   Manager (list + detail), the log-tail view, the modal prompt/message overlays,
   and the help overlay.
@@ -163,8 +163,8 @@ contains the model path (PID-reuse guard), deleting the JSON for the rest.
 `SessionManager::refresh` (called on the ≈1 s tick) derives status —
 `Downloading (N%)` while known Hub blobs are incomplete, `Starting` while the
 model loads, then `Running` after `GET /health` returns 200; `Stopped` if the
-user asked it to stop and the process is gone, else `Crashed` — and samples
-`/proc` for RSS and CPU%. Launch resolves a bindable port (skipping ports held by other live
+user asked it to stop and the process is gone, else `Crashed` — and reads the
+newly appended log for rates and context fill. Launch resolves a bindable port (skipping ports held by other live
 sessions) before spawning. A future `DaemonSupervisor` or `systemd-run` backend
 can implement the same trait. See ADR-005 and ADR-007.
 

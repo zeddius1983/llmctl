@@ -337,39 +337,26 @@ on its own branch before the consolidated merge.
 
 ### Session Monitor (ADR-021)
 The Detail pane is replaced by a Monitor modelled on `strata monitor`'s
-Overview: session tiles, system-wide GPU/RAM, recent requests. Strata's monitor
-has seven views (Overview, Serving, Requests, Engine, Hardware, Logs, Connect);
-llmctl has the first and, in the log tail, the sixth.
-- [x] Overview prototype: decode/prefill/CPU/memory tiles with sparklines,
-      `amdgpu` busy/power/temperature, VRAM/GTT/RAM bars, recent requests
+Overview. Strata's monitor has seven views (Overview, Serving, Requests,
+Engine, Hardware, Logs, Connect); llmctl has the first and, in the log tail,
+the sixth. Hardware is left to nvtop and btop.
+- [x] Overview prototype: decode/prefill tiles with sparklines
 - [x] One-line header (status · endpoint · model + context size · uptime) and
       a context-fill bar, both from the server's log
 - [x] Live activity in the header's status (Reading with progress /
       Generating with tokens) and live decode/prefill rates in tiles and list,
-      from llama.cpp's progress lines; boxed tiles; GPU clock tile; the Recent
-      requests list removed for a future Requests view
+      from llama.cpp's progress lines; boxed tiles; the Recent requests list
+      removed for a future Requests view
 - [ ] Busy-slot count across parallel requests (`/slots`, through a background
       worker like the health probe). The log's activity follows whichever
       slot reported last
 - [x] PID as a Session Manager column (dropped from the Monitor); it goes
       after the profile and before the rates when a narrow pane sheds columns
-- [x] NVIDIA through `nvidia-smi` behind the same sampler, on a worker thread
-      so its start-up never stalls the tick; skipped when
-      `/proc/driver/nvidia/gpus` is absent; inside a distrobox without
-      `nvidia-smi` it runs the host's through `distrobox-host-exec`
-- [ ] A GPU picker when there are several (today: the one with the most VRAM)
-- [x] Verified on an RTX 3080 (driver 580): the ignored
-      `nvidia_probe_reads_a_live_card` test reads busy, VRAM, temp, power,
-      clock, PCIe link and throughput
-- [x] PCIe tiles: the running link (`Gen4 x16`) and MB/s to and from the GPU,
-      from `nvidia-smi dmon -s t`
-- [x] AMD discrete cards: the link on the GPU line (sysfs); APUs, whose link
-      is the bridge inside the chip, show none
-- [ ] PCIe throughput on AMD discrete cards: no source on RDNA (`pcie_bw` is
-      Vega and older, and blocks for a second)
-- [ ] Memory bandwidth on Strix Halo: `gpu_metrics` DRAM counters read ~3×
-      low against a measured decode, so they stay out until a trustworthy
-      source turns up
+- [x] Machine figures removed: session CPU/RSS, GPU tiles (amdgpu sysfs and
+      `nvidia-smi`, distrobox included), VRAM/GTT/RAM bars and PCIe. They
+      duplicated nvtop/btop and did not scale to several GPUs; what was learned
+      is kept in ADR-021
+- [ ] Request statistics from the log (see the ideas below)
 - [ ] More views, switched inside the pane: Requests (a table of the parsed
       samples), Connect (client settings for OpenCode, Claude Code, …), Engine
       (the command line and `/props`)

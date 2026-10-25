@@ -65,7 +65,6 @@ src/
                  (per-model YAML), mod.rs (resolution layering)
   session/       command.rs (argv/display), supervisor.rs (owned children, setsid/signals),
                  record.rs (session-<id>.json), proc.rs (/proc), health.rs (/health),
-                 host.rs (amdgpu sysfs + /proc/meminfo), history.rs (Monitor series),
                  mod.rs (SessionManager)
   ui/            ratatui rendering (browser columns, Session Manager, log view, footer, prompts, help);
                  monitor.rs (the Session Manager's Monitor pane)

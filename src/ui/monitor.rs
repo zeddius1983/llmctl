@@ -2,20 +2,19 @@
 //! the list, in the column the Detail pane used to hold.
 //!
 //! A header names the session and says what it is doing this second, boxed
-//! tiles pair a current value with its recent history, and bars show how full
-//! the context and the machine are. Everything is built as text —
-//! borders, sparklines and bars are box-drawing and block characters — so the
-//! layout is a pure function of the session and the host reading, testable
-//! without a terminal.
+//! tiles pair its decode and prefill rates with their recent history, and a
+//! bar shows how full the context is. Only what the server itself reports is
+//! here: the machine's GPU, CPU and memory are left to nvtop and btop.
+//! Everything is built as text — borders, sparklines and bars are box-drawing
+//! and block characters — so the layout is a pure function of the session,
+//! testable without a terminal.
 
-use std::borrow::Cow;
 use std::time::Instant;
 
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 
 use super::{ACCENT, pad_right, status_color, truncate_right};
-use crate::session::host::HostMonitor;
 use crate::session::throughput::{Activity, Phase, format_rate};
 use crate::session::{Session, SessionStatus, format_uptime};
 
@@ -32,80 +31,37 @@ const TILE_GAP: usize = 1;
 /// The least of the model name the header keeps; with less room than this it
 /// leaves the name out.
 const MIN_NAME: usize = 8;
-const GIB: f64 = (1u64 << 30) as f64;
 const BORDER: Color = Color::DarkGray;
 
 /// One tile: what it measures, its current value, and its history scaled
 /// against `ceiling`. A live tile is showing a request still in progress.
 struct Tile {
-    label: Cow<'static, str>,
+    label: &'static str,
     value: String,
     history: Vec<Option<f64>>,
     ceiling: Option<f64>,
     live: bool,
 }
 
-impl Tile {
-    fn new(
-        label: impl Into<Cow<'static, str>>,
-        value: String,
-        history: Vec<Option<f64>>,
-        ceiling: Option<f64>,
-    ) -> Self {
-        Self { label: label.into(), value, history, ceiling, live: false }
-    }
-}
-
-pub(super) fn monitor_lines(
-    session: &Session,
-    host: &HostMonitor,
-    width: usize,
-    now: Instant,
-) -> Text<'static> {
+pub(super) fn monitor_lines(session: &Session, width: usize, now: Instant) -> Text<'static> {
     let mut lines = vec![header(session, width, now), Line::raw("")];
 
     let speed = |label: &'static str, phase| {
         let history = session.throughput.rates(phase);
         let current = session.throughput.current(phase, now);
         Tile {
-            label: label.into(),
+            label,
             value: current.map_or("—".into(), |(r, _)| format!("{} t/s", format_rate(r))),
             ceiling: peak(&history),
             history,
             live: current.is_some_and(|(_, live)| live),
         }
     };
-    lines.extend(tiles(
-        &[
-            speed("Decode", Phase::Decode),
-            speed("Prefill", Phase::Prefill),
-            Tile::new(
-                "CPU",
-                session.cpu_percent.map_or("—".into(), |c| format!("{c:.0}%")),
-                session.cpu_history.values(),
-                // A server on many cores goes past 100%; the scale follows it.
-                Some(session.cpu_history.max().unwrap_or(0.0).max(100.0)),
-            ),
-            Tile::new(
-                "Memory",
-                session.rss_bytes.map_or("—".into(), |b| format!("{:.1} GiB", b as f64 / GIB)),
-                session.rss_history.values(),
-                session.rss_history.max(),
-            ),
-        ],
-        width,
-        Color::Cyan,
-    ));
+    lines.extend(tiles(&[speed("Decode", Phase::Decode), speed("Prefill", Phase::Prefill)], width));
     let context = context_fill(session, width);
     if !context.is_empty() {
         lines.push(Line::raw(""));
         lines.extend(context);
-    }
-
-    let machine = machine_lines(host, width);
-    if !machine.is_empty() {
-        lines.push(Line::raw(""));
-        lines.extend(machine);
     }
     Text::from(lines)
 }
@@ -245,100 +201,6 @@ fn tokens(count: u64) -> String {
     }
 }
 
-/// The GPU and RAM the sessions share. Empty when there is nothing to show —
-/// no sample yet, or no live session to have taken one.
-fn machine_lines(host: &HostMonitor, width: usize) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    if let Some(gpu) = &host.gpu {
-        let more = match host.gpu_count {
-            0 | 1 => String::new(),
-            n => format!(" (1 of {n})"),
-        };
-        // Where throughput is measured the link heads the PCIe tiles instead.
-        let pcie_tiles = host.pcie_rx.max().is_some() || host.pcie_tx.max().is_some();
-        let link = match gpu.pcie_link {
-            Some((generation, lanes)) if !pcie_tiles => format!(" · PCIe Gen{generation} x{lanes}"),
-            _ => String::new(),
-        };
-        lines.push(Line::from(vec![
-            "GPU".bold(),
-            Span::styled(format!(" · {}{more}{link}", gpu.name), Style::default().fg(Color::Gray)),
-        ]));
-        lines.extend(tiles(
-            &[
-                Tile::new(
-                    "Busy",
-                    gpu.busy_percent.map_or("—".into(), |b| format!("{b:.0}%")),
-                    host.gpu_busy.values(),
-                    Some(100.0),
-                ),
-                Tile::new(
-                    "Clock",
-                    gpu.clock_mhz.map_or("—".into(), |mhz| format!("{mhz:.0} MHz")),
-                    host.gpu_clock.values(),
-                    host.gpu_clock.max(),
-                ),
-                Tile::new(
-                    "Power",
-                    gpu.power_w.map_or("—".into(), |w| format!("{w:.0} W")),
-                    host.gpu_power.values(),
-                    host.gpu_power.max(),
-                ),
-                Tile::new(
-                    "Temp",
-                    gpu.temp_c.map_or("—".into(), |t| format!("{t:.0} °C")),
-                    host.gpu_temp.values(),
-                    Some(100.0),
-                ),
-            ],
-            width,
-            Color::LightMagenta,
-        ));
-        // Only where throughput is measured, which today is NVIDIA. The two
-        // directions share a scale, so their heights compare.
-        if pcie_tiles {
-            let ceiling = host.pcie_rx.max().into_iter().chain(host.pcie_tx.max()).reduce(f64::max);
-            let link = gpu.pcie_link.map_or_else(String::new, |(generation, lanes)| {
-                format!(" Gen{generation} x{lanes}")
-            });
-            lines.extend(tiles(
-                &[
-                    Tile::new(
-                        format!("PCIe{link}"),
-                        format!("to GPU {}", gpu.pcie_rx.map_or("—".into(), megabytes_per_second)),
-                        host.pcie_rx.values(),
-                        ceiling,
-                    ),
-                    Tile::new(
-                        "PCIe",
-                        format!(
-                            "from GPU {}",
-                            gpu.pcie_tx.map_or("—".into(), megabytes_per_second)
-                        ),
-                        host.pcie_tx.values(),
-                        ceiling,
-                    ),
-                ],
-                width,
-                Color::LightMagenta,
-            ));
-        }
-        lines.push(Line::raw(""));
-        if let Some((used, total)) = gpu.vram {
-            lines.push(gauge("VRAM", used, total, width));
-        }
-        // On a discrete card GTT is a spill area that sits near empty; on an
-        // APU it is where the model lives. Shown once it holds anything.
-        if let Some((used, total)) = gpu.gtt.filter(|(used, _)| *used >= 1 << 30) {
-            lines.push(gauge("GTT", used, total, width));
-        }
-    }
-    if let Some(memory) = host.memory {
-        lines.push(gauge("RAM", memory.used(), memory.total, width));
-    }
-    lines
-}
-
 /// Lay tiles out as bordered boxes, two to a row when the pane has room, else
 /// one:
 ///
@@ -349,10 +211,9 @@ fn machine_lines(host: &HostMonitor, width: usize) -> Vec<Line<'static>> {
 /// ╰────────────────╯ ╰────────────────╯
 /// ```
 ///
-/// `color` draws the sparklines; each section has its own, so the session's
-/// history and the machine's read as separate groups. A live tile — a request
-/// in progress — marks its title and shows its value in green.
-fn tiles(tiles: &[Tile], width: usize, color: Color) -> Vec<Line<'static>> {
+/// A live tile — a request in progress — marks its title and shows its value
+/// in green.
+fn tiles(tiles: &[Tile], width: usize) -> Vec<Line<'static>> {
     let per_row = if width >= 2 * MIN_TILE + TILE_GAP { 2 } else { 1 };
     let tile_width = if per_row == 2 { (width - TILE_GAP) / 2 } else { width };
     // Inside the border and a space of padding either side.
@@ -393,7 +254,7 @@ fn tiles(tiles: &[Tile], width: usize, color: Color) -> Vec<Line<'static>> {
             {
                 let spans = &mut rows[2 + n];
                 spans.push(Span::styled("│ ", border));
-                spans.push(Span::styled(line, Style::default().fg(color)));
+                spans.push(Span::styled(line, Style::default().fg(Color::Cyan)));
                 spans.push(Span::styled(" │", border));
             }
 
@@ -405,27 +266,6 @@ fn tiles(tiles: &[Tile], width: usize, color: Color) -> Vec<Line<'static>> {
         lines.extend(rows.into_iter().map(Line::from));
     }
     lines
-}
-
-/// `578 MB/s`, or `2.5 GB/s` from a thousand up.
-fn megabytes_per_second(rate: f64) -> String {
-    if rate >= 1000.0 { format!("{:.1} GB/s", rate / 1000.0) } else { format!("{rate:.0} MB/s") }
-}
-
-/// `VRAM ████████░░░░  40.4/124.0 GiB`
-fn gauge(label: &str, used: u64, total: u64, width: usize) -> Line<'static> {
-    let figure = format!(" {:.1}/{:.1} GiB", used as f64 / GIB, total as f64 / GIB);
-    let label = pad_right(label, 5);
-    let bar_width = width.saturating_sub(label.len() + figure.len());
-    let fraction = if total == 0 { 0.0 } else { used as f64 / total as f64 };
-    let (filled, empty) = bar(fraction, bar_width);
-    let color = if fraction >= 0.9 { Color::Red } else { Color::Green };
-    Line::from(vec![
-        Span::styled(label, Style::default().fg(Color::Gray)),
-        Span::styled(filled, Style::default().fg(color)),
-        Span::styled(empty, Style::default().fg(BORDER)),
-        Span::raw(figure),
-    ])
 }
 
 fn peak(values: &[Option<f64>]) -> Option<f64> {
@@ -531,7 +371,7 @@ mod tests {
     #[test]
     fn boxed_tiles_pair_up_when_there_is_room_and_keep_their_borders_square() {
         let tile = |label| Tile {
-            label: Cow::Borrowed(label),
+            label,
             value: "211.40 t/s".into(),
             history: vec![Some(1.0); 80],
             ceiling: Some(2.0),
@@ -539,7 +379,7 @@ mod tests {
         };
         let four = [tile("Decode"), tile("Prefill"), tile("CPU"), tile("Memory")];
         for width in [MIN_TILE, 30, 2 * MIN_TILE + TILE_GAP, 42, 60, 90] {
-            let lines = tiles(&four, width, Color::Cyan);
+            let lines = tiles(&four, width);
             let paired = width >= 2 * MIN_TILE + TILE_GAP;
             // Borders, value, and the sparkline's rows, per row of boxes.
             let tall = 3 + SPARK_ROWS;
@@ -656,49 +496,5 @@ mod tests {
         assert_eq!(tokens(16384), "16K");
         assert_eq!(tokens(131072), "128K");
         assert_eq!(tokens(10035), "9.8K");
-    }
-
-    #[test]
-    fn a_gauge_fits_its_width() {
-        for width in [30, 44, 60] {
-            let line = gauge("GTT", 43_423_322_112, 133_143_986_176, width);
-            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            assert_eq!(text.width(), width, "{text:?}");
-            assert!(text.ends_with(" 40.4/124.0 GiB"));
-        }
-    }
-
-    #[test]
-    fn the_pcie_link_heads_the_tiles_or_else_the_gpu_line() {
-        use crate::session::host::GpuSample;
-        let mut host = HostMonitor::default();
-        host.gpu = Some(GpuSample { name: "NVIDIA GeForce RTX 3080".into(), ..Default::default() });
-        let text = |host: &HostMonitor| -> String {
-            machine_lines(host, 60).iter().map(|line| text_of(line) + "\n").collect()
-        };
-        assert!(!text(&host).contains("PCIe"), "no throughput, no PCIe row");
-        host.gpu = Some(GpuSample {
-            name: "amdgpu 1002:744c".into(),
-            pcie_link: Some((4, 16)),
-            ..Default::default()
-        });
-        let shown = text(&host);
-        assert!(shown.starts_with("GPU · amdgpu 1002:744c · PCIe Gen4 x16\n"), "{shown}");
-        assert!(!shown.contains("╭ PCIe"), "a link alone goes on the header, no tiles");
-
-        host.gpu = Some(GpuSample {
-            name: "NVIDIA GeForce RTX 3080".into(),
-            pcie_link: Some((4, 16)),
-            pcie_rx: Some(2522.0),
-            pcie_tx: Some(42.0),
-            ..Default::default()
-        });
-        host.pcie_rx.push(Some(2522.0));
-        host.pcie_tx.push(Some(42.0));
-        let shown = text(&host);
-        assert!(shown.contains("╭ PCIe Gen4 x16 "), "{shown}");
-        assert!(shown.starts_with("GPU · NVIDIA GeForce RTX 3080\n"), "the tiles carry the link");
-        assert!(shown.contains("to GPU 2.5 GB/s"), "{shown}");
-        assert!(shown.contains("from GPU 42 MB/s"), "{shown}");
     }
 }

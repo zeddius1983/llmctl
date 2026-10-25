@@ -1058,7 +1058,7 @@ Clippy checks run in CI to preserve the verified baseline.
 
 ## ADR-021: The Session Manager's Monitor replaces the Detail pane
 
-**Status:** Accepted (2026-10-24).
+**Status:** Accepted (2026-10-24); machine figures removed (2026-10-26).
 
 **Context:** The Detail pane beside the session list mostly restated the row it
 sat next to (see the roadmap). `strata monitor` showed what a live view of a
@@ -1079,20 +1079,17 @@ endpoint (what one copies out to point a client at the server), the model with
 its context size, and uptime. The model name truncates first when the pane is
 narrow. The compute backend is a column of the row beside it, and the PID is to
 become one. A narrow pane sheds the uptime and then the name, which the list
-shows, before it wraps. Next come the session tiles, the context-fill
-bar, and the machine's GPU tiles and memory bars. The log path and command are
+shows, before it wraps. Next come the decode and prefill tiles and the
+context-fill bar. The log path and command are
 left out: `L` and `y` reach them. A list of recent requests was tried and
-dropped; it belongs in a Requests view. Each tile group draws its sparklines in its own
-colour, with blank rows between tile rows.
+dropped; it belongs in a Requests view.
 
-*Sources.* Everything comes from what llmctl can read without a vendor tool or
-a server feature:
+*Sources.* Everything comes from the server's own log:
 
 - Per-session rates come from the throughput samples already parsed from the
   log (ADR-016). `Throughput` now keeps its last sixty measurements and pairs
   a prefill followed by a decode into one request. Both runtimes report them in
   that order.
-- Per-session CPU and RSS come from `/proc`, as before.
 - Live progress comes from the log as well. While a request runs, llama.cpp
   prints `prompt processing, n_tokens = 2048, progress = 0.76, t = 7.47 s /
   274.25 tokens per second`, then `n_gen = 865, tg = 34.99 t/s, tg_3s = 29.75
@@ -1121,63 +1118,40 @@ a server feature:
   - No HTTP is needed. A rediscovered session's log tail resumes near the end
     of the file, past llama.cpp's one-off load line, so its capacity is read
     from the first 256 KiB of the log instead (`context::capacity_from_head`).
-- The GPU comes from `amdgpu` sysfs (`gpu_busy_percent`, `mem_info_{vram,gtt}_*`,
-  hwmon temperature and power), and RAM from `/proc/meminfo`.
 
-*Cadence.* The tick stays at 250 ms, but the histories take one sample a second
-(`HISTORY_EVERY`), sixty deep. Rate histories advance per request, not per
-second, so an idle server's sparkline does not decay to zero. The machine is
-sampled only while some session is live, because reading `gpu_busy_percent`
-keeps a discrete GPU from runtime-suspending.
-
-*Honesty.* GPU and RAM figures describe the machine. They sit below the
-session's figures and are not apportioned to sessions (an earlier
-"system-wide" label on the GPU line was dropped as noise). A missing reading is a gap in the
-history, never a zero. With several GPUs the Monitor follows the one with the
-most VRAM, which an APU's carve-out never wins.
+*Cadence.* The tick stays at 250 ms. Rate histories advance per request, not
+per second, sixty deep, so an idle server's sparkline does not decay to zero.
 
 *Rendering.* The Monitor is text. Sparklines and bars are block characters
 built by pure functions in `ui/monitor.rs`, so widths are unit-tested against
 the narrowest pane rather than eyeballed. Sparklines are two rows tall
 (`SPARK_ROWS`, sixteen levels); one row of eight flattened every history into a
-strip. Tiles go two to a row from 38 columns
-and one below that.
+strip. Tiles go two to a row from 38 columns and one below that.
 
-*NVIDIA.* The proprietary driver publishes none of the `amdgpu` sysfs files,
-so NVIDIA cards are read from `nvidia-smi --query-gpu=… --format=csv`. Starting
-it costs tens of milliseconds, so it runs on a worker thread and the Monitor
-shows the previous reading; a second process is never started while one is
-still running. It is only tried when `/proc/driver/nvidia/gpus` exists. Inside a
-distrobox the container sees the driver but usually has no `nvidia-smi`, so a
-missing binary falls back to the host's through `distrobox-host-exec` (~80 ms);
-the route that worked is remembered, and only when neither exists does the
-probe stop asking. NVML through FFI would avoid the process
-but cannot be tested without the hardware. NVIDIA has no GTT, so only the VRAM
-bar shows.
+*Machine figures: tried and removed (2026-10-26).* The first cut also showed
+the session's CPU and RSS, the GPU (busy, clock, power, temperature), VRAM/GTT
+and RAM bars, and PCIe link and throughput. All of it went: it duplicated what
+nvtop and btop already do better, across vendors, and it had no answer for
+several GPUs — tiles per GPU push the session off the pane, and following one
+hides where a split model sits. The Monitor keeps only what the server itself
+reports, which no system monitor can see. What was learned, for whoever
+revisits it:
 
-*PCIe.* A row of two tiles under the GPU's, traffic to and from the card,
-headed by the link as it runs now (`PCIe Gen4 x16`; NVIDIA drops to Gen1 while
-idle, and that is shown as it is). The two share one scale so their heights
-compare. NVIDIA gives the link in the query and the throughput through
-`nvidia-smi dmon -s t -c 1`, run right after it by the same route; dmon's
-columns are found by header name. The row appears only once throughput is
-measured.
-
-AMD discrete cards show the link on the GPU line instead (`GPU · amdgpu
-1002:744c · PCIe Gen4 x16`), read from sysfs `current_link_speed` and
-`current_link_width`. They get no throughput: the kernel offers `pcie_bw` only
-on Vega and older, where each read sleeps a second. An APU's link is the bridge
-inside the chip (on Strix Halo, `00:08.1`, reporting Gen4 x16) and is left
-out. An APU is told apart by its `gpu_metrics` format revision: 2 or 3, where
-discrete cards report 1.
-
-Strix Halo's `gpu_metrics` v3.0 does carry `average_dram_reads`/`writes` in
-MB/s, but they are not shown. Measured against `llama-bench` decode of a
-6.48 GiB model at 21.9 t/s (about 150 GB/s of weight reads), the counter read
-about 52 GB/s. It also covers the whole SoC, read 23–42 GB/s near idle, and as
-a 16-bit field it cannot pass 65.5 GB/s on a 256 GB/s memory system.
+- NVIDIA's driver publishes none of `amdgpu`'s sysfs files. `nvidia-smi
+  --query-gpu` costs tens of milliseconds a call (so a worker thread), and
+  `nvidia-smi dmon -s t -c 1` gives PCIe MB/s each way. Inside a distrobox the
+  driver is visible but `nvidia-smi` usually is not; the host's runs through
+  `distrobox-host-exec` in about 80 ms.
+- AMD discrete cards report their link in sysfs (`current_link_speed`/`width`)
+  but RDNA has no throughput counter; `pcie_bw` is Vega and older and sleeps a
+  second per read. An APU's link is the bridge inside the chip (Strix Halo:
+  `00:08.1`, Gen4 x16), told apart by a `gpu_metrics` format revision of 2 or 3.
+- Strix Halo's `gpu_metrics` v3.0 DRAM read/write counters read about 52 GB/s
+  against a `llama-bench` decode moving about 150 GB/s of weights. They cover
+  the whole SoC, and as 16-bit MB/s fields cannot pass 65.5 GB/s.
 
 **Consequences:** No new dependencies, endpoints, or launch flags. llama.cpp's
-`/slots` (serving state) is a follow-up. A short terminal clips the
-Monitor from the bottom, so the machine's bars go last. The other views Strata offers
-(Requests, Connect, Engine, …) are on the roadmap.
+`/slots` (serving state) is a follow-up. Request statistics drawn from the same
+log are the natural next addition. The other views Strata offers (Requests,
+Connect, Engine, …) are on the roadmap. Whether a model fits the GPU is a
+question for launch time, not for a live bar.
