@@ -1,11 +1,12 @@
 //! Session lifecycle: launching servers, persisting and rediscovering them,
-//! and tracking their live status/resource usage for the Session Manager.
+//! and tracking their live status for the Session Manager.
 //!
 //! Process spawning/signalling is delegated to a [`SessionSupervisor`]
 //! (ADR-005); this module owns the policy: port-conflict resolution, status
 //! derivation (`Starting`/`Running`/`Stopped`/`Crashed`), and `/proc` sampling.
 
 pub mod command;
+pub mod context;
 pub mod health;
 pub mod logtail;
 pub mod proc;
@@ -16,14 +17,13 @@ pub mod throughput;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 
 use command::Command;
 use health::Health;
 use logtail::LogTail;
-use proc::CpuSample;
 use record::{DownloadRecord, SessionRecord};
 use supervisor::{DetachedSupervisor, LaunchSpec, SessionSupervisor};
 use throughput::Throughput;
@@ -77,7 +77,7 @@ impl SessionStatus {
     }
 
     /// Terminal states are not re-evaluated once reached.
-    fn is_terminal(self) -> bool {
+    pub(crate) fn is_terminal(self) -> bool {
         matches!(self, SessionStatus::Stopped | SessionStatus::Crashed)
     }
 }
@@ -108,16 +108,14 @@ const RESTART_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 pub struct Session {
     pub record: SessionRecord,
     pub status: SessionStatus,
-    pub cpu_percent: Option<f64>,
-    pub rss_bytes: Option<u64>,
     pub download_percent: Option<u8>,
     /// True once the user requested a stop/kill — distinguishes Stopped vs Crashed.
     requested_stop: bool,
-    /// Previous CPU sample for delta-based percentage.
-    last_cpu: Option<CpuSample>,
     /// Prompt-processing and token-generation rates, and the position in the
     /// server's log they are read from.
     pub throughput: Throughput,
+    /// How full the last request left the context.
+    pub context: context::ContextFill,
     log_tail: LogTail,
     /// The tail of what the server has written, kept so the Session Manager can
     /// show it without re-reading the file. See [`remember`].
@@ -132,12 +130,10 @@ impl Session {
         Self {
             record,
             status,
-            cpu_percent: None,
-            rss_bytes: None,
             download_percent,
             requested_stop: false,
-            last_cpu: None,
             throughput: Throughput::default(),
+            context: context::ContextFill::default(),
             log_tail: LogTail::default(),
             recent: VecDeque::new(),
             restart_pending: None,
@@ -382,7 +378,13 @@ impl SessionManager {
                     SessionStatus::Starting
                 };
                 self.health_checks.request(probe_key(&record));
-                self.sessions.push(Session::new(record, status));
+                let mut session = Session::new(record, status);
+                // The log tail resumes near the end of the file, past the
+                // lines a server prints once at load; see
+                // `context::capacity_from_head`.
+                let parse = crate::runtime::log_parsers(&session.record.runtime).context;
+                session.context.size = context::capacity_from_head(&session.record.log_file, parse);
+                self.sessions.push(session);
             } else {
                 record.delete(&self.dir);
             }
@@ -572,7 +574,7 @@ impl SessionManager {
         }
     }
 
-    /// Refresh live status and resource usage for every session. Cheap enough
+    /// Refresh live status, rates and context fill for every session. Cheap enough
     /// to call on the periodic UI tick.
     pub fn refresh(&mut self) {
         self.poll_health();
@@ -584,31 +586,22 @@ impl SessionManager {
                 continue;
             }
             if self.sessions[idx].status.is_terminal() {
-                self.sessions[idx].cpu_percent = None;
-                self.sessions[idx].rss_bytes = None;
                 continue;
             }
-            let Some(pid) = self.live_pid(idx) else {
+            if self.live_pid(idx).is_none() {
                 let s = &mut self.sessions[idx];
                 s.status =
                     if s.requested_stop { SessionStatus::Stopped } else { SessionStatus::Crashed };
-                s.cpu_percent = None;
-                s.rss_bytes = None;
-                s.download_percent = None;
-                s.last_cpu = None;
                 s.download_percent = None;
                 continue;
-            };
+            }
 
-            let prev = self.sessions[idx].last_cpu;
             let was_running = self.sessions[idx].status == SessionStatus::Running;
             let progress = download_percent(&self.sessions[idx].record);
 
-            let rss = proc::rss_bytes(pid);
-            let sample = proc::cpu_sample(pid);
             // The server already timed its own requests; read what it wrote
             // rather than timing anything here (see `session::throughput`).
-            let parse = crate::runtime::throughput_parser(&self.sessions[idx].record.runtime);
+            let parse = crate::runtime::log_parsers(&self.sessions[idx].record.runtime);
             let log_file = self.sessions[idx].record.log_file.clone();
             let appended = self.sessions[idx].log_tail.poll(&log_file);
             // Once a session is Running its status no longer depends on the
@@ -623,18 +616,26 @@ impl SessionManager {
             let health = if was_running { Health::Ready } else { Health::Loading };
 
             let s = &mut self.sessions[idx];
-            s.rss_bytes = rss;
             s.download_percent = progress;
-            for measurement in appended.iter().flat_map(|line| parse(line)) {
-                s.throughput.record(measurement);
+            // In log order: a request's progress lines come before its summary,
+            // and the summary is what ends it.
+            let now = Instant::now();
+            for line in &appended {
+                if let Some(live) = (parse.live)(line) {
+                    s.throughput.record_live(live, now);
+                }
+                if (parse.ends)(line) {
+                    // `flm serve` runs one request at a time, unslotted.
+                    s.throughput.record_end(None);
+                }
+                for measurement in (parse.throughput)(line) {
+                    s.throughput.record(measurement);
+                }
+                for reading in (parse.context)(line) {
+                    s.context.record(reading);
+                }
             }
             remember(&mut s.recent, &appended);
-            if let Some(now) = sample {
-                if let Some(prev) = prev {
-                    s.cpu_percent = proc::cpu_percent(prev, now);
-                }
-                s.last_cpu = Some(now);
-            }
             // Ready promotes to Running; otherwise keep Running if we were already
             // there (tolerate transient probe failures), else Starting.
             s.status = match health {
@@ -698,9 +699,6 @@ impl SessionManager {
         // not latch as Stopped if the old process disappears before the tick.
         session.requested_stop = false;
         session.status = SessionStatus::Restarting;
-        session.cpu_percent = None;
-        session.rss_bytes = None;
-        session.last_cpu = None;
         Ok(())
     }
 
@@ -788,14 +786,14 @@ impl SessionManager {
             SessionStatus::Starting
         };
         session.requested_stop = false;
-        session.last_cpu = None;
-        session.cpu_percent = None;
-        session.rss_bytes = None;
-        // The rates and the read position belong to the process that just went
-        // away. The replacement writes its own log from byte zero and has said
-        // nothing yet about how fast it runs; carrying either across would show
-        // the old process's figures as if they were the new one's.
+        // The rates, the context fill and the read position belong to the
+        // process that just went away. The replacement writes its own log from
+        // byte zero and has said nothing yet about how fast it runs or how full
+        // it is; carrying any of it across would show the old process's figures
+        // as if they were the new one's. Its context size comes back from its
+        // own load line.
         session.throughput = Throughput::default();
+        session.context = context::ContextFill::default();
         session.log_tail = LogTail::default();
         session.recent.clear();
         Ok(())
@@ -1315,7 +1313,10 @@ mod tests {
             phase: throughput::Phase::Decode,
             tokens: 100,
             seconds: 2.0,
+            slot: None,
         });
+        mgr.sessions[0].context.record(context::Reading::Size(16384));
+        mgr.sessions[0].context.record(context::Reading::Used(9000));
 
         mgr.restart(0).expect("restart");
         assert!(mgr.poll_restarts().is_empty(), "no spawn errors expected");
@@ -1324,6 +1325,11 @@ mod tests {
         assert!(
             mgr.sessions[0].throughput.rate(throughput::Phase::Decode).is_none(),
             "the replacement kept the old process's rates"
+        );
+        assert_eq!(
+            mgr.sessions[0].context,
+            context::ContextFill::default(),
+            "the replacement kept the old process's context fill"
         );
 
         sleep(Duration::from_millis(100));

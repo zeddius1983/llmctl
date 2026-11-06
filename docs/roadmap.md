@@ -335,17 +335,104 @@ on its own branch before the consolidated merge.
       now follows its longest row, so a two-column layout has that much less to
       find.
 
-### Session Manager Detail pane
-- [ ] Trim the Detail pane, which still restates the row it sits beside. Of the
-      fifteen facts it shows, the columns and the runtime heading already carry
-      nine — status, runtime, model, profile, port, size, backend, uptime, and
-      both rates. Only PID, CPU, memory, endpoint, the per-request tokens and
-      seconds behind each rate, and the command line are its own.
-      The live log tail this entry also proposed is done (ADR-017): `l`/`→`
-      swaps the pane for a tail fed by the lines `SessionManager::refresh`
-      already reads each tick. What is left is deciding what the Detail pane
-      keeps once the log is a keystroke away, and whether a download — which has
-      no log — should show anything else in that column.
+### Session Monitor (ADR-021)
+The Detail pane is replaced by a Monitor modelled on `strata monitor`'s
+Overview. Strata's monitor has seven views (Overview, Serving, Requests,
+Engine, Hardware, Logs, Connect); llmctl has the first and, in the log tail,
+the sixth. Hardware is left to nvtop and btop.
+- [x] Overview prototype: decode/prefill tiles with sparklines
+- [x] One-line header (status · endpoint · model + context size · uptime) and
+      a context-fill bar, both from the server's log
+- [x] Live activity in the header's status (Reading with progress /
+      Generating with tokens) and live decode/prefill rates in tiles and list,
+      from llama.cpp's progress lines; boxed tiles; the Recent requests list
+      removed for a future Requests view
+- [ ] Busy-slot count across parallel requests (`/slots`, through a background
+      worker like the health probe). The log's activity follows whichever
+      slot reported last
+- [x] PID as a Session Manager column (dropped from the Monitor); it goes
+      after the profile and before the rates when a narrow pane sheds columns
+- [x] Machine figures removed: session CPU/RSS, GPU tiles (amdgpu sysfs and
+      `nvidia-smi`, distrobox included), VRAM/GTT/RAM bars and PCIe. They
+      duplicated nvtop/btop and did not scale to several GPUs; what was learned
+      is kept in ADR-021
+- [ ] Request statistics from the log (see the ideas below)
+- [ ] More views, switched inside the pane: Requests (a table of the parsed
+      samples), Connect (client settings for OpenCode, Claude Code, …), Engine
+      (the command line and `/props`)
+- [ ] A download in that column still shows its facts. Decide whether it
+      deserves a transfer-rate sparkline
+
+Ideas for the Monitor's lower half, each for its own branch. Checked against
+real llama.cpp logs (build 620d222, 2026-10-26). The server logs at
+`verbosity = 3` by default: per request only the slot pick, launch, timings,
+release, live progress, draft statistics and reasoning-budget lines; no load
+details and no HTTP access lines. FastFlowLM gets what its log carries.
+
+From the default log:
+- [ ] Recent requests table: age, slot, live/finished, prompt and generated
+      tokens, pp/tg, context. The running request's row updates live. Source:
+      `launch_slot_`, `prompt eval time = 1287.34 ms / 97 tokens`, `eval time =
+      35447.91 ms / 302 tokens`, `release: … n_tokens = 3180, truncated = 0`.
+      Columns worth adding:
+  - Prefill/decode time split, from the same two timing lines
+  - Prompt cache reuse: release `n_tokens` minus the tokens `prompt eval`
+    processed, or `f_keep` from `selected slot by LCP similarity, f_sim_best =
+    1.000, f_keep = 0.958`; `/slots` also gives `n_prompt_tokens_cache`
+  - Draft acceptance per request: `draft acceptance = 0.64753 (643 accepted /
+    993 generated)`
+  - Truncated: `truncated = 1` on release. Never seen in 17,096 logged
+    requests, so a marker, not a column
+- [ ] Time to first token: `prompt eval time` gives prefill. A request queued
+      for a busy slot is not logged, so queue time cannot be shown
+- [ ] Session totals since start: requests served, prompt and generated
+      tokens, average decode rate, requests per minute (from line timestamps)
+- [ ] Idle time since the last request, from line timestamps (time since
+      server start)
+- [ ] Decode rate against context length: each request's `tg` against its
+      release `n_tokens`, e.g. `tg 74 t/s @1K → 51 t/s @7K`
+- [ ] Speculative decoding tile: per-request `draft acceptance` with a
+      sparkline; MTP also logs running totals (`statistics draft-mtp: #gen
+      drafts = 129, #acc drafts = 120, #gen tokens = 387, #acc tokens = 331`)
+- [ ] Slots strip: each parallel slot's state from the per-slot live tracking
+      (`0 ▶ 781 tok  1 ○ 1.2K  2 ○ —`), or `/slots` (`is_processing`,
+      `n_decoded`, `max_tokens`)
+- [ ] Warnings and errors: a count of `W`/`E` lines and the latest one. Real
+      ones: `E srv send_error: … failed to parse grammar`, `W srv operator():
+      got exception: {"code":500,"message":"…does not match the expected
+      peg-native format"}`, `cudaMalloc failed: out of memory`. Cancelled
+      requests: `W srv stop: cancel task`
+- [ ] Host prompt cache: `cache state: 3 prompts, 2077 MiB (limits: 8192
+      MiB)`, evictions (`cache size limit reached, removing oldest entry`) and
+      `prompt state size 10765 MiB exceeds cache size limit, skipping`, which
+      explains slow prefill on long agent prompts. Hybrid/SWA models also log
+      `erased invalidated context checkpoint` on a cache miss
+- [ ] Thinking time: `reasoning-budget: activated` / `deactivated` are
+      timestamped (`thought 19 s of 37 s`). They carry no slot id, so only
+      attributable with one request in flight
+- [x] FastFlowLM rates and context fill on flm 1.0.10: the closing chunk no
+      longer carries `usage`; a separate `Usage: {…}` line follows it, for
+      every streamed request in the logs checked. Both forms are read
+- [ ] FastFlowLM non-streamed requests: none in the logs checked, so whether
+      they log usage is unknown (earlier versions logged rates only for
+      streamed requests; upstream ROCm/FastFlowLM#841)
+
+Needs `-lv 4` (agreed 2026-10-26: llmctl may launch llama.cpp at that level):
+- [ ] Launch llama.cpp with `-lv 4`. Measured cost: the load section grows to
+      ~230 lines (mostly model metadata), a request adds ~39 lines, no
+      per-token output and still no HTTP access lines
+- [ ] Where the model landed: a static block read once from the load log,
+      one row per device, so several GPUs fit. Source: `offloaded 49/49 layers
+      to GPU`, `ROCm0 model buffer size = 6637.69 MiB`, `ROCm0 KV buffer size =
+      128.00 MiB`, and `common_memory_breakdown_print` (`ROCm0 (8060S Graphics) |
+      126976 = 119149 + (8338 = 6637 + 1568 + 132)`: total, free, model,
+      context, compute), plus `projected to use 8338 MiB of device memory vs.
+      119149 MiB of free device memory`
+
+Not available: HTTP status codes and per-endpoint counts (no access log at any
+level; only the errors above). `/metrics` needs `--metrics`. `/props` (model
+quantization, modalities, template tool/reasoning support, build,
+`is_sleeping`) belongs in a future Engine view.
 
 ### Diffusion model support
 - [ ] Discover `llama-diffusion-cli` beside `llama-server` and on `$PATH`,
