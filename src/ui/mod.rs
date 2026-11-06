@@ -144,6 +144,8 @@ fn draw_browser(frame: &mut Frame, app: &mut App) {
         Constraint::Percentage(34),
     ])
     .areas(body);
+    // The mouse handler reads this: the wheel moves the current column only.
+    app.browser.current_area = Some(current);
 
     render_header(frame, header, app);
 
@@ -1299,7 +1301,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::raw(""),
         Line::from("General".bold()),
         help_row("F5", "rescan / reload"),
-        help_row("wheel", "scroll the list or log under the pointer"),
+        help_row("wheel", "scroll the current list or log under the pointer"),
         help_row("? / q", "help / quit"),
         Line::raw(""),
         Line::from("press ? or Esc to close".dim().italic()),

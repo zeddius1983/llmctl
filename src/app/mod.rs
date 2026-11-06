@@ -1227,10 +1227,12 @@ impl App {
         self.session_view.pane_log_back = 0;
     }
 
-    /// The mouse wheel scrolls whatever the pointer is over: the browser's
-    /// lists, the session list, the Log pane beside it, or the full-screen
-    /// log. Clicks are not used. While a popup is open the wheel does nothing,
-    /// so it cannot answer a prompt or dismiss a message by accident.
+    /// The mouse wheel scrolls what the pointer is over: the browser's current
+    /// column, the session list, the Log pane beside it, or the full-screen
+    /// log. The browser's side columns take no wheel: they are not always
+    /// lists, and moving one would rebuild the column in focus. Clicks are not
+    /// used. While a popup is open the wheel does nothing, so it cannot answer
+    /// a prompt or dismiss a message by accident.
     fn on_mouse(&mut self, mouse: MouseEvent) {
         let delta: isize = match mouse.kind {
             MouseEventKind::ScrollUp => -1,
@@ -1252,7 +1254,8 @@ impl App {
             })
         };
         match self.screen {
-            Screen::Browser => self.move_selection(delta),
+            Screen::Browser if over(self.browser.current_area) => self.move_selection(delta),
+            Screen::Browser => {}
             Screen::Sessions if over(self.session_view.detail_area) => {
                 if self.session_view.pane == SessionPane::Log
                     && self.selected_server_index().is_some()
@@ -4207,6 +4210,27 @@ mod tests {
         app.on_mouse(wheel(MouseEventKind::ScrollUp, 10));
         assert_eq!(app.session_view.selection.selected(), Some(1), "a popup takes no wheel");
         assert!(app.modals.message.is_some(), "and is not dismissed by it");
+        app.modals.message = None;
+
+        let profile = |name: &str| crate::domain::Profile {
+            name: name.into(),
+            builtin: true,
+            favorite: false,
+        };
+        app.screen = Screen::Browser;
+        app.browser.focus = Pane::Profile;
+        app.browser.profiles = PaneList::new(vec![profile("a"), profile("b"), profile("c")]);
+        app.browser.current_area = Some(Rect::new(18, 1, 48, 30));
+
+        app.on_mouse(wheel(MouseEventKind::ScrollDown, 30));
+        assert_eq!(app.browser.profiles.state.selected(), Some(1), "over the current column");
+        app.on_mouse(wheel(MouseEventKind::ScrollDown, 10));
+        assert_eq!(app.browser.profiles.state.selected(), Some(1), "not over the parent");
+        app.on_mouse(wheel(MouseEventKind::ScrollDown, 70));
+        assert_eq!(app.browser.profiles.state.selected(), Some(1), "not over the preview");
+        let footer = MouseEvent { row: 40, ..wheel(MouseEventKind::ScrollDown, 30) };
+        app.on_mouse(footer);
+        assert_eq!(app.browser.profiles.state.selected(), Some(1), "not over the footer");
 
         let _ = std::fs::remove_dir_all(&root);
     }

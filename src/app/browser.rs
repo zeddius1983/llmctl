@@ -2,10 +2,13 @@
 use super::{Pane, PaneList};
 use crate::domain::{Model, OptionItem, Profile};
 use crate::runtime::RuntimeBackend;
+use ratatui::layout::Rect;
 use std::sync::Arc;
 
 pub struct BrowserState {
     pub focus: Pane,
+    /// Where the current column was last drawn, for the mouse wheel.
+    pub current_area: Option<Rect>,
     pub runtimes: PaneList<Arc<dyn RuntimeBackend>>,
     pub models: PaneList<Model>,
     pub catalog_preview: Vec<Model>,
@@ -19,6 +22,7 @@ impl BrowserState {
     pub(super) fn new(runtimes: Vec<Arc<dyn RuntimeBackend>>) -> Self {
         Self {
             focus: Pane::Runtime,
+            current_area: None,
             runtimes: PaneList::new(runtimes),
             models: PaneList::new(vec![]),
             catalog_preview: vec![],
